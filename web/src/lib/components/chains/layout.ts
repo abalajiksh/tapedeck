@@ -51,12 +51,15 @@ const COL_GAP = 70;
 const ROW_GAP = 18;
 const SUB_GAP = 24;
 
-/** One way a step can be swapped, from a named setup that overrides it. */
+/** Other gear that can be on at a slot this box is wired at. */
 export interface SlotOption {
 	name: string;
+	/** Its hours through that chain. */
 	hours: number;
 	chainId: number;
-	variantId: number;
+	equipmentId: number;
+	/** It is the one on now, instead of this box. */
+	on: boolean;
 }
 
 export interface GearNodeData {
@@ -74,7 +77,7 @@ export interface GearNodeData {
 	builtIn: boolean;
 	/** The chains this box is in, by id. */
 	chains: number[];
-	/** Named setups that swap this box for another, across every chain. */
+	/** Gear that can be on instead of this box at a slot, across every chain. */
 	options: SlotOption[];
 }
 
@@ -121,7 +124,7 @@ export function stepKey(step: ChainComponent): string {
 }
 
 /** The keys of every box a chain lights up: its own steps and the gear its
- *  setups swap in. */
+ *  slots swap in. */
 export function chainKeys(c: SignalChain): string[] {
 	return (c.components ?? []).filter((s) => s.name.trim()).map(stepKey);
 }
@@ -150,7 +153,7 @@ const BAND_GAP = 22;
 
 export function buildLayout(
 	chains: SignalChain[],
-	variants: ChainVariant[],
+	onNow: Record<string, Record<string, number>>,
 	equipment: Equipment[],
 	rooms: Room[] = []
 ): Layout {
@@ -225,21 +228,22 @@ export function buildLayout(
 		if (n && n.hours == null) n.hours = h;
 	}
 
-	// Setups as slot options on the box they swap out. Drawn on that box, not
-	// as boxes of their own: a stylus you swap is a choice at one position, and
-	// a second box would read as a second chain.
-	for (const v of variants) {
-		const c = chains.find((x) => x.id === v.chain_id);
-		if (!c) continue;
-		for (const o of v.overrides ?? []) {
-			const step = c.components?.[o.position];
-			if (!step || !step.name.trim()) continue;
+	// Slot options on the box the step is wired with. Drawn on that box, not
+	// as boxes of their own: a stylus you swap is a choice at one position,
+	// and a second box would read as a second chain.
+	for (const c of chains) {
+		(c.components ?? []).forEach((step, i) => {
+			if ((step.options?.length ?? 0) < 2 || !step.name.trim()) return;
 			const n = nodes.get(stepKey(step));
-			if (!n) continue;
-			const name =
-				o.name ?? (o.equipment_id != null ? gear.get(o.equipment_id)?.name : null) ?? '—';
-			n.options.push({ name, hours: v.total_hours, chainId: c.id, variantId: v.id });
-		}
+			if (!n) return;
+			const on = onNow[String(c.id)]?.[String(i)];
+			for (const eq of step.options ?? []) {
+				if (eq === step.equipment_id) continue;
+				const g = gear.get(eq);
+				const hours = (g?.sources ?? []).filter((s) => s.chain_id === c.id).reduce((a, s) => a + s.hours, 0);
+				n.options.push({ name: g?.name ?? 'Gone from your gear', hours, chainId: c.id, equipmentId: eq, on: on === eq });
+			}
+		});
 	}
 
 	// ── x: columns, widened by however many sub-columns a run needs ──
@@ -360,10 +364,15 @@ export function buildLayout(
 	};
 }
 
-/** Every equipment id any chain or setup names, for telling the shelf apart. */
+/** Every equipment id a chain, a slot option or a setup names, for telling
+ *  the shelf apart. */
 export function gearInUse(chains: SignalChain[], variants: ChainVariant[]): Set<number> {
 	const used = new Set<number>();
-	for (const c of chains) for (const s of c.components ?? []) if (s.equipment_id != null) used.add(s.equipment_id);
+	for (const c of chains)
+		for (const s of c.components ?? []) {
+			if (s.equipment_id != null) used.add(s.equipment_id);
+			for (const eq of s.options ?? []) used.add(eq);
+		}
 	for (const v of variants) for (const o of v.overrides ?? []) if (o.equipment_id != null) used.add(o.equipment_id);
 	return used;
 }

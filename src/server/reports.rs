@@ -1450,6 +1450,8 @@ mod tests {
             detail: None,
             since: None,
             equipment_id: None,
+            options: None,
+            slot_name: None,
         };
         // The fold the emit does, in miniature.
         let components =

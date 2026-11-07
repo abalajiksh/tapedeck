@@ -589,6 +589,79 @@ export interface ChainComponent {
 	 *  box added to a chain that already has history is credited with all of
 	 *  it. Stamped by the server on gear a chain did not name before. */
 	since?: number | null;
+	/** Gear that can be on at this step, the wired gear first. Two or more
+	 *  make the step a slot ("what's on now"). On save, leaving it out keeps
+	 *  the options the step had; `[]` stops it being a slot. */
+	options?: number[] | null;
+	/** What the slot is called, when it has a name ("On the go"). */
+	slot_name?: string | null;
+}
+
+/** One slot of a chain, as "what's on now" shows it. */
+export interface Slot {
+	position: number;
+	slot_name: string | null;
+	/** The gear the step is wired with: every play before the first switch. */
+	wired: number;
+	/** The gear on now. */
+	on: number;
+	/** When the gear on now went on; null when it has been on all along. */
+	on_since: number | null;
+	options: SlotOption[];
+}
+
+export interface SlotOption {
+	equipment_id: number;
+	name: string;
+	brand: string | null;
+	equipment_type: string | null;
+	purchased_at: number | null;
+	/** First play through any chain. "In use since" is the purchase date, else this. */
+	first_play: number | null;
+	/** Outputs that pick this option by themselves, by their reported name. */
+	picked_by: string[];
+}
+
+export interface WhatsOn {
+	chain_id: number;
+	slots: Slot[];
+	/** When the chain's last play ended: "right after the last play here". */
+	last_play_end: number | null;
+}
+
+/** What a switch did, or would do (`dry_run`). */
+export interface FitOutcome {
+	/** Plays (skips excluded) filed with the new pick. */
+	moved: number;
+	since: number;
+	/** The next recorded switch of the same step, where the change stops;
+	 *  null when there is none and the new pick is on now. */
+	until: number | null;
+	now_on: boolean;
+}
+
+/** `merge`: two chains that differ at one box past the player. */
+export interface InboxMerge {
+	chain_id: number;
+	chain_name: string;
+	chain_hours: number;
+	other_chain_id: number;
+	other_chain_name: string;
+	other_hours: number;
+	position: number;
+	gear: string;
+	other_gear: string;
+}
+
+/** `moods`: a named setup that changes no gear. */
+export interface InboxSetup {
+	id: number;
+	name: string;
+	chain_id: number;
+	chain_name: string;
+	plays: number;
+	/** Sittings its plays are in with no title yet. */
+	sessions: number;
 }
 
 export interface ChainInput {
@@ -1073,7 +1146,7 @@ export interface InboxReporter {
 /** One question in the Signal Chains inbox. */
 export interface InboxQuestion {
 	key: string;
-	kind: 'same_box' | 'which_box' | 'where';
+	kind: 'same_box' | 'which_box' | 'where' | 'merge' | 'moods';
 	equipment_id?: number;
 	equipment_name?: string;
 	reporters?: InboxReporter[];
@@ -1088,6 +1161,8 @@ export interface InboxQuestion {
 	/** What an answer remembers: an output of a box, an output by name, the
 	 *  token's or the device's default chain, or nothing at all. */
 	rule?: 'device_output' | 'output' | 'token' | 'device' | 'none';
+	merge?: InboxMerge;
+	setups?: InboxSetup[];
 }
 
 export interface Binding {
@@ -1155,6 +1230,9 @@ export interface ChainVariant {
 	overrides: VariantOverride[];
 	created_at: number;
 	total_hours: number;
+	/** Kept by Tapedeck for a set of slot picks; its name is internal. Show
+	 *  what it puts on instead (`variantLabel`). */
+	auto: boolean;
 }
 
 /** Two chains that look like the same rig, and what folding one into the other
@@ -3216,8 +3294,32 @@ class TapedeckAPI {
 	/** `last_used` is unix seconds of the newest listen through each chain, keyed
 	 *  by chain id (a JSON object, so the keys arrive as strings). A chain
 	 *  nothing played through is absent. */
-	async getChains(): Promise<{ chains: SignalChain[]; last_used: Record<string, number> }> {
+	async getChains(): Promise<{
+		chains: SignalChain[];
+		last_used: Record<string, number>;
+		/** chain id → (step position → equipment id on now), for chains with slots. */
+		on_now: Record<string, Record<string, number>>;
+	}> {
 		return this.get('/api/v1/chains');
+	}
+	async getWhatsOn(chainId: number): Promise<WhatsOn> {
+		return this.get(`/api/v1/chains/${chainId}/whats-on`);
+	}
+	/** Switch a slot, now (`since` absent) or since a moment. `dry_run` only
+	 *  counts what would move. */
+	async fitSlot(
+		chainId: number,
+		body: { position: number; equipment_id: number; since?: number | null; dry_run: boolean }
+	): Promise<FitOutcome> {
+		return this.post(`/api/v1/chains/${chainId}/fit`, body);
+	}
+	/** Merge a chain that differs at one box into this one, as an option. Not reversible. */
+	async mergeChain(chainId: number, fromChainId: number): Promise<FoldOutcome> {
+		return this.post(`/api/v1/chains/${chainId}/merge`, { from_chain_id: fromChainId });
+	}
+	/** Named setups that change no gear become titles on their sittings. */
+	async retireMoods(variantIds: number[]): Promise<{ sessions_titled: number; removed: number }> {
+		return this.post('/api/v1/chains/inbox/moods', { variant_ids: variantIds });
 	}
 	async getChain(id: number): Promise<SignalChain> { return this.get(`/api/v1/chains/${id}`); }
 	async getRooms(): Promise<{ rooms: Room[] }> {

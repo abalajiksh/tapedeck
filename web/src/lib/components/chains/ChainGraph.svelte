@@ -9,7 +9,7 @@
 	import { createEventDispatcher } from 'svelte';
 	import { SvelteFlow, Background, Controls, type Node, type Edge } from '@xyflow/svelte';
 	import '@xyflow/svelte/dist/style.css';
-	import type { ChainVariant, Equipment, Room, SignalChain } from '$lib/api';
+	import type { Equipment, Room, SignalChain } from '$lib/api';
 	import { formatHours } from '$lib/utils';
 	import GearNode from './nodes/GearNode.svelte';
 	import BandNode from './nodes/BandNode.svelte';
@@ -17,7 +17,8 @@
 	import { buildLayout, chainKeys, edgeKey, COLUMNS, NODE_W, type GearNodeData } from './layout';
 
 	export let chains: SignalChain[] = [];
-	export let variants: ChainVariant[] = [];
+	/** chain id → (step position → gear on now), for chains with slots. */
+	export let onNow: Record<string, Record<string, number>> = {};
 	export let equipment: Equipment[] = [];
 	export let selectedId: number | null = null;
 	export let rooms: Room[] = [];
@@ -28,7 +29,7 @@
 	const dispatch = createEventDispatcher<{ select: number }>();
 	const nodeTypes = { gear: GearNode, band: BandNode };
 
-	$: layout = buildLayout(chains, variants, equipment, rooms);
+	$: layout = buildLayout(chains, onNow, equipment, rooms);
 	$: room = roomId == null ? null : (rooms.find((r) => r.id === roomId) ?? null);
 	$: roomChains = new Set(room?.chain_ids ?? []);
 	$: inRoom = (chainIds: number[]) => !room || chainIds.some((c) => roomChains.has(c));

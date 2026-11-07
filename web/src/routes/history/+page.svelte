@@ -5,6 +5,7 @@
 	import { api, lyricKey } from '$lib/api';
 	import type { Scrobble, SignalChain , ChainVariant } from '$lib/api';
 	import ScrobbleRow from '$lib/components/ScrobbleRow.svelte';
+	import { variantLabel } from '$lib/components/chains/format';
 	import InspectListen from '$lib/components/InspectListen.svelte';
 	import { loadLoves, lovedKeys, isLoved, toggleLove } from '$lib/loves';
 	import SessionCard from '$lib/components/SessionCard.svelte';
@@ -590,9 +591,9 @@
 		</select>
 		{#if bulkVariants.length}
 			<select class="input" style="width:auto;min-width:150px;" bind:value={bulkVariant}
-				aria-label="Which setup of that chain">
+				aria-label="What was on at that chain's slots">
 				<option value="">— as wired —</option>
-				{#each bulkVariants as v}<option value={v.id}>{v.name}</option>{/each}
+				{#each bulkVariants as v}<option value={v.id}>{variantLabel(v, [])}</option>{/each}
 			</select>
 		{/if}
 		<button class="btn btn-primary" on:click={applyBulkChain} disabled={!selectedCount || saving}>{saving ? 'Applying…' : 'Apply'}</button>
@@ -763,10 +764,10 @@
 							     cartridges on one turntable are the same path with one
 							     step swapped, and this is what makes the hours land on
 							     the one that was actually fitted. -->
-							<div class="field" style="flex:1;min-width:180px;"><label for="ev">Setup</label>
+							<div class="field" style="flex:1;min-width:180px;"><label for="ev">What was on</label>
 								<select id="ev" class="input" bind:value={edit.chain_variant_id}>
 									<option value={0}>— as wired —</option>
-									{#each editVariants as v}<option value={v.id}>{v.name}</option>{/each}
+									{#each editVariants as v}<option value={v.id}>{variantLabel(v, [])}</option>{/each}
 								</select>
 							</div>
 						{/if}

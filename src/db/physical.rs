@@ -731,11 +731,17 @@ impl Database {
         equipment_id: Option<i64>,
         chain_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
+        // What was on at the chain's slots then (the cartridge), as for a
+        // listen; a release that names its own setup sets it afterwards.
+        let variant = match chain_id {
+            Some(c) => self.fitted_variant(user_id, c, played_at).await?,
+            None => None,
+        };
         let res = sqlx::query_as::<_, (i64,)>(&crate::sql!(
             "INSERT INTO physical_plays
                 (uuid, user_id, release_id, side, played_at, duration_secs, track_count,
-                 equipment_id, chain_id, recorded_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
+                 equipment_id, chain_id, recorded_at, chain_variant_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id"
         ))
         .bind(new_uuid())
         .bind(user_id)
@@ -747,6 +753,7 @@ impl Database {
         .bind(equipment_id)
         .bind(chain_id)
         .bind(Self::now_secs())
+        .bind(variant)
         .fetch_all(&self.pool)
         .await?;
         res.first().map(|r| r.0).ok_or(sqlx::Error::RowNotFound)

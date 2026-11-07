@@ -74,6 +74,8 @@ pub struct InboxQuestion {
     pub key: String,
     /// `same_box` — are these reporters this box? `which_box` — which box is
     /// this reporter? `where` — plays landed nowhere; where were you?
+    /// `merge` — two chains differ at one box; make it an option? `moods` —
+    /// named setups that change no gear; make them session titles?
     pub kind: &'static str,
     /// `same_box`: the box suggested, by a name or model it matches.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -110,10 +112,16 @@ pub struct InboxQuestion {
     /// source and only the counted plays can be filed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule: Option<&'static str>,
+    /// `merge`: the two chains and the step they differ at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge: Option<super::InboxMerge>,
+    /// `moods`: every setup that changes no gear.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub setups: Vec<super::InboxSetup>,
 }
 
 impl InboxQuestion {
-    fn new(key: String, kind: &'static str) -> Self {
+    pub(super) fn new(key: String, kind: &'static str) -> Self {
         InboxQuestion {
             key,
             kind,
@@ -129,6 +137,8 @@ impl InboxQuestion {
             output: None,
             source_name: None,
             rule: None,
+            merge: None,
+            setups: Vec::new(),
         }
     }
 }

@@ -1,24 +1,23 @@
 <script lang="ts">
-	// One chain, opened: the route, how plays find it, the hours on its gear,
-	// and who sees what played through it.
+	// One chain, opened: the route and what's on now at its slots, how plays
+	// find it, the hours on its gear, and who sees what played through it.
 	//
-	// The design's "Place" layout built from today's data (phase 1). Two parts
-	// of the design wait for later phases and are drawn as what exists now:
-	// * **What's on now** is a picker with backdating in the design. Until slots
-	//   land (phase 3) a swapped position lists its setups read-only, and the
-	//   Setups section below keeps every tool it had.
-	// * **How plays find this chain** lists the outputs and machines that point
-	//   here. Per-device outputs and the inbox are phase 2.
+	// The design's "Place" layout. A gear step opens "what's on now" in place
+	// (`WhatsOnPicker`): pick which option is on, since when, and which gear
+	// can be on there at all. "Setup" is not a word on this screen any more;
+	// the only named setups left are ones that add or remove a box, listed at
+	// the bottom as they were.
 	//
 	// It owns no state that outlives it: every action goes back to the page,
-	// which holds the dialogs and the data.
+	// which holds the dialogs and the data, and `changed` asks it to reload.
 	import { createEventDispatcher } from 'svelte';
-	import type { Binding, ChainVariant, Device, Equipment, Room, SignalChain } from '$lib/api';
+	import type { Binding, ChainVariant, Device, Equipment, Room, SignalChain, WhatsOn } from '$lib/api';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
 	import { formatHours } from '$lib/utils';
 	import { COLUMNS, columnOf, roomGlyph } from './layout';
 	import RoomIcon from './RoomIcon.svelte';
-	import { lastUsedPhrase } from './format';
+	import { lastUsedPhrase, variantLabel } from './format';
+	import WhatsOnPicker from './WhatsOnPicker.svelte';
 
 	export let chain: SignalChain;
 	export let variants: ChainVariant[] = [];
@@ -27,25 +26,26 @@
 	export let bindings: Binding[] = [];
 	export let lastUsed: number | null = null;
 	export let sharing = false;
-	export let canFold = false;
+	/** Another chain differs from this one at one box, so it can merge in. */
+	export let canMerge = false;
 	export let rooms: Room[] = [];
 	/** A rooms change is in flight. */
 	export let movingRooms = false;
+	/** This chain's slots, from `GET /chains/{id}/whats-on`; null while loading. */
+	export let whatsOn: WhatsOn | null = null;
+	/** What the last change said, shown under the route. */
+	export let notice = '';
 
 	const dispatch = createEventDispatcher<{
 		close: void;
 		share: boolean;
-		swap: number;
-		promote: ChainVariant;
-		editVariant: ChainVariant;
 		removeVariant: ChainVariant;
-		newVariant: void;
-		overview: void;
-		fold: void;
+		merge: void;
 		delete: void;
 		duplicate: void;
 		edit: void;
 		rooms: number[];
+		changed: string;
 	}>();
 
 	$: inRooms = rooms.filter((r) => r.chain_ids.includes(chain.id)).map((r) => r.id);
@@ -55,26 +55,26 @@
 
 	$: steps = chain.components ?? [];
 	$: mine = variants.filter((v) => v.chain_id === chain.id);
-	$: gearName = (id: number | null | undefined, fallback?: string | null) =>
-		(id != null ? equipment.find((e) => e.id === id)?.name : null) ?? fallback ?? '—';
-	/** What a setup puts at a position, for the read-only "what's on now". */
-	$: optionsAt = (i: number) =>
-		mine.flatMap((v) =>
-			(v.overrides ?? [])
-				.filter((o) => o.position === i)
-				.map((o) => ({ v, name: gearName(o.equipment_id, o.name) }))
-		);
-	/** What a setup changes, for its row's tooltip: "HD 569 → Hexa". */
-	function summary(v: ChainVariant): string {
-		if (!v.overrides?.length) return 'Same as the chain';
-		return v.overrides
-			.map((o) => {
-				const was = steps[o.position]?.name;
-				const now = gearName(o.equipment_id, o.name);
-				return was ? `${was} → ${now}` : `+ ${now}`;
-			})
-			.join(', ');
-	}
+	// Named setups slots could not take in (they add or remove a box). Those
+	// that change no gear are offered as session titles in the inbox.
+	$: older = mine.filter(
+		(v) => !v.auto && (v.overrides ?? []).some((o) => o.equipment_id !== steps[o.position]?.equipment_id)
+	);
+	$: slotAt = (i: number) => whatsOn?.slots.find((s) => s.position === i) ?? null;
+	$: onName = (i: number) => {
+		const sl = slotAt(i);
+		return sl ? (sl.options.find((o) => o.equipment_id === sl.on)?.name ?? steps[i]?.name) : steps[i]?.name;
+	};
+	let openPos: number | null = null;
+	// A different chain closes whatever picker was open.
+	$: chain.id, (openPos = null);
+
+	/** Hours of a piece of gear through this chain, from the same breakdown
+	 *  the gear tiles use, so the two cannot disagree. */
+	$: hoursOf = (id: number) =>
+		(equipment.find((e) => e.id === id)?.sources ?? [])
+			.filter((s) => s.chain_id === chain.id)
+			.reduce((a, s) => a + s.hours, 0);
 	const CONTEXT_TAG: Record<string, string> = {
 		active: 'tag-accent-2',
 		'active-mobile': 'tag-accent-2',
@@ -90,8 +90,13 @@
 				kind: b.interface ?? 'output',
 				says:
 					b.chain_variant_id != null
-						? `Comes here, on ${mine.find((v) => v.id === b.chain_variant_id)?.name ?? 'a setup'}`
-						: 'Comes here, as wired'
+						? `Comes here and puts on ${(() => {
+								const v = mine.find((x) => x.id === b.chain_variant_id);
+								return v ? variantLabel(v, equipment) : 'other gear';
+							})()} by itself`
+						: whatsOn?.slots.length
+							? 'Comes here, on whatever is on now'
+							: 'Comes here'
 			})),
 		...devices
 			.filter((d) => d.default_chain_id === chain.id)
@@ -140,28 +145,46 @@
 		<section aria-label="The route">
 			<div class="kicker">The route</div>
 			{#each steps as s, i}
-				{@const opts = optionsAt(i)}
+				{@const sl = slotAt(i)}
 				<div class="step">
 					<div class="rail">
 						<span class="rdot"></span>
 						{#if i < steps.length - 1}<span class="rline"></span>{/if}
 					</div>
-					<button class="sbody" on:click={() => dispatch('swap', i)} aria-label="Swap {s.name}"
-						title="Swap this step: as a setup, or in the chain itself">
-						<span class="srole">{COLUMNS[columnOf(s.type)]}{opts.length ? ' · what’s on now' : ''}</span>
-						<span class="sname">{s.name}<span class="shint" aria-hidden="true">swap</span></span>
-						{#if s.detail}<span class="sdetail">{s.detail}</span>{/if}
-						{#if opts.length}
-							<span class="alts">
-								<span class="alt cur">{s.name} · as wired</span>
-								{#each opts as o}<span class="alt">{o.name} · {o.v.name}{o.v.total_hours > 0 ? ` · ${formatHours(o.v.total_hours)}` : ''}</span>{/each}
-							</span>
+					<div class="sbox">
+						{#if s.equipment_id != null}
+							<button class="sbody" aria-expanded={openPos === i} on:click={() => (openPos = openPos === i ? null : i)}
+								title={sl ? 'Change what’s on' : 'Gear you swap in here'}>
+								<span class="srole">{s.slot_name ?? COLUMNS[columnOf(s.type)]}{sl ? ' · what’s on now' : ''}</span>
+								<span class="sname">
+									{#if sl}<span class="pill">{onName(i)} ▾</span>{:else}{s.name}{/if}
+									<span class="shint" aria-hidden="true">{sl ? 'change' : '+ swaps'}</span>
+								</span>
+								{#if sl && sl.options.length > 1}
+									<span class="sdetail">or {sl.options.filter((o) => o.equipment_id !== sl.on).map((o) => o.name).join(', ')}</span>
+								{:else if s.detail}<span class="sdetail">{s.detail}</span>{/if}
+							</button>
+							{#if openPos === i}
+								<WhatsOnPicker {chain} position={i} slot={sl} {equipment} {hoursOf}
+									lastPlayEnd={whatsOn?.last_play_end ?? null}
+									on:changed={(e) => dispatch('changed', e.detail)} />
+							{/if}
+						{:else}
+							<div class="sbody static">
+								<span class="srole">{COLUMNS[columnOf(s.type)]}</span>
+								<span class="sname">{s.name}</span>
+								{#if s.detail}<span class="sdetail">{s.detail}</span>{/if}
+							</div>
 						{/if}
-					</button>
+					</div>
 				</div>
 			{:else}
 				<p class="muted">No steps yet. Edit the route to describe the path.</p>
 			{/each}
+			{#if notice}<p class="notice">✓ {notice}</p>{/if}
+			{#if canMerge}
+				<div class="vacts"><button class="vadd" on:click={() => dispatch('merge')}>⤵ Merge a chain in as an option</button></div>
+			{/if}
 		</section>
 
 		<section aria-label="Where it lives">
@@ -186,30 +209,25 @@
 			</p>
 		</section>
 
-		<section aria-label="Setups">
-			<div class="kicker">Setups</div>
-			{#each mine as v (v.id)}
-				<div class="vrow" title={summary(v)}>
-					<span class="vname">{v.name}</span>
-					<span class="vend">
-						<span class="vhrs">{formatHours(v.total_hours)}</span>
-						<button class="ibtn" title="Make this the chain" aria-label="Make {v.name} the chain" on:click={() => dispatch('promote', v)}>★</button>
-						<button class="ibtn" title="Edit this setup" aria-label="Edit setup {v.name}" on:click={() => dispatch('editVariant', v)}>✎</button>
-						<button class="ibtn danger" title="Delete this setup" aria-label="Delete setup {v.name}" on:click={() => dispatch('removeVariant', v)}>✕</button>
-					</span>
-				</div>
-			{:else}
+		{#if older.length}
+			<section aria-label="Kept from before slots">
+				<div class="kicker">Kept from before</div>
 				<p class="muted">
-					Just the one. Add a setup when you swap a single box (the other stylus, the other IEMs)
-					and its hours land on the gear that was actually fitted.
+					Named before slots existed. These add or remove a box rather than swap one, so they can’t be a pick.
+					Their hours stay on the gear they ran through.
 				</p>
-			{/each}
-			<div class="vacts">
-				<button class="vadd" on:click={() => dispatch('newVariant')}>+ setup</button>
-				{#if mine.length}<button class="vadd" on:click={() => dispatch('overview')}>⛓ see all setups</button>{/if}
-				{#if canFold}<button class="vadd" on:click={() => dispatch('fold')}>⤵ fold a chain in</button>{/if}
-			</div>
-		</section>
+				{#each older as v (v.id)}
+					<div class="vrow">
+						<span class="vname">{v.name}</span>
+						<span class="vend">
+							<span class="vhrs">{formatHours(v.total_hours)}</span>
+							<button class="ibtn danger" title="Remove (its plays stay on this chain, as wired)" aria-label="Remove {v.name}"
+								on:click={() => dispatch('removeVariant', v)}>✕</button>
+						</span>
+					</div>
+				{/each}
+			</section>
+		{/if}
 
 		<section aria-label="How plays find this chain">
 			<div class="kicker">How plays find this chain</div>
@@ -403,6 +421,31 @@
 		border-radius: 12px;
 		cursor: pointer;
 	}
+	.sbox {
+		flex: 1;
+		min-width: 0;
+		padding-bottom: 6px;
+	}
+	.sbox .sbody {
+		width: 100%;
+		margin-bottom: 0;
+	}
+	.sbody.static {
+		cursor: default;
+	}
+	.pill {
+		display: inline-flex;
+		align-items: center;
+		padding: 1px 10px;
+		border-radius: 999px;
+		border: 1.5px dashed var(--td-accent);
+		color: var(--td-text);
+	}
+	.notice {
+		margin: 4px 0 0;
+		font-size: 13px;
+		color: var(--td-good-fg);
+	}
 	.sbody:hover,
 	.sbody:focus-visible {
 		background: var(--td-surface2);
@@ -434,25 +477,6 @@
 	.sdetail {
 		font-size: 12.5px;
 		color: var(--td-muted-2);
-	}
-	.alts {
-		display: flex;
-		flex-wrap: wrap;
-		gap: 4px;
-		margin-top: 6px;
-	}
-	.alt {
-		font-size: 11.5px;
-		padding: 1px 8px;
-		border-radius: 999px;
-		border: 1px solid var(--td-border);
-		color: var(--td-muted);
-	}
-	.alt.cur {
-		background: color-mix(in srgb, var(--td-accent) 18%, transparent);
-		border-color: transparent;
-		color: var(--td-text);
-		font-weight: 600;
 	}
 	.rchips {
 		display: flex;

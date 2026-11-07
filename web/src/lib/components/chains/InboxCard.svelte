@@ -101,6 +101,20 @@
 			});
 			return `${r.name} is now ${boxes.find((b) => b.id === boxId)?.name ?? 'that gear'}.`;
 		});
+	const saveMerge = () =>
+		run(async () => {
+			const m = q.merge!;
+			const out = await api.mergeChain(m.chain_id, m.other_chain_id);
+			return `${m.other_gear} is an option on ${m.chain_name} now${out.listens ? `, with ${out.listens} ${out.listens === 1 ? 'play' : 'plays'}` : ''}.`;
+		});
+	const saveMoods = () =>
+		run(async () => {
+			const out = await api.retireMoods((q.setups ?? []).map((s) => s.id));
+			const titled = out.sessions_titled
+				? ` ${out.sessions_titled} listening ${out.sessions_titled === 1 ? 'session has' : 'sessions have'} a title from them.`
+				: '';
+			return `Removed ${out.removed}.${titled}`;
+		});
 	const saveWhere = () =>
 		run(async () => {
 			const out = await api.answerInboxWhere({
@@ -163,6 +177,40 @@
 			<span class="grow"></span>
 			<button class="btn btn-secondary" disabled={busy} on:click={notNow}>Not one of mine</button>
 			<button class="btn btn-primary" disabled={busy || boxId == null} on:click={saveWhich}>Save</button>
+		</div>
+	{:else if q.kind === 'merge' && q.merge}
+		{@const m = q.merge}
+		<h3>Make {m.other_gear} an option on {m.chain_name}?</h3>
+		<p class="muted">
+			{m.other_chain_name} and {m.chain_name} differ only at one box: {m.other_gear} instead of {m.gear}. As one
+			chain, you pick which is on and each keeps its own hours. {m.other_chain_name}’s
+			{formatHours(m.other_hours)} move to {m.chain_name}, filed with {m.other_gear}, along with its outputs,
+			machines and rooms, and {m.other_chain_name} is removed. This can’t be undone.
+		</p>
+		<div class="acts">
+			<span class="grow"></span>
+			<button class="btn btn-secondary" disabled={busy} on:click={notNow}>Keep them apart</button>
+			<button class="btn btn-primary" disabled={busy} on:click={saveMerge}>Make it an option</button>
+		</div>
+	{:else if q.kind === 'moods'}
+		{@const n = (q.setups ?? []).length}
+		<h3>{n === 1 ? 'One setup changes' : `${n} setups change`} no gear</h3>
+		<p class="muted">
+			{n === 1 ? 'It is' : 'They are'} a mood rather than a box, so {n === 1 ? 'it' : 'they'} can’t be a pick at a
+			slot. Each name becomes the title of the listening sessions it was used in, where a session has no title yet,
+			and the setup goes. No hours move.
+		</p>
+		<div class="ticks">
+			{#each q.setups ?? [] as st (st.id)}
+				<div class="chip static">
+					<span class="ct"><b>{st.name}</b><small>{st.chain_name} · {st.plays} {st.plays === 1 ? 'play' : 'plays'}{st.sessions ? ` · titles ${st.sessions} ${st.sessions === 1 ? 'session' : 'sessions'}` : ''}</small></span>
+				</div>
+			{/each}
+		</div>
+		<div class="acts">
+			<span class="grow"></span>
+			<button class="btn btn-secondary" disabled={busy} on:click={notNow}>Not now</button>
+			<button class="btn btn-primary" disabled={busy} on:click={saveMoods}>Make them session titles</button>
 		</div>
 	{:else}
 		<h3>{q.plays} {q.plays === 1 ? 'play' : 'plays'} from {from} landed nowhere. Where were you?</h3>
@@ -245,6 +293,9 @@
 		font: inherit;
 		color: inherit;
 		cursor: pointer;
+	}
+	.chip.static {
+		cursor: default;
 	}
 	.chip.on,
 	.opt.on {

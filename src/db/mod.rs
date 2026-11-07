@@ -3533,6 +3533,7 @@ pub struct ChainVariantRow {
     pub overrides: String,
     pub created_at: i64,
     pub total_hours: f64,
+    pub auto: bool,
 }
 
 /// What a fold moved, so the caller can say it rather than claim success.
@@ -3612,6 +3613,9 @@ pub struct ChainVariant {
     /// question from a chain's total — a chain's hours include every variant
     /// of it, since they all ran through the same chain.
     pub total_hours: f64,
+    /// Kept by Tapedeck for a set of slot picks ("what's on now"); its name
+    /// is internal and never shown. False for a setup someone named.
+    pub auto: bool,
 }
 
 impl From<ChainVariantRow> for ChainVariant {
@@ -3624,6 +3628,7 @@ impl From<ChainVariantRow> for ChainVariant {
             overrides: serde_json::from_str(&r.overrides).unwrap_or_default(),
             created_at: r.created_at,
             total_hours: r.total_hours,
+            auto: r.auto,
         }
     }
 }
@@ -3818,6 +3823,8 @@ pub use inbox::{
     parse_aliases, DeviceBindingRow, InboxQuestion, InboxReporter, ListenOrigin, WhereAnswered,
     INBOX_WINDOW_SECS,
 };
+mod fittings;
+pub use fittings::{FitOutcome, FitRefusal, InboxMerge, InboxSetup, MoodsRetired, Picks, WhatsOn};
 mod rooms;
 mod sanitise;
 pub use rooms::{Room, RoomRefusal};

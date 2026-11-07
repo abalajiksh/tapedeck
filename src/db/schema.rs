@@ -430,6 +430,9 @@ impl Database {
                 name TEXT NOT NULL,
                 overrides JSON NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL,
+                -- Kept by Tapedeck for a combination of slot picks (what is on
+                -- now), never named on screen. `migrate()` adds it too.
+                auto BOOLEAN NOT NULL DEFAULT FALSE,
                 UNIQUE(chain_id, name)
             )",
         )
@@ -864,6 +867,30 @@ impl Database {
                 until INTEGER NOT NULL,
                 UNIQUE(user_id, key)
             )",
+        )
+        .await?;
+
+        // ── What was on when: the history of slot picks ──
+        // One row per switch: from `since`, the chain ran with `variant_id`'s
+        // picks (NULL = every slot on the gear the chain is wired with). A
+        // listen that arrives with a chain and no variant takes the fitting
+        // in effect at its timestamp (`Database::fitted_variant`), so the
+        // hours land on what was actually on. Both era mechanisms stay: a
+        // component's `since` is for wiring changes, this is for slot picks.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS chain_fittings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                chain_id INTEGER NOT NULL REFERENCES signal_chains(id),
+                variant_id INTEGER REFERENCES chain_variants(id),
+                since INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .await?;
+        self.ddl(
+            "CREATE INDEX IF NOT EXISTS idx_chain_fittings_lookup
+                 ON chain_fittings(chain_id, since)",
         )
         .await?;
 

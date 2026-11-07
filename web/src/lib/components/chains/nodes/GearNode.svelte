@@ -14,7 +14,7 @@
 
 	$: options = data.options ?? [];
 	$: optionTitle = options.length
-		? `Swapped in by a setup: ${options.map((o) => `${o.name}${o.hours > 0 ? ` (${formatHours(o.hours)})` : ''}`).join(', ')}`
+		? `Also on at this step: ${options.map((o) => `${o.name}${o.on ? ' (on now)' : ''}${o.hours > 0 ? ` (${formatHours(o.hours)})` : ''}`).join(', ')}`
 		: '';
 </script>
 
@@ -27,7 +27,7 @@
 		<span class="gname">{data.name}</span>
 		<span class="gsub">
 			{data.sub}{#if options.length}<span class="swap" title={optionTitle}
-					>⇄ {options.length} {options.length === 1 ? 'swap' : 'swaps'}</span
+					>⇄ {options.length} {options.length === 1 ? 'option' : 'options'}</span
 				>{/if}
 		</span>
 	</span>

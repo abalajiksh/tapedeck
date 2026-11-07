@@ -81,6 +81,15 @@ impl Database {
         // as `fold_artist_credit`: the fuller form of the credit.
         let artist_credit = play.artists.as_ref().filter(|a| a.len() > 1).map(|a| a.join("; "));
 
+        // What was on at the chain's slots when this was played, unless the
+        // caller named it (an output that picks the earbuds by itself, the
+        // shelf). Here rather than at each caller for the reason the format
+        // fold above is: every write path comes through this one.
+        let chain_variant_id = match (chain_id, chain_variant_id) {
+            (Some(c), None) => self.fitted_variant(user_id, c, play.timestamp as i64).await?,
+            (_, v) => v,
+        };
+
         sqlx::query(&crate::sql!(
             "INSERT INTO scrobbles (
                 user_id, title, artist, artist_credit, artist_display, album, timestamp, duration,

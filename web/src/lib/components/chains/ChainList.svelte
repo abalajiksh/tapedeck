@@ -6,12 +6,14 @@
 	// over what you were looking at. Each row is one button, so the list works
 	// with a keyboard however the graph is drawn.
 	import { createEventDispatcher } from 'svelte';
-	import type { ChainVariant, Room, SignalChain } from '$lib/api';
+	import type { Equipment, Room, SignalChain } from '$lib/api';
 	import ChainIcon from '$lib/components/ChainIcon.svelte';
-	import { lastUsedLabel, swappedPositions } from './format';
+	import { lastUsedLabel, slotPositions } from './format';
 
 	export let chains: SignalChain[] = [];
-	export let variants: ChainVariant[] = [];
+	export let equipment: Equipment[] = [];
+	/** chain id → (step position → gear on now), for chains with slots. */
+	export let onNow: Record<string, Record<string, number>> = {};
 	export let lastUsed: Record<string, number> = {};
 	export let selectedId: number | null = null;
 	export let rooms: Room[] = [];
@@ -45,7 +47,7 @@
 	{#each groups as g (g.key)}
 	{#if g.title}<div class="rhead">{g.title}<span class="n">· {g.list.length}</span></div>{/if}
 	{#each g.list as c (`${g.key}:${c.id}`)}
-		{@const swaps = swappedPositions(c, variants)}
+		{@const slots = slotPositions(c)}
 		{@const steps = (c.components ?? []).filter((s) => s.name.trim())}
 		<button
 			class="place"
@@ -62,7 +64,9 @@
 				<span class="ppath">
 					{#each steps as s, i}
 						{#if i}<span class="ar">→</span>{/if}
-						{#if swaps.has((c.components ?? []).indexOf(s))}<span class="swap" title="A setup swaps this">{s.name} ⇄</span
+						{@const at = (c.components ?? []).indexOf(s)}
+						{#if slots.has(at)}<span class="swap" title="On now; you swap gear at this step"
+								>{equipment.find((e) => e.id === onNow[String(c.id)]?.[String(at)])?.name ?? s.name} ▾</span
 							>{:else}{s.name}{/if}
 					{:else}
 						<span class="none">No steps yet</span>

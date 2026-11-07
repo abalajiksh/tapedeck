@@ -340,6 +340,8 @@ impl Database {
             "chain_bindings",
             "device_bindings",
             "chain_inbox_dismissed",
+            // Slot-pick history names a chain and a variant.
+            "chain_fittings",
             "devices",
             // A room's link rows point at a chain and a room, so they clear
             // before both; the rooms point at nothing else.

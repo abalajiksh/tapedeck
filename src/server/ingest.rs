@@ -613,10 +613,9 @@ pub async fn submit_listens(
         // a chain arriving from the wrong rung looks identical to one arriving
         // from the right one.
         //
-        // Only rung 2 names a setup (variant). The person who mapped the output
-        // said what is usually on it; a chain name, a token or a machine is a
-        // statement about the chain alone, so their listens go through it as
-        // wired.
+        // Only the output rungs name a variant: the person who mapped the
+        // output said what it picks by itself (the earbuds a Bluetooth name
+        // gives away). Every other rung takes what is on now, below.
         let (chain_id, chain_variant_id, chain_source): (Option<i64>, Option<i64>, &'static str) =
             if let Some(name) = explicit_chain_name {
                 match state.db.get_chain_by_name(user.user_id, name).await {
@@ -652,6 +651,16 @@ pub async fn submit_listens(
             } else {
                 (None, None, "none")
             };
+
+        // What is on at the chain's slots at the play's time, when no rung
+        // named it. `save_scrobble` applies the same rule on its own; it is
+        // looked up here so the dry run reports what will be filed.
+        let chain_variant_id = match (chain_id, chain_variant_id) {
+            (Some(c), None) => {
+                state.db.fitted_variant(user.user_id, c, timestamp).await.ok().flatten()
+            }
+            (_, v) => v,
+        };
 
         // ── Phase 2: Listening context from chain default ──
         // Fetched once: the context and the chain's name both come off the same

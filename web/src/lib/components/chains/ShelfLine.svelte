@@ -1,5 +1,5 @@
 <script lang="ts">
-	// Gear no chain or setup names, as one line you can open.
+	// Gear no chain or slot names, as one line you can open.
 	//
 	// Everything wired is already on the graph with its hours, so the only gear
 	// left to show is what sits on the shelf: new, spare, or lent out. One
@@ -9,7 +9,7 @@
 	import type { Equipment } from '$lib/api';
 
 	export let equipment: Equipment[] = [];
-	/** Gear a chain or a setup names: everything not on the shelf. */
+	/** Gear a chain or a slot names: everything not on the shelf. */
 	export let inUse: Set<number> = new Set();
 	/** Gear a chain step names, which is what the graph draws as a box. */
 	export let onGraph: Set<number> = new Set();
@@ -26,7 +26,7 @@
 	$: shelf = equipment.filter((e) => !inUse.has(e.id)).sort((a, b) => a.name.localeCompare(b.name));
 	$: lent = shelf.filter((e) => e.status === 'lent').length;
 	$: drawn = equipment.filter((e) => onGraph.has(e.id)).length;
-	// In use but not a box of its own: gear only a setup swaps in.
+	// In use but not a box of its own: gear only a slot swaps in.
 	$: swappedIn = equipment.length - shelf.length - drawn;
 </script>
 
@@ -36,7 +36,7 @@
 			<span class="stitle">Gear</span>
 			<span class="smeta">
 				· {equipment.length} {equipment.length === 1 ? 'piece' : 'pieces'} · {drawn} on the graph above{swappedIn
-					? ` · ${swappedIn} swapped in by a setup`
+					? ` · ${swappedIn} swapped in at a step`
 					: ''} · {shelf.length} on the shelf{lent ? `, ${lent} of them lent out` : ''}
 			</span>
 		</div>

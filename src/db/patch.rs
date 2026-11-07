@@ -3564,6 +3564,37 @@ impl Database {
             .await?;
         }
 
+        // The history of slot picks follows the same two rules, in the same
+        // order: a stretch as wired was the old base, and a stretch on the
+        // promoted variant is now the chain as wired.
+        sqlx::query(&crate::sql!(
+            "UPDATE chain_fittings SET variant_id = ?
+              WHERE user_id = ? AND chain_id = ? AND variant_id IS NULL"
+        ))
+        .bind(old_variant_id)
+        .bind(user_id)
+        .bind(chain_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&crate::sql!(
+            "UPDATE chain_fittings SET variant_id = NULL WHERE user_id = ? AND variant_id = ?"
+        ))
+        .bind(user_id)
+        .bind(variant_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // A slot keeps its options when what is wired at it changes.
+        let mut new_base = new_base;
+        for (i, c) in new_base.iter_mut().enumerate() {
+            if c.options.is_none() {
+                if let Some(b) = base.get(i) {
+                    c.options = b.options.clone();
+                    c.slot_name = b.slot_name.clone();
+                }
+            }
+        }
+
         // 4. The chain becomes what the variant described, and the variant row
         //    goes — it is the chain now.
         sqlx::query(&crate::sql!(

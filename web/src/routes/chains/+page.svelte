@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
 	import { api } from '$lib/api';
-	import type { DeviceBinding, InboxQuestion, Room, SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant, FoldSuggestion } from '$lib/api';
+	import type { DeviceBinding, InboxQuestion, Room, SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant, FoldSuggestion, WhatsOn } from '$lib/api';
 	import { formatHours, timeAgo, toDateInput, fromDateInput, ownedFor, formatDateTime } from '$lib/utils';
 	import ChainIcon, { CHAIN_ICONS, CHAIN_ICON_LABELS } from '$lib/components/ChainIcon.svelte';
 	import ChainGraph from '$lib/components/chains/ChainGraph.svelte';
@@ -12,7 +12,7 @@
 	import RoomSuggest from '$lib/components/chains/RoomSuggest.svelte';
 	import InboxCard from '$lib/components/chains/InboxCard.svelte';
 	import { gearInUse } from '$lib/components/chains/layout';
-	import { lastUsedPhrase } from '$lib/components/chains/format';
+	import { lastUsedPhrase, variantLabel } from '$lib/components/chains/format';
 	import { syncUrl } from '$lib/url';
 
 	let chains: SignalChain[] = [];
@@ -29,15 +29,6 @@
 	$: mapped = bindings.filter((b) => b.chain_id != null);
 	$: unmappedDevices = devices.filter((d) => d.default_chain_id == null);
 
-	// ── Variants ──
-	//
-	// A chain with one step swapped. Two cartridges on one turntable, or the
-	// same commute on different IEMs, are one chain and a choice — modelling
-	// them as separate chains is what turns a modest gear collection into a page
-	// of near-duplicates, and it is also what makes per-stylus hours
-	// unanswerable, since "which chain" does not say what was fitted.
-	$: variantsFor = (chainId: number | null | undefined) =>
-		variants.filter((v) => v.chain_id === chainId);
 
 	// ── The role palette ──
 	//
@@ -80,33 +71,6 @@
 	// the whole list would otherwise reload under an open drawer.
 	let sharingChain: number | null = null;
 
-	/// Make a variant the chain, and the chain a variant.
-	///
-	/// `confirm`, not `prompt` — this page and the rest of the app use dialogs
-	/// and `confirm`, and `prompt` would be the only one in the codebase. The
-	/// setup the chain is demoted to needs a name, so it takes the chain's own,
-	/// which is what somebody would call it after the fact; the ✎ beside it
-	/// renames it in one click if they want something else.
-	///
-	/// Worth confirming even though nothing is destroyed: it rewrites the chain
-	/// everything else on this page is described in terms of, and the reassuring
-	/// half — that no hours move — is not guessable from the button.
-	async function promote(chain: SignalChain, v: ChainVariant) {
-		const ok = confirm(
-			`Make “${v.name}” the chain itself?\n\n` +
-				`“${chain.name}” as it stands now becomes a setup, keeping that name. ` +
-				`Nothing about what was fitted for any listen changes and no gear's hours move — ` +
-				`it is a relabelling.`
-		);
-		if (!ok) return;
-		try {
-			await api.promoteVariant(v.id, chain.name);
-			await load();
-		} catch (e) {
-			alert(e instanceof Error ? e.message : 'Could not do that');
-		}
-	}
-
 	async function toggleShared(chain: SignalChain, on: boolean) {
 		sharingChain = chain.id;
 		try {
@@ -129,6 +93,32 @@
 	// variant you just added.
 	let openChainId: number | null = null;
 	$: openChain = chains.find((c) => c.id === openChainId) ?? null;
+
+	// What's on now at the open chain's slots: fetched when the drawer opens
+	// and after every change made in it.
+	let whatsOn: WhatsOn | null = null;
+	let drawerNotice = '';
+	let whatsOnFor: number | null = null;
+	$: if (openChainId !== whatsOnFor) {
+		whatsOnFor = openChainId;
+		drawerNotice = '';
+		void loadWhatsOn();
+	}
+	async function loadWhatsOn() {
+		const id = openChainId;
+		if (id == null) { whatsOn = null; return; }
+		try {
+			const w = await api.getWhatsOn(id);
+			if (openChainId === id) whatsOn = w;
+		} catch {
+			if (openChainId === id) whatsOn = null;
+		}
+	}
+	async function drawerChanged(text: string) {
+		drawerNotice = text;
+		await load();
+		await loadWhatsOn();
+	}
 	// Sorted by hours: the chain you actually listen through is the one worth
 	// putting at the top, and a page of chains ordered by creation date buries
 	// it under whatever you set up most recently.
@@ -142,6 +132,8 @@
 	// lit route survives a reload and Back undoes a pick, through `syncUrl`.
 	let selectedChainId: number | null = null;
 	let lastUsed: Record<string, number> = {};
+	/** chain id → (step position → gear on now), for chains with slots. */
+	let onNow: Record<string, Record<string, number>> = {};
 
 	// ── Rooms ──
 	// Where chains live. A filter on the list and the graph, in the URL
@@ -223,232 +215,18 @@
 	}
 	$: totalChainHours = chains.reduce((a, c) => a + c.total_hours, 0);
 
-	// ── The setups overview ──
-	//
-	// One picture of a chain and every variant of it, read-only. A variant is
-	// stored as *only what differs*, which is what makes editing one cheap and
-	// what makes the arrangement hard to hold in your head once there are three
-	// of them: the drawer can tell you a variant swaps the cartridge, and not
-	// what the whole shelf of possibilities looks like at once.
-	//
-	// It is a grid rather than a canvas, and that is not a compromise — a chain
-	// is a *line* (`components` is an array), so the only branching there can be
-	// is at a known position. Columns are positions, rows are setups, and the
-	// top row is the chain itself: the standard. A variant's row shows its
-	// overrides and passes everything else through, which means a variant that
-	// swaps **two** boxes reads as one row with two changes rather than as two
-	// separate things — the shape today's editor cannot create but the schema
-	// has always allowed.
-	let overviewOpen = false;
-
-	/** How many columns the picture needs: the chain's own steps, plus any
-	 *  position a variant adds past the end. */
-	function overviewSlots(c: SignalChain, vs: ChainVariant[]): number {
-		const base = c.components?.length ?? 0;
-		return vs.reduce(
-			(n, v) => v.overrides.reduce((m, o) => Math.max(m, o.position + 1), n),
-			base
-		);
-	}
-
-	/** What a variant puts at one position — `null` where the chain's own step
-	 *  passes straight through, which is most of them. */
-	function overrideAt(v: ChainVariant, i: number) {
-		return v.overrides.find((o) => o.position === i) ?? null;
-	}
-
-	/** The name a cell shows for an override. The stored snapshot wins over the
-	 *  gear table for the reason `ChainComponent.name` is written at all: gear
-	 *  can be deleted, and a row that goes blank is worse than one that is out
-	 *  of date. */
-	function overrideName(o: { equipment_id?: number | null; name?: string | null }): string {
-		return o.name ?? equipment.find((e) => e.id === o.equipment_id)?.name ?? '—';
-	}
-
 	function onKey(e: KeyboardEvent) {
 		if (e.key === 'Escape') {
 			// Innermost first, or Escape closes the drawer out from under the
 			// overlay sitting on top of it.
-			if (overviewOpen) overviewOpen = false;
-			else if (openChainId != null) openChainId = null;
+			if (openChainId != null) openChainId = null;
 		}
-	}
-
-	// The variant editor, which is also the swap editor.
-	//
-	// `vMode` is what makes a node in the path clickable. Swapping a box has two
-	// honest meanings and the old dialog could only say one of them: *this chain
-	// is wired differently now* (replace the step), or *this is the other stylus
-	// I sometimes fit* (a variant). They are not the same claim about the past —
-	// replacing rewrites what every listen through this chain is taken to have
-	// run through, where a variant leaves them alone — so the choice is on the
-	// dialog rather than inferred, and `variant` is the default because it is
-	// the non-destructive one.
-	let vOpen = false;
-	let vChain: SignalChain | null = null;
-	let vId: number | null = null;
-	let vMode: 'variant' | 'chain' = 'variant';
-	let vName = '';
-	let vSlot = 0;
-	let vGear: number | null = null;
-	let vErr = '';
-	let vSaving = false;
-
-	/**
-	 * Click a node in the path.
-	 *
-	 * v0.62.0 fixed *browsing* — cards became rows and a drawer — and left
-	 * *editing* as the form dialog it always was. These are different screens
-	 * and only the first was ever touched, which is why the editor still asked
-	 * you to find a step in a list of selects rather than pointing at the one on
-	 * screen. The path in the drawer is already drawn; this makes it the thing
-	 * you act on.
-	 */
-	function openSwap(c: SignalChain, i: number) {
-		bindFor = null;
-		vChain = c;
-		vId = null;
-		vMode = 'variant';
-		vName = '';
-		vErr = '';
-		vSlot = i;
-		vGear = c.components?.[i]?.equipment_id ?? null;
-		vOpen = true;
-	}
-
-	function newVariant(c: SignalChain) {
-		bindFor = null;
-		vChain = c;
-		vId = null;
-		vMode = 'variant';
-		vName = '';
-		vErr = '';
-		// The last step is the usual thing you swap — headphones, IEMs, a
-		// cartridge at the other end. Not a rule, just the better default.
-		vSlot = Math.max(0, (c.components?.length ?? 1) - 1);
-		vGear = null;
-		vOpen = true;
-	}
-
-	/**
-	 *  Open the editor on a variant that already exists.
-	 *
-	 *  `saveVariant` has always handled the update — `vId != null` calls
-	 *  `api.updateVariant`, and the dialog even titles itself "Edit variant" for
-	 *  it. Nothing ever set `vId`, so that branch and that title could not be
-	 *  reached: the only way to change a variant was to delete it and build it
-	 *  again, which takes its hours with it. Reported after folding two chains
-	 *  together, because a fold *creates* a variant and there was then no way
-	 *  back into it.
-	 *
-	 *  The editor holds one override, so it opens on the variant's first — which
-	 *  is the only one anything in this UI can create.
-	 */
-	function editVariant(c: SignalChain, v: ChainVariant) {
-		bindFor = null;
-		vChain = c;
-		vId = v.id;
-		// Editing an existing variant is never a chain rewrite: the variant is
-		// the thing being opened, and offering to redirect the save onto the
-		// chain instead would be a different, destructive operation wearing the
-		// same button.
-		vMode = 'variant';
-		vName = v.name;
-		vErr = '';
-		const first = v.overrides?.[0];
-		vSlot = first?.position ?? Math.max(0, (c.components?.length ?? 1) - 1);
-		vGear = first?.equipment_id ?? null;
-		vOpen = true;
-	}
-
-	async function saveVariant() {
-		if (!vChain?.id) return;
-		if (vGear == null) { vErr = 'Pick the gear that goes in that slot.'; return; }
-		// Replacing a step in the chain needs no name — the chain already has
-		// one. Only a variant is a new thing that has to be called something.
-		if (vMode === 'chain') return replaceStep();
-		if (!vName.trim()) { vErr = 'A setup needs a name.'; return; }
-		vSaving = true;
-		vErr = '';
-		try {
-			const overrides = [{
-				position: vSlot,
-				equipment_id: vGear,
-				name: equipment.find((e) => e.id === vGear)?.name ?? null
-			}];
-			if (vId == null) {
-				const made = await api.createVariant({ chain_id: vChain.id, name: vName.trim(), overrides });
-				// Opened from an output: the setup exists so that output can carry it.
-				if (bindFor) await api.setBinding(bindFor.identifier, vChain.id, made.id);
-			} else await api.updateVariant(vId, { name: vName.trim(), overrides });
-			vOpen = false;
-			bindFor = null;
-			await load();
-		} catch (e) {
-			vErr = String(e).replace(/^API \d+: /, '');
-		}
-		vSaving = false;
-	}
-
-	/**
-	 * Rewire the chain itself, rather than recording a variant of it.
-	 *
-	 * The consequence to be clear about, and the dialog says it: this is
-	 * **retroactive**. Chain hours are derived from the listens
-	 * (`db::CHAIN_COLUMNS`), so replacing a step moves every hour ever logged
-	 * through this chain onto the new box — including the ones that ran through
-	 * the old one. That is right when you sold the amp and the chain is simply
-	 * different now, and wrong when you swap between two you still own, which is
-	 * what a variant is for.
-	 *
-	 * A step past the end appends, matching what `chain_variants` allows: a
-	 * chain that never named a cartridge can gain one without being rewritten.
-	 */
-	async function replaceStep() {
-		const c = vChain;
-		if (!c || vGear == null) return;
-		const g = equipment.find((e) => e.id === vGear);
-		if (!g) { vErr = 'That gear is no longer in your equipment.'; return; }
-		vSaving = true;
-		vErr = '';
-		try {
-			const comps = (c.components ?? []).map((x) => ({ ...x }));
-			const was = comps[vSlot];
-			const step: ChainComponent = {
-				// The slot's own type wins where there is a slot: it is what the
-				// chain says this position *is*, and the gear type is only a
-				// guess at it. A new step at the end has no slot to ask.
-				type: was?.type ?? componentTypeForGear[g.equipment_type] ?? 'transducer',
-				name: g.name,
-				// The detail described the box that was here, not the position —
-				// "Ortofon 2M Red" under a step now naming an Audio-Technica is
-				// worse than nothing, and nothing errors. Kept only when the gear
-				// did not actually change, which is the case where the user opened
-				// the swap and picked what was already there.
-				detail: was?.equipment_id === g.id ? (was?.detail ?? null) : null,
-				equipment_id: g.id
-			};
-			if (vSlot < comps.length) comps[vSlot] = step;
-			else comps.push(step);
-			await api.updateChain(c.id, {
-				name: c.name,
-				description: c.description || undefined,
-				listening_context: c.listening_context,
-				icon: c.icon,
-				components: comps
-			});
-			vOpen = false;
-			await load();
-		} catch (e) {
-			vErr = String(e).replace(/^API \d+: /, '');
-		}
-		vSaving = false;
 	}
 
 	async function removeVariant(v: ChainVariant) {
-		// The listens keep their chain and fall back to its base components,
-		// which is what a null variant means everywhere — so this is not the
-		// destructive act deleting a chain would be, and needs no confirmation.
+		// The listens keep their chain and fall back to it as wired, which is
+		// what a null variant means everywhere — so this is not the destructive
+		// act deleting a chain would be, and needs no confirmation.
 		try {
 			await api.deleteVariant(v.id);
 			await load();
@@ -457,109 +235,75 @@
 		}
 	}
 
-	// ── Folding a near-duplicate chain in ──
+	// ── Merging a chain that swaps one box ──
 	//
-	// Variants shipped forward-looking: build one, and listens tagged with it
-	// from then on credit the gear fitted. But the case they were designed
-	// against already existed as two chains — the same commute with different
-	// IEMs — each holding real hours. Creating the variant did nothing to the
-	// duplicate: it kept its own listens, its own total, and its own row on the
-	// page whose whole complaint was near-duplicate rows.
-	//
-	// So the fold moves the listening across and deletes the chain, and the
-	// hours that were split across two rows that could not be compared add up
-	// on one.
+	// Two chains that differ at one box past the player (Commute Phone on the
+	// HD 569, Summer Commute on the Hexa) are one chain with a slot. The inbox
+	// asks once; this is the same thing from the drawer, any time. The other
+	// chain's listening moves across filed with its gear, and it is deleted.
 	let dupes: FoldSuggestion[] = [];
 
-	let fOpen = false;
-	let fInto: SignalChain | null = null;      // the chain being kept
-	let fFrom: number | null = null;           // the chain folding into it
-	// Either a variant that exists, or a name to derive one from — never both,
-	// which is why this is one control with a sentinel rather than two fields
-	// that can disagree.
-	let fVariant: number | 'new' = 'new';
-	let fName = '';
-	let fErr = '';
-	let fBusy = false;
-	let fDone: string | null = null;
+	let mOpen = false;
+	let mInto: SignalChain | null = null; // the chain kept
+	let mFrom: number | null = null; // the chain that becomes an option
+	let mErr = '';
+	let mBusy = false;
+	let mDone: string | null = null;
 
-	/** Chains that could fold into this one: everything else the user owns,
-	 *  nearest wiring first, and never one carrying variants of its own. */
-	$: foldable = (into: SignalChain | null) =>
+	const PLAYERS = new Set(['source', 'transport']);
+	/** Chains that can merge into this one as an option: one box apart at a
+	 *  step past the player, and carrying no setups of their own. */
+	$: mergeable = (into: SignalChain | null) =>
 		into?.id == null
 			? []
-			: chains
-					.filter((c) => c.id !== into.id && !variants.some((v) => v.chain_id === c.id))
-					.map((c) => ({
-						chain: c,
-						// `distance` comes from the server for the pairs it
-						// considers near-duplicates; anything else is simply a
-						// different rig and sorts last.
-						dupe: dupes.find(
-							(d) =>
-								(d.base_chain_id === into.id && d.fold_chain_id === c.id) ||
-								(d.fold_chain_id === into.id && d.base_chain_id === c.id)
-						)
-					}))
-					.sort((a, b) => (a.dupe?.distance ?? 99) - (b.dupe?.distance ?? 99));
+			: dupes
+					.filter((d) => d.distance === 1 && d.overrides.length === 1 && (d.base_chain_id === into.id || d.fold_chain_id === into.id))
+					.map((d) => {
+						const other = chains.find((c) => c.id === (d.base_chain_id === into.id ? d.fold_chain_id : d.base_chain_id));
+						const pos = d.overrides[0].position;
+						return { other, pos, mine: into.components?.[pos], theirs: other?.components?.[pos] };
+					})
+					.filter(
+						(m) =>
+							m.other &&
+							m.mine?.equipment_id != null &&
+							m.theirs?.equipment_id != null &&
+							!PLAYERS.has(m.mine.type) &&
+							(m.other.components?.length ?? 0) === (into.components?.length ?? 0) &&
+							!variants.some((v) => v.chain_id === m.other?.id)
+					);
 
-	function openFold(into: SignalChain, from?: number) {
-		fInto = into;
-		fErr = '';
-		fDone = null;
-		const options = foldable(into);
-		fFrom = from ?? options[0]?.chain.id ?? null;
-		pickFoldDefaults();
-		fOpen = true;
+	function openMerge(into: SignalChain, from?: number) {
+		mInto = into;
+		mErr = '';
+		mDone = null;
+		mFrom = from ?? mergeable(into)[0]?.other?.id ?? null;
+		mOpen = true;
 	}
 
-	/** Preselect the variant they already built for this pairing, if there is
-	 *  one — that is the whole state this feature exists to resolve, and
-	 *  offering to create a second variant wired identically would be the wrong
-	 *  default in exactly the case that matters. */
-	function pickFoldDefaults() {
-		const d = dupes.find(
-			(x) => x.base_chain_id === fInto?.id && x.fold_chain_id === fFrom
-		);
-		if (d?.matching_variant) {
-			fVariant = d.matching_variant[0];
-			fName = '';
-		} else {
-			fVariant = 'new';
-			fName = chains.find((c) => c.id === fFrom)?.name ?? '';
-		}
-	}
-
-	async function doFold() {
-		if (fFrom == null || fInto?.id == null) { fErr = 'Pick a chain to fold in.'; return; }
-		if (fVariant === 'new' && !fName.trim()) { fErr = 'Name the setup it becomes.'; return; }
-		fBusy = true;
-		fErr = '';
+	async function doMerge() {
+		if (mFrom == null || mInto?.id == null) { mErr = 'Pick a chain to merge in.'; return; }
+		mBusy = true;
+		mErr = '';
 		try {
-			const r = await api.foldChain(fFrom, {
-				into_chain_id: fInto.id,
-				...(fVariant === 'new' ? { variant_name: fName.trim() } : { variant_id: fVariant })
-			});
-			// Said rather than assumed: a fold that moved no listens is a real
-			// outcome (an unused duplicate), and reporting "done" for both
-			// hides the difference.
-			fDone =
-				`Folded into “${fInto.name}” as “${r.variant_name}”. ` +
+			const m = mergeable(mInto).find((x) => x.other?.id === mFrom);
+			const r = await api.mergeChain(mInto.id, mFrom);
+			// Said rather than assumed: a merge that moved no listens is a real
+			// outcome (an unused duplicate).
+			mDone =
+				`${m?.theirs?.name ?? 'Its gear'} is an option on “${mInto.name}” now. ` +
 				(r.listens
-					? `${r.listens} listen${r.listens > 1 ? 's' : ''} moved` +
-					  (r.sides ? `, ${r.sides} side${r.sides > 1 ? 's' : ''}` : '') +
+					? `${r.listens} listen${r.listens > 1 ? 's' : ''} moved with it` +
 					  (r.devices || r.tokens || r.bindings
-							? `, and ${r.devices + r.tokens + r.bindings} attribution rule${
-									r.devices + r.tokens + r.bindings > 1 ? 's' : ''
-							  }`
+							? `, and ${r.devices + r.tokens + r.bindings} rule${r.devices + r.tokens + r.bindings > 1 ? 's' : ''} for where plays go`
 							: '') +
 					  '.'
 					: 'It had no listening of its own.');
 			await load();
 		} catch (e) {
-			fErr = String(e).replace(/^API \d+: /, '');
+			mErr = String(e).replace(/^API \d+: /, '');
 		}
-		fBusy = false;
+		mBusy = false;
 	}
 
 	const contexts = ['active', 'active-mobile', 'passive', 'background', 'unknown'];
@@ -713,6 +457,7 @@
 			]);
 			chains = c.chains;
 			lastUsed = c.last_used ?? {};
+			onNow = c.on_now ?? {};
 			variants = v.variants;
 			dupes = dup.duplicates;
 			equipment = g.equipment;
@@ -725,48 +470,92 @@
 		loading = false;
 	}
 
-	// ── Outputs: a chain, or one setup of it ──
+	// ── Outputs: a chain, or a chain and what the output puts on ──
 	//
-	// One picker rather than a chain picker and a setup picker beside it
-	// (Ashwin's call, 2026-11-04): each chain with setups is a group, so the
-	// choice is a single value and a setup can never be paired with the wrong
-	// chain. It also carries the two ways to make what is missing, because an
-	// output that fits nothing you have is exactly when you want one.
+	// One picker (Ashwin's call, 2026-11-04): a chain with slots is a group,
+	// so the choice is a single value and a pick can never be paired with the
+	// wrong chain. "Puts on TW4 by itself" is for an output whose name gives
+	// the gear away (Bluetooth earbuds); every other output takes whatever is
+	// on now. It also carries the way to make a chain, because an output that
+	// fits nothing you have is exactly when you want one.
 	//
-	// Values: '' unmapped · `c:<chain>` as wired · `v:<variant>` a setup ·
-	// `new-chain` / `new-setup` open an editor.
+	// Values: '' unmapped · `c:<chain>` on whatever is on now ·
+	// `p:<chain>:<position>:<gear>` puts that gear on by itself ·
+	// `v:<variant>` an older pinned variant no single pick describes ·
+	// `new-chain` opens the editor.
 
-	/** The output a chain or setup editor was opened from. Saving maps it. */
+	/** The output a chain editor was opened from. Saving maps it. */
 	let bindFor: Binding | null = null;
 
-	const bindingValue = (b: Binding) =>
-		b.chain_id == null ? '' : b.chain_variant_id != null ? `v:${b.chain_variant_id}` : `c:${b.chain_id}`;
+	/** The single slot pick a variant describes, if that is all it is. */
+	function pickOf(v: ChainVariant): { pos: number; eq: number } | null {
+		const o = v.overrides ?? [];
+		if (o.length !== 1 || o[0].equipment_id == null) return null;
+		const c = chains.find((x) => x.id === v.chain_id);
+		const step = c?.components?.[o[0].position];
+		return step?.options?.includes(o[0].equipment_id) ? { pos: o[0].position, eq: o[0].equipment_id } : null;
+	}
+	function outputValue(b: { chain_id: number | null; chain_variant_id: number | null }): string {
+		if (b.chain_id == null) return '';
+		if (b.chain_variant_id == null) return `c:${b.chain_id}`;
+		const v = variants.find((x) => x.id === b.chain_variant_id);
+		const p = v ? pickOf(v) : null;
+		return p ? `p:${b.chain_id}:${p.pos}:${p.eq}` : `v:${b.chain_variant_id}`;
+	}
+	const bindingValue = (b: Binding) => outputValue(b);
+	const gearName = (id: number) => equipment.find((e) => e.id === id)?.name ?? 'other gear';
+	/** The picks a chain's output can make by itself: every option at every
+	 *  slot that is not the wired gear. */
+	$: picksFor = (c: SignalChain) =>
+		(c.components ?? []).flatMap((s, i) =>
+			(s.options ?? []).filter((eq) => eq !== s.equipment_id).map((eq) => ({ value: `p:${c.id}:${i}:${eq}`, label: `${c.name} · puts on ${gearName(eq)} by itself` }))
+		);
+	/** Older pinned variants an output points at that no single pick says. */
+	$: pinnedFor = (c: SignalChain, current: string) =>
+		current.startsWith('v:')
+			? variants.filter((v) => v.chain_id === c.id && `v:${v.id}` === current).map((v) => ({ value: current, label: `${c.name} · ${variantLabel(v, equipment)}` }))
+			: [];
+
+	/** Turn a picker value into the (chain, variant) a binding stores, making
+	 *  the variant for a pick when no variant says exactly that yet. */
+	async function resolveOutputValue(value: string): Promise<[number | null, number | null] | null> {
+		if (value === '') return [null, null];
+		if (value.startsWith('c:')) return [Number(value.slice(2)), null];
+		if (value.startsWith('v:')) {
+			const v = variants.find((x) => x.id === Number(value.slice(2)));
+			return v ? [v.chain_id, v.id] : null;
+		}
+		if (value.startsWith('p:')) {
+			const [cid, pos, eq] = value.slice(2).split(':').map(Number);
+			const have = variants.find((v) => v.chain_id === cid && pickOf(v)?.pos === pos && pickOf(v)?.eq === eq);
+			if (have) return [cid, have.id];
+			// Tapedeck takes a setup that swaps one box as a pick of its own
+			// on the next read (`adopt_setups`), so this is never named on screen.
+			const made = await api.createVariant({
+				chain_id: cid,
+				name: `picks ${gearName(eq)} · ${Date.now()}`,
+				overrides: [{ position: pos, equipment_id: eq, name: gearName(eq) }]
+			});
+			return [cid, made.id];
+		}
+		return null;
+	}
 
 	async function assignBinding(b: Binding, sel: HTMLSelectElement) {
 		const value = sel.value;
-		if (value === 'new-chain' || value === 'new-setup') {
+		if (value === 'new-chain') {
 			// Put the select back on what is saved: the editor might be cancelled,
 			// and a picker reading "+ New chain…" over an output that is still
 			// unmapped would be a lie.
 			sel.value = bindingValue(b);
-			if (value === 'new-chain') newChainForOutput(b);
-			else newSetupForOutput(b);
+			newChainForOutput(b);
 			return;
 		}
-		let cid: number | null = null;
-		let vid: number | null = null;
-		if (value.startsWith('c:')) cid = Number(value.slice(2));
-		else if (value.startsWith('v:')) {
-			const v = variants.find((x) => x.id === Number(value.slice(2)));
-			if (!v) return;
-			cid = v.chain_id;
-			vid = v.id;
-		}
 		try {
-			await api.setBinding(b.identifier, cid, vid);
-			bindings = bindings.map((x) =>
-				x.id === b.id ? { ...x, chain_id: cid, chain_variant_id: vid } : x
-			);
+			const r = await resolveOutputValue(value);
+			if (!r) return;
+			await api.setBinding(b.identifier, r[0], r[1]);
+			await load();
 		} catch (e) {
 			sel.value = bindingValue(b);
 			alert('Failed to map that output: ' + e);
@@ -791,47 +580,16 @@
 		}
 	}
 
-	/** A new setup for this output, of the chain it is on already, or of the
-	 *  chain you listen through most when it is on none. The dialog lets you
-	 *  pick a different chain either way. */
-	function newSetupForOutput(b: Binding) {
-		const c = chains.find((x) => x.id === b.chain_id) ?? chainRows[0];
-		if (!c) return;
-		newVariant(c);
-		bindFor = b;
-	}
-
-	/** The setup dialog's chain picker, shown only when it was opened from an
-	 *  output. Changing chain starts the swap over: the slot and the gear were
-	 *  positions in the other chain. */
-	function pickSetupChain(raw: string) {
-		const c = chains.find((x) => x.id === Number(raw));
-		if (!c) return;
-		vChain = c;
-		vSlot = Math.max(0, (c.components?.length ?? 1) - 1);
-		vGear = null;
-	}
-
 	function closeChainEditor() { chainOpen = false; bindFor = null; }
-	function closeSetupEditor() { vOpen = false; bindFor = null; }
 	// ── Outputs of one box ──
-	// The same chain-or-setup values as the picker for outputs by name, and
-	// the same rule that the setup always travels with its chain.
-	const deviceBindingValue = (b: DeviceBinding) =>
-		b.chain_id == null ? '' : b.chain_variant_id != null ? `v:${b.chain_variant_id}` : `c:${b.chain_id}`;
+	// The same values as the picker for outputs by name.
+	const deviceBindingValue = (b: DeviceBinding) => outputValue(b);
 	async function assignDeviceBinding(b: DeviceBinding, value: string) {
-		let cid: number | null = null;
-		let vid: number | null = null;
-		if (value.startsWith('c:')) cid = Number(value.slice(2));
-		if (value.startsWith('v:')) {
-			const v = variants.find((x) => x.id === Number(value.slice(2)));
-			if (!v) return;
-			cid = v.chain_id;
-			vid = v.id;
-		}
 		try {
-			await api.setBinding(b.identifier, cid, vid, b.equipment_id);
-			deviceBindings = (await api.getBindings()).device_bindings ?? [];
+			const r = await resolveOutputValue(value);
+			if (!r) return;
+			await api.setBinding(b.identifier, r[0], r[1], b.equipment_id);
+			await load();
 		} catch (e) {
 			alert(e instanceof Error ? e.message : 'Could not save that output');
 		}
@@ -1213,25 +971,7 @@
 			<span class="nudge-cta">Review →</span>
 		</button>
 	{/if}
-	<!-- Two chains that are the same rig split their hours across two rows that
-	     cannot be compared — wrong *now*, not merely wrong for future listens. -->
-	{#if dupes.length}
-		<button class="nudge" aria-label="Fold near-duplicate chains together"
-			on:click={() => {
-				const d = dupes[0];
-				const into = chains.find((c) => c.id === d.base_chain_id);
-				if (into) openFold(into, d.fold_chain_id);
-			}}>
-			<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><path d="M8 3v6l-4 3 4 3v6M16 3v6l4 3-4 3v6"/></svg>
-			<span style="flex:1;font-size:13.5px;">
-				{dupes.length === 1 ? '“' + dupes[0].fold_name + '” is' : dupes.length + ' chains are'}
-				near-{dupes.length === 1 ? 'identical to “' + dupes[0].base_name + '”' : 'duplicates of another'} —
-				fold {dupes.length === 1 ? 'it' : 'them'} in as {dupes.length === 1 ? 'a setup' : 'setups'} and the hours add up.
-			</span>
-			<span class="nudge-cta">Fold →</span>
-		</button>
-	{/if}
-	{#if unmapped.length && !unmappedDevices.length && !dupes.length}
+	{#if unmapped.length && !unmappedDevices.length}
 		<button class="nudge" aria-label="Review unmapped outputs" on:click={() => (secTab = 'outputs')}>
 			<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
 			<span style="flex:1;font-size:13.5px;">
@@ -1296,7 +1036,7 @@
 		<RoomChips {rooms} chainCount={chains.length} roomId={roomFilter} on:pick={(e) => pickRoom(e.detail)} />
 		<div class="wired">
 			<div class="wlist">
-				<ChainList chains={chainRows} {variants} {lastUsed} {rooms} roomId={roomFilter}
+				<ChainList chains={chainRows} {equipment} {onNow} {lastUsed} {rooms} roomId={roomFilter}
 					selectedId={selectedChainId} on:select={(e) => selectChain(e.detail)} />
 			</div>
 			<section class="panel wgraph" aria-label="How it is wired">
@@ -1305,11 +1045,11 @@
 						<h2 class="h-display" style="font-size:22px;">How it’s wired</h2>
 						<p class="wsub">
 							Pick a chain to light its route. Every piece of gear shows up once, with its
-							hours; <span class="wswap">⇄</span> marks gear a setup swaps.
+							hours; <span class="wswap">⇄</span> marks gear you swap at a step.
 						</p>
 					</div>
 				</div>
-				<ChainGraph {chains} {variants} {equipment} {rooms} roomId={roomFilter}
+				<ChainGraph {chains} {equipment} {onNow} {rooms} roomId={roomFilter}
 					selectedId={selectedChainId} on:select={(e) => selectChain(e.detail)} />
 				{#if selectedChain}
 					<div class="wsel">
@@ -1507,7 +1247,8 @@
 
 	{#if secTab === 'outputs'}
 		<p class="sechint">
-			Map each playback output once — to a chain, or to one setup of it — and every future listen
+			Map each playback output once, to a chain (and, for earbuds a Bluetooth name gives away, the gear it
+			puts on by itself), and every future listen
 			through it lands there. It is the most specific rule, so it wins over an app token and the
 			machine. Listens already logged stay as they are; retag those from History.
 		</p>
@@ -1530,16 +1271,15 @@
 								<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:1px;">{b.hits} plays · last seen {timeAgo(b.last_seen)}</div>
 							</div>
 							<select class="input assign" class:needs={b.chain_id == null}
-								value={deviceBindingValue(b)} aria-label="Chain or setup for {b.identifier} on {b.equipment_name}"
+								value={deviceBindingValue(b)} aria-label="Chain for {b.identifier} on {b.equipment_name}"
 								on:change={(e) => assignDeviceBinding(b, e.currentTarget.value)}>
 								<option value="">— unmapped —</option>
 								{#each chainRows as c (c.id)}
-									{#if variantsFor(c.id).length}
+									{@const extra = [...picksFor(c), ...pinnedFor(c, deviceBindingValue(b))]}
+									{#if extra.length}
 										<optgroup label={c.name}>
-											<option value="c:{c.id}">{c.name} · as wired</option>
-											{#each variantsFor(c.id) as v (v.id)}
-												<option value="v:{v.id}">{c.name} · {v.name}</option>
-											{/each}
+											<option value="c:{c.id}">{c.name} · on whatever is on now</option>
+											{#each extra as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
 										</optgroup>
 									{:else}
 										<option value="c:{c.id}">{c.name}</option>
@@ -1567,21 +1307,20 @@
 							</div>
 							<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:1px;">{b.hits} plays · last seen {timeAgo(b.last_seen)}</div>
 						</div>
-						<!-- One picker: a chain with setups is a group of them, so the
-						     choice is one value and a setup cannot land on the wrong
-						     chain. Option text repeats the chain because a closed
-						     select shows only the option, not its group. -->
+						<!-- One picker: a chain with slots is a group, so the choice is
+						     one value and a pick cannot land on the wrong chain. Option
+						     text repeats the chain because a closed select shows only
+						     the option, not its group. -->
 						<select class="input assign" class:needs={b.chain_id == null}
-							value={bindingValue(b)} aria-label="Chain or setup for {b.identifier}"
+							value={bindingValue(b)} aria-label="Chain for {b.identifier}"
 							on:change={(e) => assignBinding(b, e.currentTarget)}>
 							<option value="">— unmapped —</option>
 							{#each chainRows as c (c.id)}
-								{#if variantsFor(c.id).length}
+								{@const extra = [...picksFor(c), ...pinnedFor(c, bindingValue(b))]}
+								{#if extra.length}
 									<optgroup label={c.name}>
-										<option value="c:{c.id}">{c.name} · as wired</option>
-										{#each variantsFor(c.id) as v (v.id)}
-											<option value="v:{v.id}">{c.name} · {v.name}</option>
-										{/each}
+										<option value="c:{c.id}">{c.name} · on whatever is on now</option>
+										{#each extra as o (o.value)}<option value={o.value}>{o.label}</option>{/each}
 									</optgroup>
 								{:else}
 									<option value="c:{c.id}">{c.name}</option>
@@ -1589,11 +1328,6 @@
 							{/each}
 							<optgroup label="Nothing fits?">
 								<option value="new-chain">+ New chain from “{b.identifier}”…</option>
-								{#if chains.length}
-									<option value="new-setup">
-										+ New setup of {b.chain_id != null ? `“${chains.find((c) => c.id === b.chain_id)?.name ?? 'a chain'}”` : 'a chain'}…
-									</option>
-								{/if}
 							</optgroup>
 						</select>
 						<button class="icon-btn danger" title="Forget this output" on:click={() => removeBinding(b)} aria-label="Delete binding">✕</button>
@@ -1622,299 +1356,70 @@
 		{equipment}
 		{devices}
 		{bindings}
+		{whatsOn}
+		notice={drawerNotice}
 		lastUsed={lastUsed[String(openChain.id)] ?? null}
 		sharing={sharingChain === openChain.id}
-		canFold={foldable(openChain).length > 0}
+		canMerge={mergeable(openChain).length > 0}
 		{rooms}
 		{movingRooms}
 		on:rooms={(e) => openChain && moveChainRooms(openChain, e.detail)}
 		on:close={() => (openChainId = null)}
 		on:share={(e) => openChain && toggleShared(openChain, e.detail)}
-		on:swap={(e) => openChain && openSwap(openChain, e.detail)}
-		on:promote={(e) => openChain && promote(openChain, e.detail)}
-		on:editVariant={(e) => openChain && editVariant(openChain, e.detail)}
+		on:changed={(e) => drawerChanged(e.detail)}
 		on:removeVariant={(e) => removeVariant(e.detail)}
-		on:newVariant={() => openChain && newVariant(openChain)}
-		on:overview={() => (overviewOpen = true)}
-		on:fold={() => openChain && openFold(openChain)}
+		on:merge={() => openChain && openMerge(openChain)}
 		on:delete={() => (confirmChain = openChain)}
 		on:duplicate={() => openChain && duplicateChain(openChain)}
 		on:edit={() => openChain && editChain(openChain)}
 	/>
 {/if}
 
-<!-- Variant editor: pick a slot, pick what goes in it. Deliberately one slot
-     at a time — the whole reason variants exist is that swapping *one* thing
-     should not mean rebuilding a chain, and a full editor here would just be
-     the chain editor again. -->
-<!-- ── The setups overview ──
-     Read-only on purpose: editing lives on the nodes in the drawer, and a
-     picture that also edits would be two interactions competing over the same
-     click. This one answers "what have I actually got set up here". -->
-{#if overviewOpen && openChain}
-	{@const vs = variantsFor(openChain.id)}
-	{@const slots = overviewSlots(openChain, vs)}
-	<div class="dialog-backdrop" on:click={() => (overviewOpen = false)} on:keydown={() => {}} role="presentation">
-		<div class="dialog ov" style="width:min(980px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
-			<div class="dialog-title">{openChain.name} — every setup</div>
-			<div class="dialog-body">
-				<p class="ov-intro">
-					The top line is the chain as it stands. Each row below swaps only what it
-					says it swaps and passes the rest through, so the hours land on the box
-					that was actually fitted.
-				</p>
-				<!-- Scrolls in its own container. A long chain must not make the
-				     page scroll sideways — the rule the equipment table already
-				     had to learn. -->
-				<div class="ov-wrap">
-					<!-- The names stay put while the path scrolls. `position:sticky`
-					     was the obvious way and it does not work here: a grid item's
-					     containing block is its own grid area, so a sticky label can
-					     only travel within its own 170px column — it scrolls away
-					     looking exactly like no sticky at all. So the labels are a
-					     separate column outside the scroller, and the two are kept in
-					     step by a fixed row height rather than by hoping the content
-					     matches. -->
-					<div class="ov-labels">
-						<div class="ov-side ov-std">
-							<div class="ov-name">Standard</div>
-							<div class="ov-sub">{formatHours(openChain.total_hours)}</div>
-						</div>
-						{#each vs as v (v.id)}
-							<div class="ov-side">
-								<div class="ov-name">{v.name}</div>
-								<div class="ov-sub">{formatHours(v.total_hours)}</div>
-							</div>
-						{/each}
-					</div>
-					<div class="ov-scroll">
-					<div class="ov-grid" style="grid-template-columns:repeat({slots}, minmax(150px, 1fr));">
-						{#each Array(slots) as _, i}
-							{@const step = openChain.components?.[i]}
-							<div class="ov-cell">
-								{#if step}
-									<div class="ov-node" style="border-color:{roleColour(step.type)};">
-										<span class="ov-dot" style="background:{roleColour(step.type)};"></span>
-										<span class="ov-role">{roleLabel(step)}</span>
-										<span class="ov-label">{step.name}</span>
-									</div>
-								{:else}
-									<!-- A position only a variant reaches: the chain itself
-									     has nothing here, which is a real state and not a
-									     gap to fill in. -->
-									<div class="ov-none">nothing here</div>
-								{/if}
-							</div>
-						{/each}
-
-						{#each vs as v (v.id)}
-							{#each Array(slots) as _, i}
-								{@const o = overrideAt(v, i)}
-								{@const step = openChain.components?.[i]}
-								<div class="ov-cell">
-									{#if o}
-										<div class="ov-node ov-swap">
-											<span class="ov-dot" style="background:var(--td-accent);"></span>
-											<span class="ov-role">{step ? 'swapped' : 'added'}</span>
-											<span class="ov-label">{overrideName(o)}</span>
-										</div>
-									{:else}
-										<!-- Passed through. Drawn as the line it is rather
-										     than as a repeat of the standard's node: the
-										     row would then read as a whole second chain,
-										     which is exactly what a variant is not. -->
-										<div class="ov-thru" aria-label="same as the chain"></div>
-									{/if}
-								</div>
-							{/each}
-						{/each}
-					</div>
-					</div>
-				</div>
-			</div>
-			<div class="dialog-actions">
-				<button class="btn btn-secondary" on:click={() => (overviewOpen = false)}>Close</button>
-			</div>
-		</div>
-	</div>
-{/if}
-
-{#if vOpen && vChain}
-	<div class="dialog-backdrop" on:click={closeSetupEditor} on:keydown={() => {}} role="presentation">
-		<div class="dialog" style="width:min(520px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
-			<div class="dialog-title">
-				{vId == null ? (vMode === 'chain' ? 'Swap a step in' : 'New setup of') : 'Edit setup of'}
-				{vChain.name}
-			</div>
-			<div class="dialog-body">
-				<div style="display:flex;flex-direction:column;gap:13px;">
-					<!-- Opened from an output: which chain this is a setup of is the
-					     first question, and saving maps the output to it. There is
-					     no "replace in the chain" here — rewiring a chain is not
-					     something to do on the way to mapping an output. -->
-					{#if bindFor && vId == null}
-						<div class="field">
-							<label for="vc">A setup of</label>
-							<select id="vc" class="input" value={String(vChain.id)}
-								on:change={(e) => pickSetupChain(e.currentTarget.value)}>
-								{#each chainRows as c (c.id)}<option value={String(c.id)}>{c.name}</option>{/each}
-							</select>
-							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-								Saving maps “{bindFor.identifier}” to it.
-							</p>
-						</div>
-					{/if}
-					<!-- The two meanings of swapping a box, stated rather than
-					     guessed at. Only offered when creating: editing an
-					     existing variant is about that variant, and redirecting
-					     the save onto the chain would be a different and
-					     destructive operation behind the same button. -->
-					{#if vId == null && !bindFor}
-						<div class="vmode">
-							<button class="vmode-btn" class:on={vMode === 'variant'}
-								on:click={() => (vMode = 'variant')}>
-								<span class="vmode-t">Save as a setup</span>
-								<span class="vmode-s">Both stay yours. Hours split between them.</span>
-							</button>
-							<button class="vmode-btn" class:on={vMode === 'chain'}
-								on:click={() => (vMode = 'chain')}>
-								<span class="vmode-t">Replace it in the chain</span>
-								<span class="vmode-s">The chain is simply wired this way now.</span>
-							</button>
-						</div>
-					{/if}
-					{#if vMode === 'variant'}
-						<div class="field">
-							<label for="vn">Name</label>
-							<input id="vn" class="input" bind:value={vName} placeholder="Microlinear" />
-							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-								What is different about it — the stylus fitted, the headphones on.
-							</p>
-						</div>
-					{/if}
-					<div class="field">
-						<label for="vs">Swap which step</label>
-						<select id="vs" class="input" bind:value={vSlot}>
-							{#each vChain.components ?? [] as step, i}
-								<option value={i}>{compTypeLabel(step.type)} · {step.name}</option>
-							{/each}
-							<option value={(vChain.components ?? []).length}>+ add a step at the end</option>
-						</select>
-					</div>
-					<div class="field">
-						<label for="vg">For</label>
-						<select id="vg" class="input" bind:value={vGear}>
-							<option value={null}>— pick from your gear —</option>
-							{#each equipment as e}
-								<option value={e.id}>{e.name}{e.brand ? ` · ${e.brand}` : ''}</option>
-							{/each}
-						</select>
-						{#if vMode === 'variant'}
-							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-								Listens through this setup credit their hours here instead of
-								whatever the chain names at that step — which is what makes
-								per-stylus wear answerable.
-							</p>
-						{:else}
-							<!-- Said plainly because it cannot be seen. Chain hours are
-							     derived from the listens, so rewiring the chain moves
-							     every hour ever logged through it onto the new box —
-							     including the ones that ran through the old one. -->
-							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-								This is retroactive: hours are worked out from the listens, so
-								every hour already logged through this chain moves onto the new
-								box. Right when you replaced the old one for good — use a
-								setup if you still swap between them.
-							</p>
-						{/if}
-					</div>
-					{#if vErr}<p style="font-size:13px;color:#b2622d;margin:0;">{vErr}</p>{/if}
-				</div>
-			</div>
-			<div class="dialog-actions">
-				<button class="btn btn-secondary" on:click={closeSetupEditor}>Cancel</button>
-				<button class="btn btn-primary" on:click={saveVariant} disabled={vSaving}>
-					{vSaving ? 'Saving…' : vMode === 'chain' ? 'Replace in the chain' : bindFor ? 'Save and map' : 'Save setup'}
-				</button>
-			</div>
-		</div>
-	</div>
-{/if}
-
-<!-- Fold dialog.
-     Two chains that are the same rig with one box swapped are one chain and a
-     choice — but saying so after the fact has to *move the listening*, or the
-     hours stay split across a row that no longer exists in the user's head.
-     Not reversible, and the dialog says so rather than burying it. -->
-{#if fOpen && fInto}
-	<div class="dialog-backdrop" on:click={() => (fOpen = false)} on:keydown={() => {}} role="presentation">
+<!-- Merge dialog.
+     A chain that swaps one box is one chain with a slot, but saying so after
+     the fact has to *move the listening*, or the hours stay split across a row
+     that no longer exists in the person's head. Not reversible, and the
+     dialog says so rather than burying it. -->
+{#if mOpen && mInto}
+	{@const opts = mergeable(mInto)}
+	<div class="dialog-backdrop" on:click={() => (mOpen = false)} on:keydown={() => {}} role="presentation">
 		<div class="dialog" style="width:min(560px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
-			<div class="dialog-title">Fold a chain into “{fInto.name}”</div>
+			<div class="dialog-title">Merge a chain into “{mInto.name}” as an option</div>
 			<div class="dialog-body">
-				{#if fDone}
-					<p style="font-size:13.5px;margin:0;">{fDone}</p>
+				{#if mDone}
+					<p style="font-size:13.5px;margin:0;">{mDone}</p>
 				{:else}
 					<div style="display:flex;flex-direction:column;gap:13px;">
 						<div class="field">
-							<label for="ff">Which chain is really this one?</label>
-							<select id="ff" class="input" bind:value={fFrom} on:change={pickFoldDefaults}>
-								{#each foldable(fInto) as o}
-									<option value={o.chain.id}>
-										{o.chain.name}{o.dupe
-											? o.dupe.distance === 0
-												? ' — identical wiring'
-												: ` — ${o.dupe.distance} step${o.dupe.distance > 1 ? 's' : ''} differ${o.dupe.distance > 1 ? '' : 's'}`
-											: ''}{o.chain.total_hours > 0 ? ` · ${formatHours(o.chain.total_hours)}` : ''}
+							<label for="mf">Which chain is this one with other gear on?</label>
+							<select id="mf" class="input" bind:value={mFrom}>
+								{#each opts as o (o.other?.id)}
+									<option value={o.other?.id}>
+										{o.other?.name} — {o.theirs?.name} instead of {o.mine?.name}{(o.other?.total_hours ?? 0) > 0 ? ` · ${formatHours(o.other?.total_hours ?? 0)}` : ''}
 									</option>
 								{/each}
 							</select>
 							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-								Its listening moves onto “{fInto.name}” and the chain itself is deleted.
-								A chain carrying setups of its own can’t fold — its overrides point at
-								steps this would replace.
+								Its gear becomes an option at that step, so you pick which is on. Its listening moves onto
+								“{mInto.name}” filed with that gear, with its outputs, machines and rooms, and the chain itself
+								is deleted.
 							</p>
 						</div>
-						<div class="field">
-							<label for="fv">Logged as</label>
-							<select id="fv" class="input" bind:value={fVariant}>
-								<option value="new">— a new setup —</option>
-								{#each variantsFor(fInto.id) as v}
-									<option value={v.id}>{v.name}</option>
-								{/each}
-							</select>
-							{#if fVariant === 'new'}
-								<input class="input" style="margin-top:8px;" bind:value={fName} placeholder="Summer" />
-								<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-									What it swaps is worked out from the two chains, so the moved hours
-									credit the gear that chain actually named — not this one’s.
-								</p>
-							{:else}
-								<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-									The moved listens credit whatever this setup swaps in. Pick the one
-									that matches how that chain was wired.
-								</p>
-							{/if}
-						</div>
 						<p style="font-size:12.5px;color:var(--td-muted-2);margin:0;border-left:2px solid var(--td-muted-3);padding-left:10px;">
-							Not reversible. The listens keep everything else — only which chain and
-							setup they went through changes.
+							Not reversible. The listens keep everything else; only which chain they went through changes.
 						</p>
-						{#if fErr}<p style="font-size:13px;color:#b2622d;margin:0;">{fErr}</p>{/if}
+						{#if mErr}<p style="font-size:13px;color:var(--td-bad-fg);margin:0;">{mErr}</p>{/if}
 					</div>
 				{/if}
 			</div>
 			<div class="dialog-actions">
-				<!-- The drawer is opened on the way out rather than alongside the
-				     result: both are overlays, and raising the drawer while the
-				     dialog still holds the "what moved" line buries the one
-				     thing worth reading. -->
 				<button class="btn btn-secondary"
-					on:click={() => { const keep = fDone ? fInto?.id ?? null : null; fOpen = false; if (keep != null) openChainId = keep; }}>
-					{fDone ? 'Close' : 'Cancel'}
+					on:click={() => { const keep = mDone ? mInto?.id ?? null : null; mOpen = false; if (keep != null) openChainId = keep; }}>
+					{mDone ? 'Close' : 'Cancel'}
 				</button>
-				{#if !fDone}
-					<button class="btn btn-primary" on:click={doFold} disabled={fBusy || fFrom == null}>
-						{fBusy ? 'Folding…' : 'Fold in'}
+				{#if !mDone}
+					<button class="btn btn-primary" on:click={doMerge} disabled={mBusy || mFrom == null}>
+						{mBusy ? 'Merging…' : 'Merge it in'}
 					</button>
 				{/if}
 			</div>
@@ -1935,7 +1440,7 @@
 			<div class="dialog-body" style="max-height:70vh;overflow-y:auto;">
 				<div style="display:flex;flex-direction:column;gap:13px;">
 					<div class="field"><label for="cn">Name</label><input id="cn" class="input" bind:value={cName} placeholder="Desktop Reference"></div>
-					<div class="field"><label for="cd">Description</label><input id="cd" class="input" bind:value={cDesc} placeholder="Primary desk setup"></div>
+					<div class="field"><label for="cd">Description</label><input id="cd" class="input" bind:value={cDesc} placeholder="The main desk rig"></div>
 					<div class="field"><label for="cx">Listening context</label>
 						<select id="cx" class="input" bind:value={cContext}>{#each contexts as ct}<option value={ct}>{ct}</option>{/each}</select>
 					</div>
@@ -2230,82 +1735,6 @@
 	.cwhen { display: flex; align-items: center; gap: 8px; margin: -2px 0 4px 176px; }
 	@media (max-width: 560px) { .cwhen { margin-left: 0; } }
 
-	/* ── The two meanings of a swap ── */
-	.vmode { display: flex; gap: 8px; flex-wrap: wrap; }
-	.vmode-btn {
-		flex: 1 1 200px;
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-		text-align: left;
-		padding: 10px 12px;
-		border-radius: 12px;
-		border: 1px solid var(--td-border);
-		background: var(--td-surface2);
-		color: inherit;
-		font: inherit;
-		cursor: pointer;
-	}
-	.vmode-btn.on { border-color: var(--td-accent); background: color-mix(in srgb, var(--td-accent) 10%, transparent); }
-	.vmode-t { font-size: 13.5px; font-weight: 600; }
-	.vmode-s { font-size: 11.5px; color: var(--td-muted-2); }
-
-	/* ── The setups overview ── */
-	.ov-intro { font-size: 13px; color: var(--td-muted); margin: 0 0 16px; max-width: 66ch; text-wrap: pretty; }
-	/* Wide content scrolls inside its own box; the page body never does.
-	   `min-width:0` in both places is the load-bearing half and it is not
-	   obvious: a grid column floor of 150px makes the grid's min-content wider
-	   than the dialog, that contribution propagates up through the block to the
-	   flex item, and a flex item's default `min-width:auto` refuses to shrink
-	   below it — so `width:min(980px,100%)` was quietly losing and the dialog
-	   grew past the viewport instead of scrolling inside itself. Found by
-	   opening it, not by any check. */
-	.dialog.ov { min-width: 0; }
-	/* One row height for both columns, which is what keeps the names lined up
-	   with the setups they name. Deriving it from the content instead would put
-	   the two columns in separate formatting contexts and let them drift the
-	   moment a gear name wrapped. */
-	.ov-wrap { display: flex; gap: 12px; --ov-row: 64px; }
-	.ov-labels { flex: none; width: 150px; display: flex; flex-direction: column; gap: 10px; }
-	.ov-scroll { overflow-x: auto; min-width: 0; flex: 1; padding-bottom: 4px; }
-	.ov-grid { display: grid; gap: 10px; }
-	.ov-side {
-		height: var(--ov-row);
-		display: flex;
-		flex-direction: column;
-		justify-content: center;
-		min-width: 0;
-	}
-	/* Clamped rather than allowed to wrap freely: the row height is fixed, so a
-	   long name would otherwise be cut off mid-letter with nothing to say so. */
-	.ov-name { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; }
-	.ov-std .ov-name { font-family: 'Caprasimo', serif; font-weight: 400; }
-	.ov-sub { font-size: 12px; color: var(--td-muted-2); font-variant-numeric: tabular-nums; }
-	.ov-cell { height: var(--ov-row); display: flex; align-items: center; min-width: 0; }
-	.ov-node {
-		display: flex;
-		flex-direction: column;
-		justify-content: center;
-		gap: 1px;
-		width: 100%;
-		height: 100%;
-		min-width: 0;
-		padding: 0 11px;
-		border-radius: 12px;
-		border: 1px solid var(--td-border);
-		border-left-width: 3px;
-		background: var(--td-surface2);
-	}
-	.ov-swap { border-color: var(--td-accent); background: color-mix(in srgb, var(--td-accent) 9%, transparent); }
-	.ov-dot { width: 7px; height: 7px; border-radius: 50%; }
-	.ov-role { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--td-muted-3); }
-	.ov-label { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-	/* Passed through: the line the signal takes when this row changes nothing
-	   here. Deliberately not a repeat of the standard's node — the row would
-	   then read as a whole second chain. */
-	.ov-thru { width: 100%; height: 2px; border-radius: 2px; background: var(--td-muted-3); opacity: .3; }
-	.ov-none { font-size: 12px; color: var(--td-muted-3); font-style: italic; }
-
 	/* ── Shared bits ── */
 	/* A grid of toggles rather than a dropdown: a glyph is quicker to recognise
 	   than a word to read, which is the entire point of having them. A fixed
@@ -2356,7 +1785,6 @@
 	.sc-title { font-weight: 600; font-size: 14px; }
 	.sc-sub { font-size: 12.5px; color: var(--td-muted); margin-top: 2px; line-height: 1.45; }
 	.sc-pick { width: auto; min-width: 160px; }
-
 
 	/* ── The chain list and the graph, side by side ──
 	   The list keeps a reading width; the graph takes the rest and drops under

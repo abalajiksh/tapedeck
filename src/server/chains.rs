@@ -13,8 +13,9 @@ use super::auth::{AuthUser, ReadAuth};
 use super::models::{ErrorResponse, OkResponse};
 use super::AppState;
 use crate::db::{
-    BindingRow, ChainVariant, DeviceBindingRow, DeviceRow, EquipmentRow, FoldOutcome,
-    FoldSuggestion, FoldTarget, InboxQuestion, Room, RoomRefusal, WhereAnswered,
+    BindingRow, ChainVariant, DeviceBindingRow, DeviceRow, EquipmentRow, FitOutcome, FitRefusal,
+    FoldOutcome, FoldSuggestion, FoldTarget, InboxQuestion, MoodsRetired, Room, RoomRefusal,
+    WhatsOn, WhereAnswered,
 };
 use crate::models::*;
 use crate::openapi::{BadRequest, Forbidden, NotFound, Unauthorized};
@@ -54,6 +55,10 @@ pub struct ChainList {
     // one scan where a correlated subquery in `CHAIN_COLUMNS` would be one per
     // chain on every read of a chain anywhere.
     pub last_used: std::collections::BTreeMap<i64, i64>,
+    /// What is on now at each slot, for chains with slots: chain id →
+    /// (step position → equipment id). See `GET /api/v1/chains/{id}/whats-on`.
+    #[schema(value_type = Object)]
+    pub on_now: std::collections::BTreeMap<i64, crate::db::Picks>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -622,6 +627,16 @@ pub async fn list_chains(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {
+    // Named setups that swap gear become slot options the first time the
+    // list is read after an upgrade (and after one made through the old
+    // variants API). Idempotent, and nothing to do on almost every read.
+    if let Err(e) = state.db.adopt_setups(user.user_id).await {
+        return internal(e);
+    }
+    let on_now = match state.db.current_picks(user.user_id).await {
+        Ok(m) => m.into_iter().collect(),
+        Err(e) => return internal(e),
+    };
     let last_used = match state.db.chain_last_used(user.user_id).await {
         Ok(m) => m,
         Err(e) => {
@@ -633,7 +648,9 @@ pub async fn list_chains(
         }
     };
     match state.db.get_chains(user.user_id).await {
-        Ok(chains) => (StatusCode::OK, Json(ChainList { chains, last_used })).into_response(),
+        Ok(chains) => {
+            (StatusCode::OK, Json(ChainList { chains, last_used, on_now })).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { code: 500, error: e.to_string() }),
@@ -1302,8 +1319,172 @@ async fn delete_binding(
     update_room,
     delete_room,
     set_chain_rooms,
+    whats_on,
+    fit_slot,
+    merge_chain,
+    retire_moods,
 ))]
 pub struct Api;
+
+// ── What's on now ──
+//
+// A slot is a chain step with options; a switch is recorded with when it
+// happened and files plays with the pick. See `db::fittings`.
+
+/// What is on at each slot of a chain, and what the picker offers.
+///
+/// Scope: `read`. Each option carries its purchase date and first play ("in
+/// use since"), and the outputs that pick it by themselves. `last_play_end`
+/// is when the chain's last play ended, for "right after the last play here".
+#[utoipa::path(
+    get,
+    path = "/api/v1/chains/{id}/whats-on",
+    tag = "Chains",
+    params(("id" = i64, Path, description = "The chain.")),
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    responses(
+        (status = 200, description = "OK.", body = WhatsOn),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+        (status = 404, response = NotFound),
+    )
+)]
+async fn whats_on(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    match state.db.whats_on(user.user_id, id).await {
+        Ok(Some(w)) => (StatusCode::OK, Json(w)).into_response(),
+        Ok(None) => not_found("No such chain"),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct FitRequest {
+    /// The slot: the step's position in the chain.
+    pub position: i64,
+    /// The gear to put on, one of the slot's options.
+    pub equipment_id: i64,
+    /// From when, unix seconds. Absent is now. Earlier is a backdate: the
+    /// plays from then up to the next recorded switch of this step move to
+    /// the new pick, and later switches stay as they are.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// `true` counts what would move and writes nothing. Required, so a
+    /// preview can never be sent as the real thing by leaving it out.
+    pub dry_run: bool,
+}
+
+/// Switch what is on at a slot, now or since a moment.
+///
+/// Session-only. Only plays filed with the pick in effect at their time
+/// move, so a play an output picked by itself stays where it is. Other
+/// slots' picks are never changed. `moved` counts plays, skips excluded.
+#[utoipa::path(
+    post,
+    path = "/api/v1/chains/{id}/fit",
+    tag = "Chains",
+    params(("id" = i64, Path, description = "The chain.")),
+    request_body = FitRequest,
+    responses(
+        (status = 200, description = "Switched, or what a switch would move.", body = FitOutcome),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+        (status = 404, response = NotFound),
+    )
+)]
+async fn fit_slot(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<FitRequest>,
+) -> impl IntoResponse {
+    match state
+        .db
+        .fit(user.user_id, id, body.position, body.equipment_id, body.since, body.dry_run)
+        .await
+    {
+        Ok(Ok(out)) => (StatusCode::OK, Json(out)).into_response(),
+        Ok(Err(FitRefusal::NoChain)) => not_found("No such chain"),
+        Ok(Err(FitRefusal::NotASlot)) => bad("That step has no options to pick from"),
+        Ok(Err(FitRefusal::NotAnOption)) => bad("That gear is not one of this step's options"),
+        Ok(Err(FitRefusal::InFuture)) => bad("A switch cannot start in the future"),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+#[schema(as = MergeChainRequest)]
+pub struct MergeRequest {
+    /// The chain that becomes an option on this one, and is then deleted.
+    pub from_chain_id: i64,
+}
+
+/// Merge a chain that differs at one box into this one, as an option there.
+///
+/// Session-only, and not reversible. The two must differ at exactly one
+/// step past the player (a different player is a different chain). The
+/// other chain's listens, outputs, defaults and rooms move here, filed with
+/// that option, and the other chain is deleted.
+#[utoipa::path(
+    post,
+    path = "/api/v1/chains/{id}/merge",
+    tag = "Chains",
+    params(("id" = i64, Path, description = "The chain kept.")),
+    request_body = MergeRequest,
+    responses(
+        (status = 200, description = "Merged. The counts are what moved.", body = FoldOutcome),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
+async fn merge_chain(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Path(id): Path<i64>,
+    Json(body): Json<MergeRequest>,
+) -> impl IntoResponse {
+    match state.db.merge_as_option(user.user_id, id, body.from_chain_id).await {
+        Ok(Ok(out)) => (StatusCode::OK, Json::<FoldOutcome>(out)).into_response(),
+        Ok(Err(why)) => bad(&why),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct RetireMoodsRequest {
+    /// The setups to retire, from the `moods` question.
+    pub variant_ids: Vec<i64>,
+}
+
+/// Turn named setups that change no gear into session titles.
+///
+/// Session-only. Each one's name becomes the title of the sittings its plays
+/// are in, where a sitting has no title yet, and the setup is removed. The
+/// plays keep their chain; the gear was the same, so no hour moves. Ids that
+/// are not such a setup of yours are ignored.
+#[utoipa::path(
+    post,
+    path = "/api/v1/chains/inbox/moods",
+    tag = "Chains",
+    request_body = RetireMoodsRequest,
+    responses(
+        (status = 200, description = "What changed.", body = MoodsRetired),
+        (status = 401, response = Unauthorized),
+    )
+)]
+async fn retire_moods(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<RetireMoodsRequest>,
+) -> impl IntoResponse {
+    match state.db.retire_mood_setups(user.user_id, &body.variant_ids).await {
+        Ok(out) => (StatusCode::OK, Json(out)).into_response(),
+        Err(e) => internal(e),
+    }
+}
 
 // ── The Signal Chains inbox ──
 //
@@ -1362,12 +1543,14 @@ pub struct DismissRequest {
     pub key: String,
 }
 
-/// The questions about plays that landed in no chain.
+/// The questions about plays that landed in no chain, and about slots.
 ///
 /// Session-only. From the last 30 days, grouped by where the plays came from:
 /// first which box a device or token is (`same_box`, `which_box`), then where
-/// unfiled plays should have gone (`where`), most plays first. Questions put
-/// off with "not now" are left out for 30 days.
+/// unfiled plays should have gone (`where`), most plays first. Then chains
+/// that differ at one box and could be one chain with an option (`merge`),
+/// and named setups that change no gear (`moods`). Questions put off with
+/// "not now" are left out for 30 days.
 #[utoipa::path(
     get,
     path = "/api/v1/chains/inbox",
@@ -1378,7 +1561,17 @@ pub struct DismissRequest {
     )
 )]
 async fn chain_inbox(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
-    match state.db.chain_inbox(user.user_id).await {
+    if let Err(e) = state.db.adopt_setups(user.user_id).await {
+        return internal(e);
+    }
+    let slots = match state.db.slot_questions(user.user_id).await {
+        Ok(q) => q,
+        Err(e) => return internal(e),
+    };
+    match state.db.chain_inbox(user.user_id).await.map(|mut q| {
+        q.extend(slots);
+        q
+    }) {
         Ok(questions) => (
             StatusCode::OK,
             Json(InboxList { questions, window_days: crate::db::INBOX_WINDOW_SECS / 86_400 }),
@@ -1782,6 +1975,10 @@ pub fn create_gear_router() -> Router<Arc<AppState>> {
         .route("/api/v1/chains/inbox/where", post(answer_inbox_where))
         .route("/api/v1/chains/inbox/box", post(answer_inbox_box))
         .route("/api/v1/chains/inbox/dismiss", post(dismiss_inbox))
+        .route("/api/v1/chains/inbox/moods", post(retire_moods))
+        .route("/api/v1/chains/:id/whats-on", get(whats_on))
+        .route("/api/v1/chains/:id/fit", post(fit_slot))
+        .route("/api/v1/chains/:id/merge", post(merge_chain))
         .route("/api/v1/device-bindings/:id", axum::routing::delete(delete_device_binding))
         .route("/api/v1/chains/:id/fold", post(fold_chain))
         .route("/api/v1/chains/:id/rooms", axum::routing::put(set_chain_rooms))

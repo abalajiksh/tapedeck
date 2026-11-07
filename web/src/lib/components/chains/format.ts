@@ -1,6 +1,6 @@
 // Small wording helpers shared by the Signal Chains list, drawer and graph.
 
-import type { ChainVariant, SignalChain } from '$lib/api';
+import type { ChainVariant, Equipment, SignalChain } from '$lib/api';
 
 /** "Today", a weekday within the week, otherwise "29 Oct" (with the year
  *  when it is not this one). The list is scanned, not read, so this is short. */
@@ -26,10 +26,26 @@ export function lastUsedPhrase(ts: number | null | undefined): string {
 	return `last used ${label === 'Today' ? 'today' : label}`;
 }
 
-/** Positions in a chain that a named setup swaps, so a row can mark them. */
-export function swappedPositions(c: SignalChain, variants: ChainVariant[]): Set<number> {
+/** Positions in a chain that are slots (two or more options), so a row can
+ *  mark them. */
+export function slotPositions(c: SignalChain): Set<number> {
 	const at = new Set<number>();
-	for (const v of variants)
-		if (v.chain_id === c.id) for (const o of v.overrides ?? []) at.add(o.position);
+	(c.components ?? []).forEach((s, i) => {
+		if ((s.options?.length ?? 0) >= 2) at.add(i);
+	});
 	return at;
+}
+
+/** What a variant puts on, by gear name: "Hexa", "Shibata + HD 650". */
+export function picksLabel(v: ChainVariant, equipment: Equipment[]): string {
+	return (v.overrides ?? [])
+		.map((o) => o.name ?? equipment.find((e) => e.id === o.equipment_id)?.name ?? 'other gear')
+		.join(' + ');
+}
+
+/** How a variant reads on screen. Tapedeck's own (`auto`) are named by what
+ *  they put on, never by their internal name; a setup someone named before
+ *  slots existed keeps its name. */
+export function variantLabel(v: ChainVariant, equipment: Equipment[]): string {
+	return v.auto ? picksLabel(v, equipment) || 'as wired' : v.name;
 }

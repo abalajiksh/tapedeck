@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { api, type Session, type Scrobble, type SignalChain, type ChainVariant } from '$lib/api';
+	import { variantLabel } from '$lib/components/chains/format';
 	import { formatDuration, timeAgo } from '$lib/utils';
 	import ScrobbleRow from './ScrobbleRow.svelte';
 	import { createEventDispatcher } from 'svelte';
@@ -133,7 +134,7 @@
 			scrobbles = [];
 			if (open) scrobbles = (await api.getSession(session.id)).scrobbles;
 			dispatch('changed');
-		} catch (e) { alert('Failed to set the setup: ' + e); }
+		} catch (e) { alert('Failed to set what was on: ' + e); }
 		busy = false;
 	}
 
@@ -219,9 +220,9 @@
 					<select class="input" style="width:auto;min-width:150px;font-size:12.5px;"
 						value={session.chain_variant_id ?? ''} disabled={busy}
 						on:change={(e) => setVariant(e.currentTarget.value)}
-						aria-label="Which setup of that chain">
+						aria-label="What was on at that chain's slots">
 						<option value="">— as wired —</option>
-						{#each ownVariants as v}<option value={v.id}>{v.name}</option>{/each}
+						{#each ownVariants as v}<option value={v.id}>{variantLabel(v, [])}</option>{/each}
 					</select>
 				{/if}
 				<span style="font-size:12px;color:var(--td-muted-3);">

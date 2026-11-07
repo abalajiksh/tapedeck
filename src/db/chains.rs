@@ -74,8 +74,8 @@ impl Database {
         Ok(current)
     }
     pub async fn create_chain(&self, chain: &SignalChain) -> Result<i64, sqlx::Error> {
-        let components_json =
-            serde_json::to_string(&chain.components).unwrap_or_else(|_| "[]".into());
+        let components = self.normalise_slots(chain.user_id, &chain.components, &[]).await?;
+        let components_json = serde_json::to_string(&components).unwrap_or_else(|_| "[]".into());
         let now = Self::now_secs();
         let result = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO signal_chains (uuid, user_id, name, description, components, listening_context, icon, is_active, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id")).bind(new_uuid()).bind(chain.user_id).bind(&chain.name).bind(&chain.description)
@@ -289,6 +289,7 @@ impl Database {
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
         let components = &Self::stamp_new_steps(components, &was);
+        let components = &self.normalise_slots(user_id, components, &was).await?;
 
         let components_json = serde_json::to_string(components).unwrap_or_else(|_| "[]".into());
         let res = sqlx::query(&crate::sql!(// `shared` is deliberately absent. This is a whole-record replace
@@ -354,6 +355,11 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
+        // What was on when means nothing without the chain.
+        sqlx::query(&crate::sql!("DELETE FROM chain_fittings WHERE chain_id = ?"))
+            .bind(chain_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(&crate::sql!("DELETE FROM chain_variants WHERE chain_id = ?"))
             .bind(chain_id)
             .execute(&mut *tx)

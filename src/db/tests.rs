@@ -2474,6 +2474,8 @@ async fn chain_and_gear_hours_follow_the_listens_however_late_they_are_assigned(
                     detail: None,
                     since: None,
                     equipment_id: Some(gear),
+                    options: None,
+                    slot_name: None,
                 },
                 ChainComponent {
                     component_type: ComponentType::Transport,
@@ -2481,6 +2483,8 @@ async fn chain_and_gear_hours_follow_the_listens_however_late_they_are_assigned(
                     detail: None,
                     since: None,
                     equipment_id: Some(gear),
+                    options: None,
+                    slot_name: None,
                 },
             ],
             listening_context: ListeningContext::Active,
@@ -3129,6 +3133,8 @@ async fn a_variant_moves_the_wear_onto_the_gear_that_was_fitted() {
                     detail: None,
                     since: None,
                     equipment_id: Some(deck),
+                    options: None,
+                    slot_name: None,
                 },
                 ChainComponent {
                     component_type: ComponentType::Source,
@@ -3136,6 +3142,8 @@ async fn a_variant_moves_the_wear_onto_the_gear_that_was_fitted() {
                     detail: None,
                     since: None,
                     equipment_id: Some(ell),
+                    options: None,
+                    slot_name: None,
                 },
             ],
             listening_context: ListeningContext::Active,
@@ -6479,6 +6487,8 @@ async fn promoting_a_variant_moves_no_hours() {
         detail: None,
         since: None,
         equipment_id: Some(id),
+        options: None,
+        slot_name: None,
     };
 
     let chain_id = db
@@ -6605,6 +6615,8 @@ async fn promoting_repoints_the_listens_both_ways() {
                 detail: None,
                 since: None,
                 equipment_id: None,
+                options: None,
+                slot_name: None,
             }],
             listening_context: ListeningContext::Unknown,
             icon: None,
@@ -6677,6 +6689,8 @@ async fn retagging_a_listen_s_chain_does_not_leave_a_stale_setup() {
             detail: None,
             since: None,
             equipment_id: None,
+            options: None,
+            slot_name: None,
         }],
         listening_context: ListeningContext::Unknown,
         icon: None,
@@ -7775,6 +7789,8 @@ async fn chain_of(db: &Database, uid: i64, name: &str, steps: &[(&str, i64)]) ->
                 detail: None,
                 since: None,
                 equipment_id: Some(*g),
+                options: None,
+                slot_name: None,
             })
             .collect(),
         listening_context: ListeningContext::Active,
@@ -7853,6 +7869,8 @@ async fn gear_added_to_an_old_chain_is_not_credited_with_the_chain_s_past() {
         detail: None,
         since,
         equipment_id: Some(gear),
+        options: None,
+        slot_name: None,
     };
     let with_sub = vec![
         step("Dell Precision", pc, None),
@@ -12499,4 +12517,345 @@ async fn an_alias_is_remembered_once_and_suggests_the_box() {
         gear.iter().find(|g| g.id == phone).unwrap().reporters,
         vec!["Chrome on xq-dq54".to_string()]
     );
+}
+
+// ── What's on now (phase 3) ──
+
+fn step_of(t: ComponentType, name: &str, gear: i64, options: Option<Vec<i64>>) -> ChainComponent {
+    ChainComponent {
+        component_type: t,
+        name: name.into(),
+        detail: None,
+        since: None,
+        equipment_id: Some(gear),
+        options,
+        slot_name: None,
+    }
+}
+
+async fn chain_with(db: &Database, uid: i64, name: &str, steps: Vec<ChainComponent>) -> i64 {
+    db.create_chain(&SignalChain {
+        id: None,
+        user_id: uid,
+        name: name.into(),
+        description: None,
+        components: steps,
+        listening_context: ListeningContext::Active,
+        icon: None,
+        is_active: true,
+        shared: false,
+        total_hours: 0.0,
+        created_at: 0,
+    })
+    .await
+    .unwrap()
+}
+
+/// An hour's play through a chain, filed however `save_scrobble` decides
+/// unless `variant` names one.
+async fn played(db: &Database, uid: i64, chain: i64, ts: i64, variant: Option<i64>) {
+    let mut p = Play::new(format!("T{ts}"), "A".into(), ts as u64, format!("p-{ts}"), "t".into());
+    p.duration = Some(3600);
+    db.save_scrobble(
+        uid,
+        &p,
+        None,
+        None,
+        Some(chain),
+        variant,
+        None,
+        None,
+        None,
+        ListenDisposition::LIVE,
+    )
+    .await
+    .unwrap();
+}
+
+async fn variant_at(db: &Database, uid: i64, ts: i64) -> Option<i64> {
+    sqlx::query_scalar("SELECT chain_variant_id FROM scrobbles WHERE user_id = ? AND timestamp = ?")
+        .bind(uid)
+        .bind(ts)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+/// Gear seconds as a sorted list, for comparing before and after.
+async fn gear_secs(db: &Database, uid: i64) -> Vec<(i64, i64)> {
+    let mut v: Vec<(i64, i64)> = db.equipment_seconds(uid).await.unwrap().0.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// A switch files plays from its moment on. A backdated one stops at the next
+/// recorded switch of the same step and leaves it standing, and a play an
+/// output picked by itself never moves.
+#[tokio::test]
+async fn a_backdated_switch_moves_plays_up_to_the_next_switch_of_that_step() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let gear = |n: &'static str| {
+        let db = &db;
+        async move { db.upsert_equipment(uid, n, "headphones", None, None, 0.0, None).await.unwrap() }
+    };
+    let xperia = db.upsert_equipment(uid, "Xperia", "phone", None, None, 0.0, None).await.unwrap();
+    let (hd569, hexa, s08, tw4) =
+        (gear("HD 569").await, gear("Hexa").await, gear("S08").await, gear("TW4").await);
+    let chain = chain_with(
+        &db,
+        uid,
+        "Commute",
+        vec![
+            step_of(ComponentType::Source, "Xperia", xperia, None),
+            step_of(ComponentType::Transducer, "HD 569", hd569, Some(vec![hexa, s08, tw4, hd569])),
+        ],
+    )
+    .await;
+    let opts = db.get_chain(uid, chain).await.unwrap().unwrap().components[1].options.clone();
+    assert_eq!(opts, Some(vec![hd569, hexa, s08, tw4]), "the wired gear first");
+
+    let day = 86_400;
+    let t0 = Database::now_secs() - 100 * day;
+    let d = |n: i64| t0 + n * day;
+    for n in [1, 10, 20, 30, 40] {
+        played(&db, uid, chain, d(n), None).await;
+    }
+    // TW4 over Bluetooth: an output that picks the earbuds by itself.
+    let tw4_v = db
+        .create_variant(
+            uid,
+            chain,
+            "bt",
+            &[VariantOverride { position: 1, equipment_id: Some(tw4), name: None }],
+        )
+        .await
+        .unwrap();
+    played(&db, uid, chain, d(35), Some(tw4_v)).await;
+
+    // S08 since day 15: nothing recorded after, so up to now.
+    let s = db.fit(uid, chain, 1, s08, Some(d(15)), false).await.unwrap().unwrap();
+    assert_eq!(
+        (s.moved, s.until, s.now_on),
+        (3, None, true),
+        "days 20, 30 and 40; not the TW4 play"
+    );
+
+    // Hexa since day 5: stops at the S08 switch, which stays.
+    let preview = db.fit(uid, chain, 1, hexa, Some(d(5)), true).await.unwrap().unwrap();
+    assert_eq!((preview.moved, preview.until, preview.now_on), (1, Some(d(15)), false));
+    assert_eq!(variant_at(&db, uid, d(10)).await, None, "a dry run writes nothing");
+    let h = db.fit(uid, chain, 1, hexa, Some(d(5)), false).await.unwrap().unwrap();
+    assert_eq!(h.moved, preview.moved, "the count shown is the count moved");
+
+    let on = db.whats_on(uid, chain).await.unwrap().unwrap();
+    assert_eq!((on.slots[0].on, on.slots[0].on_since), (s08, Some(d(15))), "S08 is still on");
+    assert_eq!(variant_at(&db, uid, d(1)).await, None, "before any switch: as wired");
+    let hexa_v = variant_at(&db, uid, d(10)).await;
+    let s08_v = variant_at(&db, uid, d(20)).await;
+    assert!(hexa_v.is_some() && s08_v.is_some() && hexa_v != s08_v);
+    assert_eq!(variant_at(&db, uid, d(35)).await, Some(tw4_v), "the output's pick stays");
+    let hexa_opt = on.slots[0].options.iter().find(|o| o.equipment_id == hexa).unwrap();
+    assert_eq!(hexa_opt.first_play, Some(d(10)));
+
+    // A new play takes what is on at its time.
+    played(&db, uid, chain, d(99), None).await;
+    assert_eq!(variant_at(&db, uid, d(99)).await, s08_v);
+
+    // Hexa again since day 25, inside the S08 stretch: up to now.
+    let h2 = db.fit(uid, chain, 1, hexa, Some(d(25)), false).await.unwrap().unwrap();
+    assert_eq!((h2.moved, h2.now_on), (3, true), "days 30, 40 and 99");
+    assert_eq!(variant_at(&db, uid, d(20)).await, s08_v, "before the moment stays");
+    assert_eq!(variant_at(&db, uid, d(30)).await, hexa_v, "one variant per set of picks");
+    assert_eq!(variant_at(&db, uid, d(35)).await, Some(tw4_v));
+
+    // And the gear hours follow the plays.
+    let secs: HashMap<i64, i64> = gear_secs(&db, uid).await.into_iter().collect();
+    assert_eq!(secs.get(&hd569), Some(&3600));
+    assert_eq!(secs.get(&hexa), Some(&(4 * 3600)));
+    assert_eq!(secs.get(&s08), Some(&3600));
+    assert_eq!(secs.get(&tw4), Some(&3600));
+    assert_eq!(secs.get(&xperia), Some(&(7 * 3600)));
+
+    assert_eq!(db.fit(uid, chain, 0, xperia, None, true).await.unwrap(), Err(FitRefusal::NotASlot));
+    assert_eq!(
+        db.fit(uid, chain, 1, xperia, None, true).await.unwrap(),
+        Err(FitRefusal::NotAnOption)
+    );
+    assert_eq!(
+        db.fit(uid, chain, 1, hexa, Some(Database::now_secs() + day), true).await.unwrap(),
+        Err(FitRefusal::InFuture)
+    );
+    // Deleting the chain clears its history first.
+    assert!(db.delete_chain(uid, chain).await.unwrap());
+}
+
+/// Named setups that swap gear become slot options with no hour moving;
+/// setups that change no gear become sitting titles; and a save that leaves
+/// `options` out keeps them.
+#[tokio::test]
+async fn named_setups_become_options_and_moods_become_session_titles() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let other = db.create_user("kim", None, "pw", "user").await.unwrap();
+    let xperia = db.upsert_equipment(uid, "Xperia", "phone", None, None, 0.0, None).await.unwrap();
+    let hd569 =
+        db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+    let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+    let theirs = db.upsert_equipment(other, "Theirs", "iem", None, None, 0.0, None).await.unwrap();
+    let steps = vec![
+        step_of(ComponentType::Source, "Xperia", xperia, None),
+        step_of(ComponentType::Transducer, "HD 569", hd569, None),
+    ];
+    let chain = chain_with(&db, uid, "Commute", steps.clone()).await;
+    let summer = db
+        .create_variant(
+            uid,
+            chain,
+            "Summer Commute",
+            &[VariantOverride { position: 1, equipment_id: Some(hexa), name: Some("Hexa".into()) }],
+        )
+        .await
+        .unwrap();
+    let casual = db.create_variant(uid, chain, "Casual Play", &[]).await.unwrap();
+    let t = Database::now_secs() - 10 * 86_400;
+    played(&db, uid, chain, t, Some(summer)).await;
+    played(&db, uid, chain, t + 4000, Some(summer)).await;
+    played(&db, uid, chain, t + 9000, None).await;
+    played(&db, uid, chain, t + 20_000, Some(casual)).await;
+    played(&db, uid, chain, t + 30_000, Some(casual)).await;
+    // Two sittings for the mood plays; one already titled.
+    for (ts, title) in [(t + 20_000, None::<&str>), (t + 30_000, Some("Late one"))] {
+        let sid: i64 = sqlx::query_scalar(
+            "INSERT INTO sessions (user_id, chain_id, started_at, ended_at, title) VALUES (?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(uid)
+        .bind(chain)
+        .bind(ts)
+        .bind(ts + 3600)
+        .bind(title)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE scrobbles SET session_id = ? WHERE user_id = ? AND timestamp = ?")
+            .bind(sid)
+            .bind(uid)
+            .bind(ts)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let before = gear_secs(&db, uid).await;
+
+    assert_eq!(
+        db.adopt_setups(uid).await.unwrap(),
+        1,
+        "Summer Commute; Casual Play changes no gear"
+    );
+    assert_eq!(db.adopt_setups(uid).await.unwrap(), 0, "once");
+    assert_eq!(gear_secs(&db, uid).await, before, "no hour moves");
+    let comps = db.get_chain(uid, chain).await.unwrap().unwrap().components;
+    assert_eq!(comps[1].options, Some(vec![hd569, hexa]));
+    assert_eq!(db.current_picks(uid).await.unwrap()[&chain][&1], hd569, "nothing switched yet");
+    // A Hexa switch reuses the adopted setup rather than making another.
+    db.fit(uid, chain, 1, hexa, Some(t + 9000), false).await.unwrap().unwrap();
+    assert_eq!(variant_at(&db, uid, t + 9000).await, Some(summer));
+    let before = gear_secs(&db, uid).await;
+
+    // The route editor saves without `options`: they stay. Foreign gear is
+    // dropped, and `[]` ends the slot.
+    let mut edited = steps.clone();
+    db.update_chain(uid, chain, "Commute", None, &edited, "active", None).await.unwrap();
+    assert_eq!(
+        db.get_chain(uid, chain).await.unwrap().unwrap().components[1].options,
+        Some(vec![hd569, hexa])
+    );
+    edited[1].options = Some(vec![theirs, hexa, hexa]);
+    db.update_chain(uid, chain, "Commute", None, &edited, "active", None).await.unwrap();
+    assert_eq!(
+        db.get_chain(uid, chain).await.unwrap().unwrap().components[1].options,
+        Some(vec![hd569, hexa])
+    );
+
+    let moods = db.mood_setups(uid).await.unwrap();
+    assert_eq!(moods.len(), 1);
+    assert_eq!(
+        (moods[0].id, moods[0].plays, moods[0].sessions),
+        (casual, 1, 1),
+        "the titled sitting is not counted"
+    );
+    let q = db.slot_questions(uid).await.unwrap();
+    assert!(q.iter().any(|q| q.kind == "moods"));
+    let done = db.retire_mood_setups(uid, &[casual, summer]).await.unwrap();
+    assert_eq!((done.sessions_titled, done.removed), (1, 1), "Summer Commute is not a mood");
+    let titles: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT title FROM sessions WHERE user_id = ? ORDER BY started_at")
+            .bind(uid)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(titles, vec![Some("Casual Play".into()), Some("Late one".into())]);
+    assert_eq!(variant_at(&db, uid, t + 20_000).await, None, "the play keeps its chain, as wired");
+    assert_eq!(gear_secs(&db, uid).await, before);
+
+    edited[1].options = Some(vec![]);
+    db.update_chain(uid, chain, "Commute", None, &edited, "active", None).await.unwrap();
+    assert_eq!(db.get_chain(uid, chain).await.unwrap().unwrap().components[1].options, None);
+    // Deleting the person clears the switch history too.
+    db.delete_user(uid).await.unwrap();
+}
+
+/// Two chains that swap one box past the player become one chain with an
+/// option there; a chain on another player is not offered.
+#[tokio::test]
+async fn a_chain_that_swaps_one_box_merges_in_as_an_option() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let xperia = db.upsert_equipment(uid, "Xperia", "phone", None, None, 0.0, None).await.unwrap();
+    let walkman = db.upsert_equipment(uid, "Walkman", "dap", None, None, 0.0, None).await.unwrap();
+    let hd569 =
+        db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+    let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+    let src = |g: i64| step_of(ComponentType::Source, "src", g, None);
+    let phone = chain_with(
+        &db,
+        uid,
+        "Commute Phone",
+        vec![src(xperia), step_of(ComponentType::Transducer, "HD 569", hd569, None)],
+    )
+    .await;
+    let summer = chain_with(
+        &db,
+        uid,
+        "Summer Commute",
+        vec![src(xperia), step_of(ComponentType::Transducer, "Hexa", hexa, None)],
+    )
+    .await;
+    let walk = chain_with(
+        &db,
+        uid,
+        "Commute Walkman",
+        vec![src(walkman), step_of(ComponentType::Transducer, "HD 569", hd569, None)],
+    )
+    .await;
+    let t = Database::now_secs() - 5 * 86_400;
+    played(&db, uid, phone, t, None).await;
+    played(&db, uid, phone, t + 4000, None).await;
+    played(&db, uid, summer, t + 8000, None).await;
+    played(&db, uid, walk, t + 12_000, None).await;
+    let before = gear_secs(&db, uid).await;
+
+    let m = db.merge_candidates(uid).await.unwrap();
+    assert_eq!(m.len(), 1, "the Walkman chain differs at the player: {m:?}");
+    assert_eq!((m[0].chain_id, m[0].other_chain_id, m[0].position), (phone, summer, 1));
+    assert!(db.slot_questions(uid).await.unwrap().iter().any(|q| q.kind == "merge"));
+
+    assert!(db.merge_as_option(uid, phone, walk).await.unwrap().is_err());
+    let out = db.merge_as_option(uid, phone, summer).await.unwrap().unwrap();
+    assert_eq!(out.listens, 1);
+    assert!(db.get_chain(uid, summer).await.unwrap().is_none());
+    let comps = db.get_chain(uid, phone).await.unwrap().unwrap().components;
+    assert_eq!(comps[1].options, Some(vec![hd569, hexa]));
+    assert_eq!(gear_secs(&db, uid).await, before, "the Hexa hour stays on the Hexa");
+    assert!(db.merge_candidates(uid).await.unwrap().is_empty());
 }

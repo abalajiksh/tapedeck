@@ -131,7 +131,7 @@ impl Database {
     }
     pub async fn list_variants(&self, user_id: i64) -> Result<Vec<ChainVariant>, sqlx::Error> {
         sqlx::query_as::<_, ChainVariantRow>(&crate::sql!(
-            "SELECT v.id, v.user_id, v.chain_id, v.name, v.overrides, v.created_at,
+            "SELECT v.id, v.user_id, v.chain_id, v.name, v.overrides, v.created_at, v.auto,
                     CAST(COALESCE((
                         SELECT SUM(sc.duration) FROM scrobbles sc
                          WHERE sc.user_id = v.user_id AND sc.chain_variant_id = v.id
@@ -225,6 +225,14 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
+        // A stretch of history fitted with it reads as the chain as wired.
+        sqlx::query(&crate::sql!(
+            "UPDATE chain_fittings SET variant_id = NULL WHERE variant_id = ? AND user_id = ?"
+        ))
+        .bind(id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
         let res =
             sqlx::query(&crate::sql!("DELETE FROM chain_variants WHERE user_id = ? AND id = ?"))
                 .bind(user_id)
@@ -487,6 +495,14 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         sqlx::query(&crate::sql!("DELETE FROM chain_rooms WHERE chain_id = ? AND user_id = ?"))
+            .bind(from_chain_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        // Its picks history described a chain that is now one option of
+        // another; every listen it covered has just been filed with that
+        // option, so there is nothing left for it to say.
+        sqlx::query(&crate::sql!("DELETE FROM chain_fittings WHERE chain_id = ? AND user_id = ?"))
             .bind(from_chain_id)
             .bind(user_id)
             .execute(&mut *tx)
