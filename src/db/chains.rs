@@ -74,8 +74,8 @@ impl Database {
         Ok(current)
     }
     pub async fn create_chain(&self, chain: &SignalChain) -> Result<i64, sqlx::Error> {
-        let components_json =
-            serde_json::to_string(&chain.components).unwrap_or_else(|_| "[]".into());
+        let components = self.normalise_slots(chain.user_id, &chain.components, &[]).await?;
+        let components_json = serde_json::to_string(&components).unwrap_or_else(|_| "[]".into());
         let now = Self::now_secs();
         let result = sqlx::query_as::<_, (i64,)>(&crate::sql!("INSERT INTO signal_chains (uuid, user_id, name, description, components, listening_context, icon, is_active, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id")).bind(new_uuid()).bind(chain.user_id).bind(&chain.name).bind(&chain.description)
@@ -93,6 +93,22 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+    /// When each of this user's chains last carried a listen, by chain id.
+    /// Skips are not listening, so they do not count as use.
+    pub async fn chain_last_used(
+        &self,
+        user_id: i64,
+    ) -> Result<std::collections::BTreeMap<i64, i64>, sqlx::Error> {
+        let rows: Vec<(i64, i64)> = sqlx::query_as(&crate::sql!(
+            "SELECT chain_id, MAX(timestamp) FROM scrobbles
+              WHERE user_id = ? AND chain_id IS NOT NULL AND skipped = FALSE
+              GROUP BY chain_id"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
     }
     pub async fn get_chain(
         &self,
@@ -273,6 +289,7 @@ impl Database {
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_default();
         let components = &Self::stamp_new_steps(components, &was);
+        let components = &self.normalise_slots(user_id, components, &was).await?;
 
         let components_json = serde_json::to_string(components).unwrap_or_else(|_| "[]".into());
         let res = sqlx::query(&crate::sql!(// `shared` is deliberately absent. This is a whole-record replace
@@ -322,7 +339,13 @@ impl Database {
 
         // Anything pointing at a *variant* of this chain has to let go before
         // the variants themselves can be deleted.
-        for table in ["scrobbles", "physical_plays", "physical_releases", "chain_bindings"] {
+        for table in [
+            "scrobbles",
+            "physical_plays",
+            "physical_releases",
+            "chain_bindings",
+            "device_bindings",
+        ] {
             sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_variant_id = NULL
                   WHERE chain_variant_id IN
@@ -332,6 +355,11 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
+        // What was on when means nothing without the chain.
+        sqlx::query(&crate::sql!("DELETE FROM chain_fittings WHERE chain_id = ?"))
+            .bind(chain_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(&crate::sql!("DELETE FROM chain_variants WHERE chain_id = ?"))
             .bind(chain_id)
             .execute(&mut *tx)
@@ -344,6 +372,7 @@ impl Database {
             ("sessions", "chain_id"),
             ("devices", "default_chain_id"),
             ("chain_bindings", "chain_id"),
+            ("device_bindings", "chain_id"),
             ("tokens", "default_chain_id"),
             ("physical_plays", "chain_id"),
             ("physical_releases", "chain_id"),
@@ -357,6 +386,13 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
+
+        // Rooms hold the chain by a link row; the rooms themselves stay.
+        sqlx::query(&crate::sql!("DELETE FROM chain_rooms WHERE chain_id = ? AND user_id = ?"))
+            .bind(chain_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
 
         let res =
             sqlx::query(&crate::sql!("DELETE FROM signal_chains WHERE id = ? AND user_id = ?"))

@@ -169,6 +169,7 @@ impl Database {
             "physical_releases",
             "physical_plays",
             "physical_images",
+            "rooms",
         ] {
             constraint!(&format!(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_uuid ON {table}(uuid)"
@@ -293,6 +294,9 @@ impl Database {
                 is_active BOOLEAN DEFAULT TRUE,
                 total_hours REAL DEFAULT 0,
                 created_at INTEGER NOT NULL,
+                -- own, or friend: the built-in At a friend's, where Shared
+                -- Spool plays land. `migrate()` adds it too.
+                kind TEXT NOT NULL DEFAULT 'own',
                 -- Phase 6: the sharing unit is the chain, not the listen.
                 --
                 -- Off by default, and it is what decides whether a listen ever
@@ -317,6 +321,8 @@ impl Database {
                 last_used_at INTEGER,
                 expires_at INTEGER,
                 default_chain_id INTEGER REFERENCES signal_chains(id),
+                -- The box this token's app runs on; see `devices.equipment_id`.
+                equipment_id INTEGER,
                 -- Whether this client's import-type submissions are
                 -- live listens rather than a backfill. Off by default and never
                 -- inferred: turning it on lets a client write to the owner's
@@ -338,6 +344,12 @@ impl Database {
                 machine_id TEXT NOT NULL, name TEXT, platform TEXT,
                 product TEXT, device_type TEXT,
                 default_chain_id INTEGER REFERENCES signal_chains(id),
+                -- The physical box this reporter is (a phone, a laptop). Several
+                -- devices and tokens can be one box: the app, the browser and the
+                -- model number a phone reports as. No REFERENCES, because
+                -- `equipment` is created after this table; `delete_equipment`
+                -- clears it. `migrate()` adds it.
+                equipment_id INTEGER,
                 first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL,
                 total_listens INTEGER DEFAULT 0,
                 UNIQUE(user_id, machine_id)
@@ -366,6 +378,11 @@ impl Database {
                 -- constraint here would mean a rebuild to add a word. NULL is
                 -- the usual state and means nothing has been said.
                 status TEXT,
+                -- Other names this box reports as, a JSON array of strings: a
+                -- phone's model number (XQ-DQ54), an app's own name for it. Filled
+                -- by answering the inbox, never guessed; a reporter matching one is
+                -- *suggested* as this box and still asked about.
+                aliases TEXT,
                 UNIQUE(user_id, name)
             )",
         )
@@ -416,6 +433,9 @@ impl Database {
                 name TEXT NOT NULL,
                 overrides JSON NOT NULL DEFAULT '[]',
                 created_at INTEGER NOT NULL,
+                -- Kept by Tapedeck for a combination of slot picks (what is on
+                -- now), never named on screen. `migrate()` adds it too.
+                auto BOOLEAN NOT NULL DEFAULT FALSE,
                 UNIQUE(chain_id, name)
             )",
         )
@@ -482,6 +502,17 @@ impl Database {
                 is_transcoded BOOLEAN, transcode_reason TEXT, quality_score REAL,
                 device_id INTEGER REFERENCES devices(id),
                 chain_id INTEGER REFERENCES signal_chains(id),
+                -- Where the listen came from, recorded at ingest so a play that
+                -- landed in no chain can be asked about later (the Signal Chains
+                -- inbox): the token that sent it, the output the client named, and
+                -- which rung of the ladder decided its chain. NULL on listens older
+                -- than v0.129.0 and on sources that report none of it. `token_id`
+                -- has no REFERENCES on purpose: a deleted token's id stays, so the
+                -- inbox can still group the plays it sent (a token you deleted)
+                -- and deleting one never rewrites history. `migrate()` adds all three.
+                token_id INTEGER,
+                output_identifier TEXT,
+                chain_source TEXT,
                 session_id INTEGER REFERENCES sessions(id),
                 listening_context TEXT, submission_client TEXT,
                 delivered_sinks TEXT NOT NULL DEFAULT '[]',
@@ -801,6 +832,105 @@ impl Database {
                 last_seen INTEGER NOT NULL,
                 hits INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(user_id, identifier)
+            )",
+        )
+        .await?;
+
+        // ── Outputs per box ──
+        // `chain_bindings` is one row per output *name*, so "Phone speaker"
+        // from two phones could only ever point at one chain. A box that its
+        // reporters have been tied to records its outputs here instead, keyed
+        // by the box; `chain_bindings` stays as the rung for outputs from
+        // anything not tied to a box. Same columns, so every statement that
+        // moves `chain_bindings` rows can move these with it.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS device_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                equipment_id INTEGER NOT NULL REFERENCES equipment(id),
+                identifier TEXT NOT NULL,
+                interface TEXT,
+                chain_id INTEGER REFERENCES signal_chains(id),
+                chain_variant_id INTEGER REFERENCES chain_variants(id),
+                last_seen INTEGER NOT NULL,
+                hits INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(user_id, equipment_id, identifier)
+            )",
+        )
+        .await?;
+
+        // ── The Signal Chains inbox: questions put off ──
+        // The questions are computed on read from the listens; only "not now"
+        // is stored, as the question's key and when to ask again.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS chain_inbox_dismissed (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                key TEXT NOT NULL,
+                until INTEGER NOT NULL,
+                UNIQUE(user_id, key)
+            )",
+        )
+        .await?;
+
+        // ── What was on when: the history of slot picks ──
+        // One row per switch: from `since`, the chain ran with `variant_id`'s
+        // picks (NULL = every slot on the gear the chain is wired with). A
+        // listen that arrives with a chain and no variant takes the fitting
+        // in effect at its timestamp (`Database::fitted_variant`), so the
+        // hours land on what was actually on. Both era mechanisms stay: a
+        // component's `since` is for wiring changes, this is for slot picks.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS chain_fittings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                chain_id INTEGER NOT NULL REFERENCES signal_chains(id),
+                variant_id INTEGER REFERENCES chain_variants(id),
+                since INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )",
+        )
+        .await?;
+        self.ddl(
+            "CREATE INDEX IF NOT EXISTS idx_chain_fittings_lookup
+                 ON chain_fittings(chain_id, since)",
+        )
+        .await?;
+
+        // ── Rooms: where chains live ──
+        // A room holds chains, not gear: headphones move between rooms and the
+        // chains they are in do not. A chain may be in several rooms
+        // (`chain_rooms`, Ashwin 2026-11-06), so it is a link table rather than
+        // a column on `signal_chains`. `kind` is 'room' for the person's own,
+        // 'portable' for the built-in "On the go" and 'elsewhere' for the
+        // built-in that will hold "At a friend's"; the built-ins are created
+        // lazily and cannot be renamed or deleted. `icon` follows the rule
+        // `signal_chains.icon` does: the UI owns the vocabulary.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS rooms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                -- Stable id for replicas; see the note on `notes.uuid`.
+                uuid TEXT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                name TEXT NOT NULL,
+                icon TEXT,
+                kind TEXT NOT NULL DEFAULT 'room',
+                sort INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                UNIQUE(user_id, name)
+            )",
+        )
+        .await?;
+        // `user_id` although the chain already names its owner: every read
+        // here is scoped by it without a join, and `delete_user` can clear the
+        // table in its loop like any other.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS chain_rooms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                chain_id INTEGER NOT NULL REFERENCES signal_chains(id),
+                room_id INTEGER NOT NULL REFERENCES rooms(id),
+                UNIQUE(chain_id, room_id)
             )",
         )
         .await?;

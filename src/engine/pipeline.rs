@@ -919,7 +919,21 @@ impl ScrobbleEngine {
                 .await
             {
                 Ok(true) => {
-                    info!("📥 Queued for user {}: {} - {}", user_id, play.artist, play.title)
+                    info!("📥 Queued for user {}: {} - {}", user_id, play.artist, play.title);
+                    // A polled listen has no token or output; only the device
+                    // default can place it. Recorded so the inbox can tell a
+                    // play that found no chain from one older than the record.
+                    let origin = crate::db::ListenOrigin {
+                        token_id: None,
+                        output: None,
+                        chain_source: if chain_id.is_some() { "device_default" } else { "none" },
+                    };
+                    if let Err(e) = db
+                        .set_listen_origin(user_id, &play.source_id, &play.source_name, &origin)
+                        .await
+                    {
+                        debug!("Could not record where a listen came from: {}", e);
+                    }
                 }
                 Ok(false) => {}
                 Err(e) => error!("Database error: {}", e),

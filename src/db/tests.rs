@@ -2474,6 +2474,8 @@ async fn chain_and_gear_hours_follow_the_listens_however_late_they_are_assigned(
                     detail: None,
                     since: None,
                     equipment_id: Some(gear),
+                    options: None,
+                    slot_name: None,
                 },
                 ChainComponent {
                     component_type: ComponentType::Transport,
@@ -2481,6 +2483,8 @@ async fn chain_and_gear_hours_follow_the_listens_however_late_they_are_assigned(
                     detail: None,
                     since: None,
                     equipment_id: Some(gear),
+                    options: None,
+                    slot_name: None,
                 },
             ],
             listening_context: ListeningContext::Active,
@@ -3129,6 +3133,8 @@ async fn a_variant_moves_the_wear_onto_the_gear_that_was_fitted() {
                     detail: None,
                     since: None,
                     equipment_id: Some(deck),
+                    options: None,
+                    slot_name: None,
                 },
                 ChainComponent {
                     component_type: ComponentType::Source,
@@ -3136,6 +3142,8 @@ async fn a_variant_moves_the_wear_onto_the_gear_that_was_fitted() {
                     detail: None,
                     since: None,
                     equipment_id: Some(ell),
+                    options: None,
+                    slot_name: None,
                 },
             ],
             listening_context: ListeningContext::Active,
@@ -4676,7 +4684,8 @@ async fn a_patch_reads_nothing_until_it_is_accepted() {
     assert_eq!(reel.len(), 1);
     assert_eq!(reel[0].title, "Teardrop");
     assert_eq!(reel[0].username, "kim");
-    assert_eq!(reel[0].chain_name.as_deref(), Some("Study Chain"), "a shared chain is still named");
+    let row = serde_json::to_string(&reel[0]).unwrap();
+    assert!(!row.contains("Study Chain"), "a shared chain is never named: {row}");
 
     // And withdrawing takes it away again.
     assert!(db.unpatch(me, them).await.unwrap());
@@ -5164,8 +5173,8 @@ async fn nothing_unshared_reaches_any_of_the_step_three_screens() {
 
     let deck = db.deck_view(me, "kim").await.unwrap().expect("the deck");
     assert_eq!(deck.listens, 1, "deck page counts only shared listens");
-    assert_eq!(deck.chains.len(), 1, "and lists only shared chains");
-    assert_eq!(deck.chains[0].name, "Study");
+    let page = serde_json::to_string(&deck).unwrap();
+    assert!(!page.contains("Study"), "and never names a chain, shared or not: {page}");
 
     let pulse = db.instance_pulse(0).await.unwrap();
     let pulse_names: Vec<String> = pulse.artists.iter().map(|a| a.name.clone()).collect();
@@ -5275,15 +5284,9 @@ async fn opening_a_deck_up_shows_every_listen_and_still_spares_the_instance() {
         "everything they played, newest first — and never the skip"
     );
 
-    // The chain is named only where they share it, and "private" is told
-    // apart from "there was none".
-    let by_title = |t: &str| reel.iter().find(|r| r.title == t).expect("row");
-    assert_eq!(by_title("Shared").chain_name.as_deref(), Some("Study"));
-    assert!(by_title("Shared").has_chain);
-    assert_eq!(by_title("Hidden").chain_name, None, "a private chain is not named");
-    assert!(by_title("Hidden").has_chain, "but the screen must know there *was* one");
-    assert_eq!(by_title("Orphan").chain_name, None);
-    assert!(!by_title("Orphan").has_chain, "and that this one ran through nothing");
+    // No chain is named on any row, shared, private or absent.
+    let rows = serde_json::to_string(&reel).unwrap();
+    assert!(!rows.contains("Study") && !rows.contains("Bedroom"), "no chain is named: {rows}");
 
     // The rest of the patched screens follow.
     let names: Vec<String> =
@@ -5291,7 +5294,8 @@ async fn opening_a_deck_up_shows_every_listen_and_still_spares_the_instance() {
     assert_eq!(names.len(), 3, "artists tab, got {names:?}");
     let deck = db.deck_view(me, "kim").await.unwrap().expect("the deck");
     assert_eq!(deck.listens, 3, "deck page");
-    assert_eq!(deck.chains.len(), 1, "but it still lists only the chains they share");
+    let page = serde_json::to_string(&deck).unwrap();
+    assert!(!page.contains("Study") && !page.contains("Bedroom"), "nor on the deck page: {page}");
 
     // And the instance does not. This is the assertion that matters most:
     // it is the one place a person who never agreed to any of this is read.
@@ -5513,13 +5517,17 @@ async fn searching_the_reel_narrows_it_and_never_widens_it() {
         "the unshared listen is not on the Reel to begin with"
     );
 
-    // By track, by artist, by chain, by deck — all narrow.
+    // By track, by artist, by deck — all narrow. Not by chain: a chain is
+    // never named to anybody else, so its name must not find anything either.
     assert_eq!(titles(db.reel(me, 40, None, Some("spoon"), None).await.unwrap()), ["Spoon"]);
     assert_eq!(
         titles(db.reel(me, 40, None, Some("talk talk"), None).await.unwrap()),
         ["Ascension Day"]
     );
-    assert_eq!(titles(db.reel(me, 40, None, Some("study"), None).await.unwrap()).len(), 2);
+    assert!(
+        titles(db.reel(me, 40, None, Some("study"), None).await.unwrap()).is_empty(),
+        "a chain's name is not something the Reel can be searched by"
+    );
     assert_eq!(titles(db.reel(me, 40, None, None, Some("kim")).await.unwrap()).len(), 2);
     assert!(titles(db.reel(me, 40, None, None, Some("nobody")).await.unwrap()).is_empty());
 
@@ -5537,11 +5545,85 @@ async fn searching_the_reel_narrows_it_and_never_widens_it() {
 
 /// A live deck is gated exactly as a banked listen is.
 ///
+/// **A signal chain is private by design, shared or not** (Ashwin,
+/// 2026-11-06). Sharing a chain hands over the listen's format and transcode
+/// details and nothing about the chain: not its name, not its gear, not its
+/// hours. Not shared, and the format stays home too.
+#[tokio::test]
+async fn a_shared_chain_hands_over_the_format_and_never_itself() {
+    let db = testdb().await;
+    let (me, them, shared) = patched_pair(&db).await;
+    sqlx::query("UPDATE signal_chains SET components = ? WHERE id = ?")
+        .bind(r#"[{"type":"transducer","name":"Hexa Monitor"}]"#)
+        .bind(shared)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let private = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Bedroom', ?) \
+             RETURNING id",
+    )
+    .bind(them)
+    .bind(Database::now_secs())
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()[0];
+    db.set_share_all_with_patched(them, true).await.unwrap();
+
+    let q = AudioQuality {
+        format_type: Some("pcm".into()),
+        codec: Some("flac".into()),
+        sample_rate: Some(96_000),
+        bit_depth: Some(24),
+        is_lossless: Some(true),
+        delivery_codec: Some("aac".into()),
+        delivery_bitrate: Some(256),
+        is_transcoded: Some(true),
+        transcode_reason: Some("bandwidth".into()),
+        ..Default::default()
+    };
+    for (chain, title, ts) in [(shared, "Out", 1_760_000_100u64), (private, "Home", 1_760_000_200)]
+    {
+        let p = Play::new(title.into(), "Artist".into(), ts, format!("f-{ts}"), "test".into());
+        db.save_scrobble(
+            them,
+            &p,
+            Some(&q),
+            None,
+            Some(chain),
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    }
+
+    let reel = db.reel(me, 50, None, None, None).await.unwrap();
+    let out = reel.iter().find(|r| r.title == "Out").expect("shared row");
+    assert_eq!(out.format.codec.as_deref(), Some("flac"));
+    assert_eq!(out.format.sample_rate, Some(96_000));
+    assert_eq!(out.format.delivery_codec.as_deref(), Some("aac"));
+    assert_eq!(out.format.is_transcoded, Some(true));
+    assert_eq!(out.format.transcode_reason.as_deref(), Some("bandwidth"));
+    let home = reel.iter().find(|r| r.title == "Home").expect("private row");
+    assert_eq!(home.format.codec, None, "an unshared chain keeps the format home");
+    assert_eq!(home.format.delivery_codec, None);
+
+    let rows = serde_json::to_string(&reel).unwrap();
+    for leak in ["Study", "Bedroom", "Hexa Monitor", "chain"] {
+        assert!(!rows.contains(leak), "{leak:?} reached a patched deck: {rows}");
+    }
+    // A search cannot probe for a chain by name either.
+    assert!(db.reel(me, 50, None, Some("study"), None).await.unwrap().is_empty());
+}
+
 /// With the switch **off** — the default, and every account that predates
-/// it — that is the shared chain, unchanged. `live_visibility` returns the
-/// chain's *name* rather than a boolean so one round trip answers both
-/// questions, which is also what stops a caller showing the name of a
-/// chain it never checked.
+/// it — that is the shared chain, unchanged. `live_visibility` answers
+/// whether the listen shows and whether its format goes with it; it never
+/// returns the chain's name (2026-11-06).
 #[tokio::test]
 async fn a_live_deck_is_gated_on_the_same_shared_chain_a_listen_is() {
     let db = testdb().await;
@@ -5558,7 +5640,7 @@ async fn a_live_deck_is_gated_on_the_same_shared_chain_a_listen_is() {
 
     assert_eq!(
         db.live_visibility(them, Some(shared)).await.unwrap(),
-        Visible::Yes(Some("Study".into()))
+        Visible::Yes { format_shared: true }
     );
     assert_eq!(
         db.live_visibility(them, Some(private)).await.unwrap(),
@@ -5575,8 +5657,8 @@ async fn a_live_deck_is_gated_on_the_same_shared_chain_a_listen_is() {
     // — what must not happen is their chain's name coming back on it.
     assert_eq!(
         db.live_visibility(me, Some(shared)).await.unwrap(),
-        Visible::Yes(None),
-        "a chain that is not theirs is never named on their deck"
+        Visible::Yes { format_shared: false },
+        "a chain that is not theirs shares nothing on their deck"
     );
 
     // With the switch on, the track shows and the private chain is simply
@@ -5584,17 +5666,17 @@ async fn a_live_deck_is_gated_on_the_same_shared_chain_a_listen_is() {
     db.set_share_all_with_patched(them, true).await.unwrap();
     assert_eq!(
         db.live_visibility(them, Some(shared)).await.unwrap(),
-        Visible::Yes(Some("Study".into())),
-        "a shared chain is still named"
+        Visible::Yes { format_shared: true },
+        "a shared chain still hands over the format"
     );
     assert_eq!(
         db.live_visibility(them, Some(private)).await.unwrap(),
-        Visible::Yes(None),
-        "a private chain shows the track and withholds the name"
+        Visible::Yes { format_shared: false },
+        "a private chain shows the track and withholds the format"
     );
     assert_eq!(
         db.live_visibility(them, None).await.unwrap(),
-        Visible::Yes(None),
+        Visible::Yes { format_shared: false },
         "and a chainless listen shows too — 'all the music they scrobble' means all of it"
     );
 
@@ -6405,6 +6487,8 @@ async fn promoting_a_variant_moves_no_hours() {
         detail: None,
         since: None,
         equipment_id: Some(id),
+        options: None,
+        slot_name: None,
     };
 
     let chain_id = db
@@ -6531,6 +6615,8 @@ async fn promoting_repoints_the_listens_both_ways() {
                 detail: None,
                 since: None,
                 equipment_id: None,
+                options: None,
+                slot_name: None,
             }],
             listening_context: ListeningContext::Unknown,
             icon: None,
@@ -6603,6 +6689,8 @@ async fn retagging_a_listen_s_chain_does_not_leave_a_stale_setup() {
             detail: None,
             since: None,
             equipment_id: None,
+            options: None,
+            slot_name: None,
         }],
         listening_context: ListeningContext::Unknown,
         icon: None,
@@ -7701,6 +7789,8 @@ async fn chain_of(db: &Database, uid: i64, name: &str, steps: &[(&str, i64)]) ->
                 detail: None,
                 since: None,
                 equipment_id: Some(*g),
+                options: None,
+                slot_name: None,
             })
             .collect(),
         listening_context: ListeningContext::Active,
@@ -7779,6 +7869,8 @@ async fn gear_added_to_an_old_chain_is_not_credited_with_the_chain_s_past() {
         detail: None,
         since,
         equipment_id: Some(gear),
+        options: None,
+        slot_name: None,
     };
     let with_sub = vec![
         step("Dell Precision", pc, None),
@@ -11903,4 +11995,1100 @@ async fn an_output_bound_to_a_setup_keeps_naming_the_gear_it_names() {
     assert_eq!(db.resolve_binding(uid, "Desk DAC").await.unwrap(), None);
     let rows = db.list_bindings(uid).await.unwrap();
     assert!(rows.iter().all(|b| b.chain_id.is_none() && b.chain_variant_id.is_none()));
+}
+
+/// "Last used" on the Signal Chains list: the newest listen through each chain,
+/// never a skip, and nothing for a chain nothing has played through.
+#[tokio::test]
+async fn a_chain_is_last_used_at_its_newest_listen_not_its_newest_skip() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let mk = |name: &'static str| {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, ?, ?) RETURNING id",
+        )
+        .bind(uid)
+        .bind(name)
+        .bind(Database::now_secs())
+    };
+    let desk = mk("Desk").fetch_one(&db.pool).await.unwrap();
+    let idle = mk("Idle").fetch_one(&db.pool).await.unwrap();
+
+    listen(&db, uid, Some(desk), "One", "A", 1_760_000_100).await;
+    listen(&db, uid, Some(desk), "Two", "A", 1_760_000_200).await;
+    let skip = Play::new("Bailed".into(), "A".into(), 1_760_000_900, "sk-1".into(), "test".into());
+    db.save_scrobble(
+        uid,
+        &skip,
+        None,
+        None,
+        Some(desk),
+        None,
+        None,
+        None,
+        None,
+        ListenDisposition { imported: false, skipped: true },
+    )
+    .await
+    .unwrap();
+
+    let last = db.chain_last_used(uid).await.unwrap();
+    assert_eq!(last.get(&desk), Some(&1_760_000_200), "the newest listen, not the skip after it");
+    assert_eq!(last.get(&idle), None, "a chain nothing played through has no last use");
+}
+
+// ── Rooms ──
+
+fn room_of(rooms: &[Room], name: &str) -> Room {
+    rooms.iter().find(|r| r.name == name).unwrap_or_else(|| panic!("no room {name}")).clone()
+}
+
+/// A room is a person's own: one name each (ignoring case), never usable by
+/// anybody else, and "On the go" is there without anybody making it.
+#[tokio::test]
+async fn rooms_are_one_persons_and_named_once() {
+    let db = testdb().await;
+    let ash = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let kim = db.create_user("kim", None, "pw", "user").await.unwrap();
+
+    let study = db.create_room(ash, "  Study  ", Some("desk")).await.unwrap().unwrap();
+    assert_eq!(db.create_room(ash, "study", None).await.unwrap(), Err(RoomRefusal::Duplicate));
+    assert_eq!(db.create_room(ash, "   ", None).await.unwrap(), Err(RoomRefusal::BadName));
+    assert_eq!(
+        db.create_room(ash, &"x".repeat(61), None).await.unwrap(),
+        Err(RoomRefusal::BadName)
+    );
+    // Somebody else may have a Study of their own.
+    assert!(db.create_room(kim, "Study", None).await.unwrap().is_ok());
+
+    let rooms = db.list_rooms(ash).await.unwrap();
+    assert_eq!(room_of(&rooms, "Study").icon.as_deref(), Some("desk"), "whitespace collapsed");
+    assert_eq!(room_of(&rooms, "On the go").kind, "portable", "the built-in arrives on its own");
+    assert_eq!(rooms.len(), 2);
+    // Asking again does not make a second one.
+    assert_eq!(db.list_rooms(ash).await.unwrap().len(), 2);
+
+    // kim cannot touch ash's room, and cannot put a chain of theirs in it.
+    assert_eq!(
+        db.update_room(kim, study, Some("Mine"), None, None).await.unwrap(),
+        Err(RoomRefusal::NotFound)
+    );
+    assert_eq!(db.delete_room(kim, study).await.unwrap(), Err(RoomRefusal::NotFound));
+    let kims = chain_of(&db, kim, "Desk", &[]).await;
+    assert_eq!(db.set_chain_rooms(kim, kims, &[study]).await.unwrap(), Err(RoomRefusal::NotFound));
+    let ashs = chain_of(&db, ash, "Desk", &[]).await;
+    assert_eq!(
+        db.set_chain_rooms(kim, ashs, &[]).await.unwrap(),
+        Err(RoomRefusal::NotFound),
+        "nor change which rooms ash's chain is in"
+    );
+}
+
+/// A chain may live in several rooms, and taking either side away is clean:
+/// deleting a room never deletes a chain, deleting a chain never deletes a room.
+#[tokio::test]
+async fn a_chain_lives_in_several_rooms_and_either_side_can_go() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let study = db.create_room(uid, "Study", None).await.unwrap().unwrap();
+    let kitchen = db.create_room(uid, "Kitchen", None).await.unwrap().unwrap();
+    let speaker = chain_of(&db, uid, "BT speaker", &[]).await;
+    let desk = chain_of(&db, uid, "Desk", &[]).await;
+
+    db.set_chain_rooms(uid, speaker, &[study, kitchen, study]).await.unwrap().unwrap();
+    db.set_chain_rooms(uid, desk, &[study]).await.unwrap().unwrap();
+    let rooms = db.list_rooms(uid).await.unwrap();
+    assert_eq!(room_of(&rooms, "Study").chain_ids, vec![speaker.min(desk), speaker.max(desk)]);
+    assert_eq!(room_of(&rooms, "Kitchen").chain_ids, vec![speaker], "a repeat is one link");
+
+    // The room goes; both chains stay, and the speaker is still in the Study.
+    db.delete_room(uid, study).await.unwrap().unwrap();
+    assert_eq!(db.get_chains(uid).await.unwrap().len(), 2);
+    let rooms = db.list_rooms(uid).await.unwrap();
+    assert_eq!(room_of(&rooms, "Kitchen").chain_ids, vec![speaker]);
+
+    // The chain goes; the room stays, empty.
+    assert!(db.delete_chain(uid, speaker).await.unwrap());
+    let rooms = db.list_rooms(uid).await.unwrap();
+    assert!(room_of(&rooms, "Kitchen").chain_ids.is_empty());
+
+    // [] takes a chain out of every room.
+    db.set_chain_rooms(uid, desk, &[kitchen]).await.unwrap().unwrap();
+    db.set_chain_rooms(uid, desk, &[]).await.unwrap().unwrap();
+    assert!(db.list_rooms(uid).await.unwrap().iter().all(|r| r.chain_ids.is_empty()));
+}
+
+/// The built-ins can be reordered, not renamed or deleted; and a room of your
+/// own already called "On the go" becomes the built-in rather than a clash.
+#[tokio::test]
+async fn built_in_rooms_keep_their_names() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let mine = db.create_room(uid, "On the go", Some("car")).await.unwrap().unwrap();
+    let rooms = db.list_rooms(uid).await.unwrap();
+    assert_eq!(rooms.len(), 1, "adopted, not duplicated");
+    assert_eq!(room_of(&rooms, "On the go").id, mine);
+    assert_eq!(room_of(&rooms, "On the go").kind, "portable");
+
+    assert_eq!(
+        db.update_room(uid, mine, Some("Car"), None, None).await.unwrap(),
+        Err(RoomRefusal::BuiltIn)
+    );
+    assert_eq!(db.delete_room(uid, mine).await.unwrap(), Err(RoomRefusal::BuiltIn));
+    db.update_room(uid, mine, None, Some(None), Some(5)).await.unwrap().unwrap();
+    let r = room_of(&db.list_rooms(uid).await.unwrap(), "On the go");
+    assert_eq!((r.icon, r.sort), (None, 5), "an icon and a place in the order may change");
+}
+
+/// Folding a chain into another carries its rooms over, and deleting the
+/// person takes their rooms with them.
+#[tokio::test]
+async fn rooms_follow_a_fold_and_go_with_their_owner() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let phone = db.upsert_equipment(uid, "Xperia", "dap", None, None, 0.0, None).await.unwrap();
+    let hd569 =
+        db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+    let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+    let commute =
+        chain_of(&db, uid, "Commute Phone", &[("Xperia", phone), ("HD 569", hd569)]).await;
+    let summer = chain_of(&db, uid, "Summer Commute", &[("Xperia", phone), ("Hexa", hexa)]).await;
+    let car = db.create_room(uid, "Car", None).await.unwrap().unwrap();
+    let go = db.ensure_builtin_room(uid, "portable").await.unwrap();
+    db.set_chain_rooms(uid, commute, &[go]).await.unwrap().unwrap();
+    db.set_chain_rooms(uid, summer, &[go, car]).await.unwrap().unwrap();
+
+    db.fold_chain_into_variant(uid, summer, commute, FoldTarget::New("Hexa"))
+        .await
+        .unwrap()
+        .expect("the fold is allowed");
+    let rooms = db.list_rooms(uid).await.unwrap();
+    assert_eq!(
+        room_of(&rooms, "Car").chain_ids,
+        vec![commute],
+        "the folded chain's room carries over"
+    );
+    assert_eq!(room_of(&rooms, "On the go").chain_ids, vec![commute], "once, not twice");
+
+    assert!(db.delete_user(uid).await.unwrap(), "rooms must not block deleting their owner");
+    let left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rooms").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(left, 0);
+}
+
+/// Deleting a person who has used the chain features fully: a setup, a mapped
+/// output carrying it, a machine with a default chain, a pairing in flight and
+/// a room. Each of those used to block the delete on a foreign key.
+#[tokio::test]
+async fn deleting_a_person_with_setups_outputs_machines_and_rooms_succeeds() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let hd = db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+    let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+    let chain = chain_of(&db, uid, "Commute", &[("HD 569", hd)]).await;
+    let v = db
+        .create_variant(
+            uid,
+            chain,
+            "Summer",
+            &[VariantOverride { position: 0, equipment_id: Some(hexa), name: Some("Hexa".into()) }],
+        )
+        .await
+        .unwrap();
+    db.record_output(uid, "Bluetooth", None).await.unwrap();
+    db.set_binding(uid, "Bluetooth", Some(chain), Some(v)).await.unwrap();
+    let dev = db.upsert_device(uid, "m-1", Some("Phone"), None, None).await.unwrap();
+    sqlx::query("UPDATE devices SET default_chain_id = ? WHERE id = ?")
+        .bind(chain)
+        .bind(dev)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO pairing_requests (device_code_hash, user_code, client_name, scopes, \
+         user_id, default_chain_id, created_at, expires_at) VALUES ('h', 'C', 'x', 'submit', ?, ?, 0, 9e9)",
+    )
+    .bind(uid)
+    .bind(chain)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let room = db.create_room(uid, "Study", None).await.unwrap().unwrap();
+    db.set_chain_rooms(uid, chain, &[room]).await.unwrap().unwrap();
+
+    assert!(db.delete_user(uid).await.unwrap());
+    for table in ["chain_variants", "signal_chains", "chain_bindings", "devices", "rooms"] {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{table} left behind");
+    }
+}
+
+/// A new room goes after the person's own rooms and before the built-ins,
+/// even after a reorder has moved a built-in up the list.
+#[tokio::test]
+async fn a_new_room_lands_before_the_built_ins() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let go = db.ensure_builtin_room(uid, "portable").await.unwrap();
+    let study = db.create_room(uid, "Study", None).await.unwrap().unwrap();
+    let names = |rs: Vec<Room>| rs.into_iter().map(|r| r.name).collect::<Vec<_>>();
+    assert_eq!(names(db.list_rooms(uid).await.unwrap()), ["Study", "On the go"]);
+
+    // The way the Rooms page reorders: every position rewritten.
+    db.update_room(uid, study, None, None, Some(0)).await.unwrap().unwrap();
+    db.update_room(uid, go, None, None, Some(1)).await.unwrap().unwrap();
+    db.create_room(uid, "Garden", None).await.unwrap().unwrap();
+    assert_eq!(names(db.list_rooms(uid).await.unwrap()), ["Study", "Garden", "On the go"]);
+}
+
+// ── Phase 2: where listens come from, boxes, the inbox ──
+
+/// A listen saved with no chain, from a device and/or token and/or output, the
+/// way ingest records it.
+async fn unfiled(
+    db: &Database,
+    uid: i64,
+    ts: i64,
+    device: Option<i64>,
+    token: Option<i64>,
+    output: Option<&str>,
+    source: &str,
+    skipped: bool,
+) {
+    let p = Play::new(format!("T{ts}"), "A".into(), ts as u64, format!("u-{ts}"), source.into());
+    db.save_scrobble(
+        uid,
+        &p,
+        None,
+        device,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ListenDisposition { imported: false, skipped },
+    )
+    .await
+    .unwrap();
+    db.set_listen_origin(
+        uid,
+        &p.source_id,
+        source,
+        &ListenOrigin { token_id: token, output, chain_source: "none" },
+    )
+    .await
+    .unwrap();
+}
+
+async fn token_id_named(db: &Database, uid: i64, name: &str) -> i64 {
+    db.create_token(uid, name, "submit", None, false).await.unwrap();
+    sqlx::query_scalar("SELECT id FROM tokens WHERE user_id = ? AND name = ?")
+        .bind(uid)
+        .bind(name)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+/// Two phones both report "Phone speaker". Once their reporters are tied to
+/// boxes, each box's output is its own and outranks the old by-name mapping.
+#[tokio::test]
+async fn an_output_learned_per_box_outranks_the_same_name_from_anything() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let xperia = db.upsert_equipment(uid, "Xperia", "phone", None, None, 0.0, None).await.unwrap();
+    let pixel = db.upsert_equipment(uid, "Pixel", "phone", None, None, 0.0, None).await.unwrap();
+    let commute = chain_of(&db, uid, "Commute", &[]).await;
+    let kitchen = chain_of(&db, uid, "Kitchen", &[]).await;
+
+    // The old world: one row per name, so both phones share it.
+    db.record_output(uid, "Phone speaker", None).await.unwrap();
+    db.set_binding(uid, "Phone speaker", Some(kitchen), None).await.unwrap();
+
+    let dev = db.upsert_device(uid, "m-x", Some("TIDAL on XQ-DQ54"), None, None).await.unwrap();
+    assert_eq!(db.source_equipment(uid, Some(dev), None).await.unwrap(), None);
+    db.tie_reporters(uid, Some(xperia), &[dev], &[]).await.unwrap();
+    assert_eq!(db.source_equipment(uid, Some(dev), None).await.unwrap(), Some(xperia));
+
+    db.record_device_output(uid, xperia, "Phone speaker", Some("speaker")).await.unwrap();
+    assert_eq!(
+        db.resolve_device_binding(uid, xperia, "Phone speaker").await.unwrap(),
+        None,
+        "seen, not mapped"
+    );
+    db.set_device_binding(uid, xperia, "Phone speaker", Some(commute), None).await.unwrap();
+    assert_eq!(
+        db.resolve_device_binding(uid, xperia, "Phone speaker").await.unwrap(),
+        Some((commute, None))
+    );
+    assert_eq!(
+        db.resolve_device_binding(uid, pixel, "Phone speaker").await.unwrap(),
+        None,
+        "the other phone's is its own"
+    );
+    assert_eq!(
+        db.resolve_binding(uid, "Phone speaker").await.unwrap(),
+        Some((kitchen, None)),
+        "the old rung still answers"
+    );
+
+    // Deleting the chain lets go of the box's output; deleting the box takes
+    // its outputs and frees its reporters.
+    assert!(db.delete_chain(uid, commute).await.unwrap());
+    assert_eq!(db.resolve_device_binding(uid, xperia, "Phone speaker").await.unwrap(), None);
+    assert!(db.delete_equipment(uid, xperia).await.unwrap());
+    assert!(db.list_device_bindings(uid).await.unwrap().is_empty());
+    assert_eq!(db.source_equipment(uid, Some(dev), None).await.unwrap(), None);
+}
+
+/// The inbox asks only about unfiled, unskipped plays from the last 30 days,
+/// suggests a box only by a name it carries, and asks which box when nothing
+/// matches. "Not now" hides a question.
+#[tokio::test]
+async fn the_inbox_asks_about_unfiled_plays_and_suggests_boxes_by_name() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let now = Database::now_secs();
+    let xperia = db
+        .upsert_equipment(uid, "Xperia 1 V", "phone", Some("Sony"), Some("XQ-DQ54"), 0.0, None)
+        .await
+        .unwrap();
+    let tidal = db
+        .upsert_device(uid, "m-t", Some("TIDAL on XQ-DQ54"), Some("Android"), None)
+        .await
+        .unwrap();
+    let navi = db.upsert_device(uid, "m-n", Some("NavidromeUI"), Some("Web"), None).await.unwrap();
+    let tok = token_id_named(&db, uid, "xperia 1 v").await;
+
+    unfiled(&db, uid, now - 3600, Some(tidal), None, Some("Bluetooth"), "ingest", false).await;
+    unfiled(&db, uid, now - 3500, Some(tidal), None, Some("Bluetooth"), "ingest", false).await;
+    unfiled(&db, uid, now - 3400, Some(navi), None, None, "ingest", false).await;
+    unfiled(&db, uid, now - 3300, Some(navi), None, None, "ingest", true).await; // a skip: never asked
+    unfiled(&db, uid, now - 40 * 86_400, Some(navi), None, None, "ingest", false).await; // too old
+    unfiled(&db, uid, now - 3200, None, None, None, "Navidrome", false).await;
+
+    let qs = db.chain_inbox(uid).await.unwrap();
+    let kinds: Vec<&str> = qs.iter().map(|q| q.kind).collect();
+    assert_eq!(
+        kinds,
+        ["same_box", "which_box", "where", "where", "where"],
+        "boxes first: {kinds:?}"
+    );
+
+    let same = &qs[0];
+    assert_eq!(same.equipment_id, Some(xperia));
+    let named: Vec<&str> = same.reporters.iter().map(|r| r.name.as_str()).collect();
+    assert!(
+        named.contains(&"TIDAL on XQ-DQ54") && named.contains(&"xperia 1 v"),
+        "the model number and the name both match: {named:?}"
+    );
+    assert!(!named.contains(&"NavidromeUI"));
+    assert_eq!(qs[1].reporters[0].name, "NavidromeUI", "nothing matches, so it asks which box");
+
+    let tidal_q = qs.iter().find(|q| q.device.as_ref().is_some_and(|d| d.id == tidal)).unwrap();
+    assert_eq!((tidal_q.plays, tidal_q.rule), (Some(2), Some("output")));
+    let navi_q = qs.iter().find(|q| q.device.as_ref().is_some_and(|d| d.id == navi)).unwrap();
+    assert_eq!(
+        (navi_q.plays, navi_q.rule),
+        (Some(1), Some("device")),
+        "the skip and the old play are not counted"
+    );
+    let bare = qs.iter().find(|q| q.source_name.as_deref() == Some("Navidrome")).unwrap();
+    assert_eq!(bare.rule, Some("none"), "nothing identifies it, so nothing can be remembered");
+
+    // Tie the phone's reporters; its question goes and its output rule becomes
+    // the box's own.
+    db.tie_reporters(uid, Some(xperia), &[tidal], &[tok]).await.unwrap();
+    db.dismiss_inbox(uid, &qs[1].key).await.unwrap();
+    let qs = db.chain_inbox(uid).await.unwrap();
+    assert!(qs.iter().all(|q| q.kind == "where"), "both box questions answered or put off");
+    let tidal_q = qs.iter().find(|q| q.device.as_ref().is_some_and(|d| d.id == tidal)).unwrap();
+    assert_eq!(tidal_q.rule, Some("device_output"));
+    let _ = tok;
+}
+
+/// Answering "where were you?" writes the rule future plays follow and files
+/// exactly the plays it counted: not the skip, not the one from before the
+/// window, not one from another output.
+#[tokio::test]
+async fn answering_where_files_exactly_what_was_counted() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let now = Database::now_secs();
+    let phone = db.upsert_equipment(uid, "Xperia", "phone", None, None, 0.0, None).await.unwrap();
+    let dev = db.upsert_device(uid, "m-x", Some("Phone"), None, None).await.unwrap();
+    db.tie_reporters(uid, Some(phone), &[dev], &[]).await.unwrap();
+    let commute = chain_of(&db, uid, "Commute", &[]).await;
+
+    unfiled(&db, uid, now - 100, Some(dev), None, Some("Bluetooth"), "ingest", false).await;
+    unfiled(&db, uid, now - 90, Some(dev), None, Some("Bluetooth"), "ingest", false).await;
+    unfiled(&db, uid, now - 80, Some(dev), None, Some("Bluetooth"), "ingest", true).await;
+    unfiled(&db, uid, now - 70, Some(dev), None, Some("Jack"), "ingest", false).await;
+    unfiled(&db, uid, now - 40 * 86_400, Some(dev), None, Some("Bluetooth"), "ingest", false).await;
+
+    let q = db
+        .chain_inbox(uid)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|q| q.output.as_deref() == Some("Bluetooth"))
+        .unwrap();
+    assert_eq!(q.plays, Some(2));
+    let done = db
+        .answer_where(
+            uid,
+            Some(dev),
+            None,
+            Some("Bluetooth"),
+            "ingest",
+            q.since.unwrap(),
+            commute,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (done.rule, done.moved),
+        ("device_output", 2),
+        "the number on the button is the number that moves"
+    );
+    assert_eq!(
+        db.resolve_device_binding(uid, phone, "Bluetooth").await.unwrap(),
+        Some((commute, None))
+    );
+
+    let filed: Vec<(i64, Option<i64>)> = sqlx::query_as(
+        "SELECT timestamp, chain_id FROM scrobbles WHERE user_id = ? ORDER BY timestamp",
+    )
+    .bind(uid)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let chain_at = |ts: i64| filed.iter().find(|(t, _)| *t == ts).unwrap().1;
+    assert_eq!(chain_at(now - 100), Some(commute));
+    assert_eq!(chain_at(now - 90), Some(commute));
+    assert_eq!(chain_at(now - 80), None, "a skip is not filed");
+    assert_eq!(chain_at(now - 70), None, "another output is another question");
+    assert_eq!(chain_at(now - 40 * 86_400), None, "older than what was counted");
+
+    // A token rung, without backfill: the rule only.
+    let tok = token_id_named(&db, uid, "laptop").await;
+    let done = db
+        .answer_where(uid, None, Some(tok), None, "ingest", now - 86_400, commute, None, false)
+        .await
+        .unwrap();
+    assert_eq!((done.rule, done.moved), ("token", 0));
+    let default: Option<i64> =
+        sqlx::query_scalar("SELECT default_chain_id FROM tokens WHERE id = ?")
+            .bind(tok)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(default, Some(commute));
+}
+
+/// An alias is remembered once, ignoring case and punctuation, and a reporter
+/// carrying it is suggested as that box.
+#[tokio::test]
+async fn an_alias_is_remembered_once_and_suggests_the_box() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let now = Database::now_secs();
+    let phone = db.upsert_equipment(uid, "Phone", "phone", None, None, 0.0, None).await.unwrap();
+    db.add_alias(uid, phone, "XQ-DQ54").await.unwrap();
+    db.add_alias(uid, phone, "xq dq54").await.unwrap();
+    db.add_alias(uid, phone, "   ").await.unwrap();
+    let gear = db.get_equipment(uid).await.unwrap();
+    assert_eq!(gear.iter().find(|g| g.id == phone).unwrap().aliases, vec!["XQ-DQ54".to_string()]);
+
+    let chrome = db.upsert_device(uid, "m-c", Some("Chrome on xq-dq54"), None, None).await.unwrap();
+    unfiled(&db, uid, now - 60, Some(chrome), None, None, "ingest", false).await;
+    let qs = db.chain_inbox(uid).await.unwrap();
+    assert_eq!(qs[0].kind, "same_box");
+    assert_eq!(qs[0].equipment_id, Some(phone));
+
+    db.tie_reporters(uid, Some(phone), &[chrome], &[]).await.unwrap();
+    let gear = db.get_equipment(uid).await.unwrap();
+    assert_eq!(
+        gear.iter().find(|g| g.id == phone).unwrap().reporters,
+        vec!["Chrome on xq-dq54".to_string()]
+    );
+}
+
+// ── What's on now (phase 3) ──
+
+fn step_of(t: ComponentType, name: &str, gear: i64, options: Option<Vec<i64>>) -> ChainComponent {
+    ChainComponent {
+        component_type: t,
+        name: name.into(),
+        detail: None,
+        since: None,
+        equipment_id: Some(gear),
+        options,
+        slot_name: None,
+    }
+}
+
+async fn chain_with(db: &Database, uid: i64, name: &str, steps: Vec<ChainComponent>) -> i64 {
+    db.create_chain(&SignalChain {
+        id: None,
+        user_id: uid,
+        name: name.into(),
+        description: None,
+        components: steps,
+        listening_context: ListeningContext::Active,
+        icon: None,
+        is_active: true,
+        shared: false,
+        total_hours: 0.0,
+        created_at: 0,
+    })
+    .await
+    .unwrap()
+}
+
+/// An hour's play through a chain, filed however `save_scrobble` decides
+/// unless `variant` names one.
+async fn played(db: &Database, uid: i64, chain: i64, ts: i64, variant: Option<i64>) {
+    let mut p = Play::new(format!("T{ts}"), "A".into(), ts as u64, format!("p-{ts}"), "t".into());
+    p.duration = Some(3600);
+    db.save_scrobble(
+        uid,
+        &p,
+        None,
+        None,
+        Some(chain),
+        variant,
+        None,
+        None,
+        None,
+        ListenDisposition::LIVE,
+    )
+    .await
+    .unwrap();
+}
+
+async fn variant_at(db: &Database, uid: i64, ts: i64) -> Option<i64> {
+    sqlx::query_scalar("SELECT chain_variant_id FROM scrobbles WHERE user_id = ? AND timestamp = ?")
+        .bind(uid)
+        .bind(ts)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+}
+
+/// Gear seconds as a sorted list, for comparing before and after.
+async fn gear_secs(db: &Database, uid: i64) -> Vec<(i64, i64)> {
+    let mut v: Vec<(i64, i64)> = db.equipment_seconds(uid).await.unwrap().0.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// A switch files plays from its moment on. A backdated one stops at the next
+/// recorded switch of the same step and leaves it standing, and a play an
+/// output picked by itself never moves.
+#[tokio::test]
+async fn a_backdated_switch_moves_plays_up_to_the_next_switch_of_that_step() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let gear = |n: &'static str| {
+        let db = &db;
+        async move { db.upsert_equipment(uid, n, "headphones", None, None, 0.0, None).await.unwrap() }
+    };
+    let xperia = db.upsert_equipment(uid, "Xperia", "phone", None, None, 0.0, None).await.unwrap();
+    let (hd569, hexa, s08, tw4) =
+        (gear("HD 569").await, gear("Hexa").await, gear("S08").await, gear("TW4").await);
+    let chain = chain_with(
+        &db,
+        uid,
+        "Commute",
+        vec![
+            step_of(ComponentType::Source, "Xperia", xperia, None),
+            step_of(ComponentType::Transducer, "HD 569", hd569, Some(vec![hexa, s08, tw4, hd569])),
+        ],
+    )
+    .await;
+    let opts = db.get_chain(uid, chain).await.unwrap().unwrap().components[1].options.clone();
+    assert_eq!(opts, Some(vec![hd569, hexa, s08, tw4]), "the wired gear first");
+
+    let day = 86_400;
+    let t0 = Database::now_secs() - 100 * day;
+    let d = |n: i64| t0 + n * day;
+    for n in [1, 10, 20, 30, 40] {
+        played(&db, uid, chain, d(n), None).await;
+    }
+    // TW4 over Bluetooth: an output that picks the earbuds by itself.
+    let tw4_v = db
+        .create_variant(
+            uid,
+            chain,
+            "bt",
+            &[VariantOverride { position: 1, equipment_id: Some(tw4), name: None }],
+        )
+        .await
+        .unwrap();
+    played(&db, uid, chain, d(35), Some(tw4_v)).await;
+
+    // S08 since day 15: nothing recorded after, so up to now.
+    let s = db.fit(uid, chain, 1, s08, Some(d(15)), false).await.unwrap().unwrap();
+    assert_eq!(
+        (s.moved, s.until, s.now_on),
+        (3, None, true),
+        "days 20, 30 and 40; not the TW4 play"
+    );
+
+    // Hexa since day 5: stops at the S08 switch, which stays.
+    let preview = db.fit(uid, chain, 1, hexa, Some(d(5)), true).await.unwrap().unwrap();
+    assert_eq!((preview.moved, preview.until, preview.now_on), (1, Some(d(15)), false));
+    assert_eq!(variant_at(&db, uid, d(10)).await, None, "a dry run writes nothing");
+    let h = db.fit(uid, chain, 1, hexa, Some(d(5)), false).await.unwrap().unwrap();
+    assert_eq!(h.moved, preview.moved, "the count shown is the count moved");
+
+    let on = db.whats_on(uid, chain).await.unwrap().unwrap();
+    assert_eq!((on.slots[0].on, on.slots[0].on_since), (s08, Some(d(15))), "S08 is still on");
+    assert_eq!(variant_at(&db, uid, d(1)).await, None, "before any switch: as wired");
+    let hexa_v = variant_at(&db, uid, d(10)).await;
+    let s08_v = variant_at(&db, uid, d(20)).await;
+    assert!(hexa_v.is_some() && s08_v.is_some() && hexa_v != s08_v);
+    assert_eq!(variant_at(&db, uid, d(35)).await, Some(tw4_v), "the output's pick stays");
+    let hexa_opt = on.slots[0].options.iter().find(|o| o.equipment_id == hexa).unwrap();
+    assert_eq!(hexa_opt.first_play, Some(d(10)));
+
+    // A new play takes what is on at its time.
+    played(&db, uid, chain, d(99), None).await;
+    assert_eq!(variant_at(&db, uid, d(99)).await, s08_v);
+
+    // Hexa again since day 25, inside the S08 stretch: up to now.
+    let h2 = db.fit(uid, chain, 1, hexa, Some(d(25)), false).await.unwrap().unwrap();
+    assert_eq!((h2.moved, h2.now_on), (3, true), "days 30, 40 and 99");
+    assert_eq!(variant_at(&db, uid, d(20)).await, s08_v, "before the moment stays");
+    assert_eq!(variant_at(&db, uid, d(30)).await, hexa_v, "one variant per set of picks");
+    assert_eq!(variant_at(&db, uid, d(35)).await, Some(tw4_v));
+
+    // And the gear hours follow the plays.
+    let secs: HashMap<i64, i64> = gear_secs(&db, uid).await.into_iter().collect();
+    assert_eq!(secs.get(&hd569), Some(&3600));
+    assert_eq!(secs.get(&hexa), Some(&(4 * 3600)));
+    assert_eq!(secs.get(&s08), Some(&3600));
+    assert_eq!(secs.get(&tw4), Some(&3600));
+    assert_eq!(secs.get(&xperia), Some(&(7 * 3600)));
+
+    assert_eq!(db.fit(uid, chain, 0, xperia, None, true).await.unwrap(), Err(FitRefusal::NotASlot));
+    assert_eq!(
+        db.fit(uid, chain, 1, xperia, None, true).await.unwrap(),
+        Err(FitRefusal::NotAnOption)
+    );
+    assert_eq!(
+        db.fit(uid, chain, 1, hexa, Some(Database::now_secs() + day), true).await.unwrap(),
+        Err(FitRefusal::InFuture)
+    );
+    // Deleting the chain clears its history first.
+    assert!(db.delete_chain(uid, chain).await.unwrap());
+}
+
+/// Named setups that swap gear become slot options with no hour moving;
+/// setups that change no gear become sitting titles; and a save that leaves
+/// `options` out keeps them.
+#[tokio::test]
+async fn named_setups_become_options_and_moods_become_session_titles() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let other = db.create_user("kim", None, "pw", "user").await.unwrap();
+    let xperia = db.upsert_equipment(uid, "Xperia", "phone", None, None, 0.0, None).await.unwrap();
+    let hd569 =
+        db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+    let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+    let theirs = db.upsert_equipment(other, "Theirs", "iem", None, None, 0.0, None).await.unwrap();
+    let steps = vec![
+        step_of(ComponentType::Source, "Xperia", xperia, None),
+        step_of(ComponentType::Transducer, "HD 569", hd569, None),
+    ];
+    let chain = chain_with(&db, uid, "Commute", steps.clone()).await;
+    let summer = db
+        .create_variant(
+            uid,
+            chain,
+            "Summer Commute",
+            &[VariantOverride { position: 1, equipment_id: Some(hexa), name: Some("Hexa".into()) }],
+        )
+        .await
+        .unwrap();
+    let casual = db.create_variant(uid, chain, "Casual Play", &[]).await.unwrap();
+    let t = Database::now_secs() - 10 * 86_400;
+    played(&db, uid, chain, t, Some(summer)).await;
+    played(&db, uid, chain, t + 4000, Some(summer)).await;
+    played(&db, uid, chain, t + 9000, None).await;
+    played(&db, uid, chain, t + 20_000, Some(casual)).await;
+    played(&db, uid, chain, t + 30_000, Some(casual)).await;
+    // Two sittings for the mood plays; one already titled.
+    for (ts, title) in [(t + 20_000, None::<&str>), (t + 30_000, Some("Late one"))] {
+        let sid: i64 = sqlx::query_scalar(
+            "INSERT INTO sessions (user_id, chain_id, started_at, ended_at, title) VALUES (?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(uid)
+        .bind(chain)
+        .bind(ts)
+        .bind(ts + 3600)
+        .bind(title)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE scrobbles SET session_id = ? WHERE user_id = ? AND timestamp = ?")
+            .bind(sid)
+            .bind(uid)
+            .bind(ts)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let before = gear_secs(&db, uid).await;
+
+    assert_eq!(
+        db.adopt_setups(uid).await.unwrap(),
+        1,
+        "Summer Commute; Casual Play changes no gear"
+    );
+    assert_eq!(db.adopt_setups(uid).await.unwrap(), 0, "once");
+    assert_eq!(gear_secs(&db, uid).await, before, "no hour moves");
+    let comps = db.get_chain(uid, chain).await.unwrap().unwrap().components;
+    assert_eq!(comps[1].options, Some(vec![hd569, hexa]));
+    assert_eq!(db.current_picks(uid).await.unwrap()[&chain][&1], hd569, "nothing switched yet");
+    // A Hexa switch reuses the adopted setup rather than making another.
+    db.fit(uid, chain, 1, hexa, Some(t + 9000), false).await.unwrap().unwrap();
+    assert_eq!(variant_at(&db, uid, t + 9000).await, Some(summer));
+    let before = gear_secs(&db, uid).await;
+
+    // The route editor saves without `options`: they stay. Foreign gear is
+    // dropped, and `[]` ends the slot.
+    let mut edited = steps.clone();
+    db.update_chain(uid, chain, "Commute", None, &edited, "active", None).await.unwrap();
+    assert_eq!(
+        db.get_chain(uid, chain).await.unwrap().unwrap().components[1].options,
+        Some(vec![hd569, hexa])
+    );
+    edited[1].options = Some(vec![theirs, hexa, hexa]);
+    db.update_chain(uid, chain, "Commute", None, &edited, "active", None).await.unwrap();
+    assert_eq!(
+        db.get_chain(uid, chain).await.unwrap().unwrap().components[1].options,
+        Some(vec![hd569, hexa])
+    );
+
+    let moods = db.mood_setups(uid).await.unwrap();
+    assert_eq!(moods.len(), 1);
+    assert_eq!(
+        (moods[0].id, moods[0].plays, moods[0].sessions),
+        (casual, 1, 1),
+        "the titled sitting is not counted"
+    );
+    let q = db.slot_questions(uid).await.unwrap();
+    assert!(q.iter().any(|q| q.kind == "moods"));
+    let done = db.retire_mood_setups(uid, &[casual, summer]).await.unwrap();
+    assert_eq!((done.sessions_titled, done.removed), (1, 1), "Summer Commute is not a mood");
+    let titles: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT title FROM sessions WHERE user_id = ? ORDER BY started_at")
+            .bind(uid)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(titles, vec![Some("Casual Play".into()), Some("Late one".into())]);
+    assert_eq!(variant_at(&db, uid, t + 20_000).await, None, "the play keeps its chain, as wired");
+    assert_eq!(gear_secs(&db, uid).await, before);
+
+    edited[1].options = Some(vec![]);
+    db.update_chain(uid, chain, "Commute", None, &edited, "active", None).await.unwrap();
+    assert_eq!(db.get_chain(uid, chain).await.unwrap().unwrap().components[1].options, None);
+    // Deleting the person clears the switch history too.
+    db.delete_user(uid).await.unwrap();
+}
+
+/// Two chains that swap one box past the player become one chain with an
+/// option there; a chain on another player is not offered.
+#[tokio::test]
+async fn a_chain_that_swaps_one_box_merges_in_as_an_option() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let xperia = db.upsert_equipment(uid, "Xperia", "phone", None, None, 0.0, None).await.unwrap();
+    let walkman = db.upsert_equipment(uid, "Walkman", "dap", None, None, 0.0, None).await.unwrap();
+    let hd569 =
+        db.upsert_equipment(uid, "HD 569", "headphones", None, None, 0.0, None).await.unwrap();
+    let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+    let src = |g: i64| step_of(ComponentType::Source, "src", g, None);
+    let phone = chain_with(
+        &db,
+        uid,
+        "Commute Phone",
+        vec![src(xperia), step_of(ComponentType::Transducer, "HD 569", hd569, None)],
+    )
+    .await;
+    let summer = chain_with(
+        &db,
+        uid,
+        "Summer Commute",
+        vec![src(xperia), step_of(ComponentType::Transducer, "Hexa", hexa, None)],
+    )
+    .await;
+    let walk = chain_with(
+        &db,
+        uid,
+        "Commute Walkman",
+        vec![src(walkman), step_of(ComponentType::Transducer, "HD 569", hd569, None)],
+    )
+    .await;
+    let t = Database::now_secs() - 5 * 86_400;
+    played(&db, uid, phone, t, None).await;
+    played(&db, uid, phone, t + 4000, None).await;
+    played(&db, uid, summer, t + 8000, None).await;
+    played(&db, uid, walk, t + 12_000, None).await;
+    let before = gear_secs(&db, uid).await;
+
+    let m = db.merge_candidates(uid).await.unwrap();
+    assert_eq!(m.len(), 1, "the Walkman chain differs at the player: {m:?}");
+    assert_eq!((m[0].chain_id, m[0].other_chain_id, m[0].position), (phone, summer, 1));
+    assert!(db.slot_questions(uid).await.unwrap().iter().any(|q| q.kind == "merge"));
+
+    assert!(db.merge_as_option(uid, phone, walk).await.unwrap().is_err());
+    let out = db.merge_as_option(uid, phone, summer).await.unwrap().unwrap();
+    assert_eq!(out.listens, 1);
+    assert!(db.get_chain(uid, summer).await.unwrap().is_none());
+    let comps = db.get_chain(uid, phone).await.unwrap().unwrap().components;
+    assert_eq!(comps[1].options, Some(vec![hd569, hexa]));
+    assert_eq!(gear_secs(&db, uid).await, before, "the Hexa hour stays on the Hexa");
+    assert!(db.merge_candidates(uid).await.unwrap().is_empty());
+}
+
+// ── The route editor (phase 4) ──
+
+/// "From now on": the old route stays on every play already logged, what is
+/// on now carries over by gear, an output's own pick keeps picking, and a
+/// switch cannot reach back past the change.
+#[tokio::test]
+async fn a_route_saved_from_now_on_leaves_past_plays_on_the_old_route() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let g = |n: &'static str, t: &'static str| {
+        let db = &db;
+        async move { db.upsert_equipment(uid, n, t, None, None, 0.0, None).await.unwrap() }
+    };
+    let (dell, mimir, dawn) =
+        (g("Dell", "computer").await, g("Mimir", "dac").await, g("Dawn", "dac").await);
+    let (hd650, hexa) = (g("HD 650", "headphones").await, g("Hexa", "iem").await);
+    let steps = |dac: (i64, &str)| {
+        vec![
+            step_of(ComponentType::Source, "Dell", dell, None),
+            step_of(ComponentType::Dac, dac.1, dac.0, None),
+            step_of(ComponentType::Transducer, "HD 650", hd650, Some(vec![hd650, hexa])),
+        ]
+    };
+    let chain = chain_with(&db, uid, "Desk", steps((mimir, "Mimir"))).await;
+    let day = 86_400;
+    let t0 = Database::now_secs() - 30 * day;
+    played(&db, uid, chain, t0, None).await;
+    played(&db, uid, chain, t0 + day, None).await;
+    db.fit(uid, chain, 2, hexa, Some(t0 + 2 * day), false).await.unwrap().unwrap();
+    played(&db, uid, chain, t0 + 3 * day, None).await;
+    // An output that puts the Hexa on by itself.
+    let hexa_v = variant_at(&db, uid, t0 + 3 * day).await.unwrap();
+    db.set_binding(uid, "Bluetooth", Some(chain), Some(hexa_v)).await.unwrap();
+    let before = gear_secs(&db, uid).await;
+
+    let out = db.save_route(uid, chain, &steps((dawn, "Dawn")), true).await.unwrap().unwrap();
+    assert_eq!((out.past, out.kept, out.unchanged), ("keep", 2, false));
+    assert_eq!(gear_secs(&db, uid).await, before, "no hour moves");
+
+    // A new play runs through the new route with the Hexa still on.
+    let now = Database::now_secs();
+    played(&db, uid, chain, now + 5, None).await;
+    let secs: HashMap<i64, i64> = gear_secs(&db, uid).await.into_iter().collect();
+    assert_eq!(secs.get(&dawn), Some(&3600));
+    assert_eq!(secs.get(&mimir), Some(&(3 * 3600)));
+    assert_eq!(secs.get(&hexa), Some(&(2 * 3600)));
+    let on = db.whats_on(uid, chain).await.unwrap().unwrap();
+    assert_eq!(on.slots[0].on, hexa);
+
+    // The output still picks the Hexa, now on the new route.
+    let (bound, v) = db.resolve_binding(uid, "Bluetooth").await.unwrap().unwrap();
+    assert_eq!(bound, chain);
+    let v = v.unwrap();
+    assert_ne!(v, hexa_v);
+    let resolved = {
+        let vs = db.list_variants(uid).await.unwrap();
+        let c = db.get_chain(uid, chain).await.unwrap().unwrap();
+        crate::models::resolve_variant(
+            &c.components,
+            &vs.iter().find(|x| x.id == v).unwrap().overrides,
+        )
+    };
+    let gear: Vec<Option<i64>> = resolved.iter().map(|c| c.equipment_id).collect();
+    assert_eq!(gear, vec![Some(dell), Some(dawn), Some(hexa)]);
+
+    // A switch cannot be backdated across the route change.
+    assert_eq!(
+        db.fit(uid, chain, 2, hd650, Some(t0 + day), true).await.unwrap(),
+        Err(FitRefusal::BeforeRouteChange)
+    );
+    // Switching now works on the new route.
+    db.fit(uid, chain, 2, hd650, None, false).await.unwrap().unwrap();
+    assert!(db.delete_chain(uid, chain).await.unwrap());
+}
+
+/// "Rewrite past plays too": every play is read through the new route, and
+/// a swap follows its gear to wherever it sits now.
+#[tokio::test]
+async fn a_rewritten_route_moves_the_hours_and_swaps_follow_their_gear() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let dell = db.upsert_equipment(uid, "Dell", "computer", None, None, 0.0, None).await.unwrap();
+    let mimir = db.upsert_equipment(uid, "Mimir", "dac", None, None, 0.0, None).await.unwrap();
+    let amp = db.upsert_equipment(uid, "Midgaard", "amp", None, None, 0.0, None).await.unwrap();
+    let hd650 =
+        db.upsert_equipment(uid, "HD 650", "headphones", None, None, 0.0, None).await.unwrap();
+    let hexa = db.upsert_equipment(uid, "Hexa", "iem", None, None, 0.0, None).await.unwrap();
+    let chain = chain_with(
+        &db,
+        uid,
+        "Desk",
+        vec![
+            step_of(ComponentType::Source, "Dell", dell, None),
+            step_of(ComponentType::Transducer, "HD 650", hd650, Some(vec![hd650, hexa])),
+        ],
+    )
+    .await;
+    let t = Database::now_secs() - 10 * 86_400;
+    played(&db, uid, chain, t, None).await;
+    db.fit(uid, chain, 1, hexa, Some(t + 100), false).await.unwrap().unwrap();
+    played(&db, uid, chain, t + 4000, None).await;
+
+    // A DAC and an amp go in between: the headphones move from 1 to 3.
+    let new = vec![
+        step_of(ComponentType::Source, "Dell", dell, None),
+        step_of(ComponentType::Dac, "Mimir", mimir, None),
+        step_of(ComponentType::Amp, "Midgaard", amp, None),
+        step_of(ComponentType::Transducer, "HD 650", hd650, None),
+    ];
+    let out = db.save_route(uid, chain, &new, false).await.unwrap().unwrap();
+    assert_eq!((out.past, out.unchanged), ("rewrite", false));
+    let comps = db.get_chain(uid, chain).await.unwrap().unwrap().components;
+    assert_eq!(comps[3].options, Some(vec![hd650, hexa]), "options carried by gear");
+    let secs: HashMap<i64, i64> = gear_secs(&db, uid).await.into_iter().collect();
+    assert_eq!(secs.get(&mimir), Some(&(2 * 3600)), "every past play runs through the new boxes");
+    assert_eq!(secs.get(&hexa), Some(&3600), "the Hexa swap followed the headphones to step 3");
+    assert_eq!(secs.get(&hd650), Some(&3600));
+
+    // The same wiring again is no change at all.
+    let again = db.save_route(uid, chain, &comps, true).await.unwrap().unwrap();
+    assert!(again.unchanged);
+    // Gear that is not yours is refused.
+    let other = db.create_user("kim", None, "pw", "user").await.unwrap();
+    let theirs = db.upsert_equipment(other, "Theirs", "dac", None, None, 0.0, None).await.unwrap();
+    let mut bad = comps.clone();
+    bad[1].equipment_id = Some(theirs);
+    assert!(db.save_route(uid, chain, &bad, true).await.unwrap().is_err());
+}
+
+// ── At a friend's (phase 5) ──
+
+/// An accepted Shared Spool play lands At a friend's, made on first use in
+/// the Elsewhere room with no steps and shared with nobody; a chain named
+/// the old way still wins.
+#[tokio::test]
+async fn an_accepted_spool_play_lands_at_a_friends_unless_a_chain_was_named() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, Some("Sunday"), &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+    listen(&db, them, Some(chain), "One", "Massive Attack", 1_760_000_100).await;
+    listen(&db, them, Some(chain), "Two", "Massive Attack", 1_760_000_400).await;
+    assert_eq!(db.friend_chain(me).await.unwrap(), None, "made only when needed");
+
+    let caps = db.spool_captures(me).await.unwrap();
+    let one = caps.iter().find(|c| c.title == "One").unwrap().id;
+    let two = caps.iter().find(|c| c.title == "Two").unwrap().id;
+    db.settle_captures(me, &[one], true).await.unwrap();
+    let friend = db.friend_chain(me).await.unwrap().expect("made on the first accept");
+    let c = db.get_chain(me, friend).await.unwrap().unwrap();
+    assert!(c.components.is_empty() && !c.shared, "no gear, and Only me");
+    let rooms = db.list_rooms(me).await.unwrap();
+    let elsewhere = rooms.iter().find(|r| r.kind == "elsewhere").expect("the Elsewhere room");
+    assert_eq!(elsewhere.chain_ids, vec![friend]);
+    let landed: Option<i64> =
+        sqlx::query_scalar("SELECT chain_id FROM scrobbles WHERE user_id = ? AND title = 'One'")
+            .bind(me)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(landed, Some(friend));
+
+    // A chain named the old way is honoured.
+    let mine = chain_of(&db, me, "Living room", &[]).await;
+    assert!(db.set_spool_chain(me, Some(mine)).await.unwrap());
+    db.settle_captures(me, &[two], true).await.unwrap();
+    let landed: Option<i64> =
+        sqlx::query_scalar("SELECT chain_id FROM scrobbles WHERE user_id = ? AND title = 'Two'")
+            .bind(me)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(landed, Some(mine));
+
+    // The friend chain has no route to edit.
+    assert!(db.save_route(me, friend, &[], true).await.unwrap().is_err());
+    // Made once.
+    assert_eq!(db.ensure_friend_chain(me).await.unwrap(), friend);
+}
+
+/// Spool plays accepted before At a friend's existed are asked about once
+/// and filed together.
+#[tokio::test]
+async fn spool_plays_on_no_chain_are_asked_about_and_filed_at_a_friends() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    for (i, skipped) in [(0, false), (1, false), (2, true)] {
+        let p = Play::new(
+            format!("S{i}"),
+            "A".into(),
+            1_760_000_000 + i * 300,
+            format!("spool-x-{i}"),
+            super::friend::SPOOL_SOURCE.into(),
+        );
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(super::friend::SPOOL_SOURCE),
+            None,
+            ListenDisposition { imported: true, skipped },
+        )
+        .await
+        .unwrap();
+    }
+    let q = db.slot_questions(uid).await.unwrap();
+    let spool = q.iter().find(|q| q.kind == "spool").expect("asked");
+    assert_eq!(spool.spool.as_ref().unwrap().plays, 2, "skips are not counted");
+    assert!(db
+        .chain_inbox(uid)
+        .await
+        .unwrap()
+        .iter()
+        .all(|q| q.source_name.as_deref() != Some(super::friend::SPOOL_SOURCE)));
+
+    let (moved, chain) = db.file_spool_plays(uid, None).await.unwrap().unwrap();
+    assert_eq!(moved, 2);
+    assert_eq!(Some(chain), db.friend_chain(uid).await.unwrap());
+    let left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND chain_id IS NULL")
+            .bind(uid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "the skip goes with them, as stored");
+    assert!(db.slot_questions(uid).await.unwrap().iter().all(|q| q.kind != "spool"));
+    assert!(db.file_spool_plays(uid, Some(99_999)).await.unwrap().is_err());
 }

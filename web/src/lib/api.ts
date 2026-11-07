@@ -563,6 +563,19 @@ export interface SignalChain {
 	total_hours: number;
 }
 
+/** Where chains live. A chain may be in several rooms; rooms never affect
+ *  where a listen is attributed. `portable` ("On the go") and `elsewhere` are
+ *  built in and cannot be renamed or deleted. */
+export interface Room {
+	id: number;
+	name: string;
+	icon: string | null;
+	kind: 'room' | 'portable' | 'elsewhere';
+	sort: number;
+	created_at: number;
+	chain_ids: number[];
+}
+
 export interface ChainComponent {
 	type: string;
 	name: string;
@@ -576,6 +589,79 @@ export interface ChainComponent {
 	 *  box added to a chain that already has history is credited with all of
 	 *  it. Stamped by the server on gear a chain did not name before. */
 	since?: number | null;
+	/** Gear that can be on at this step, the wired gear first. Two or more
+	 *  make the step a slot ("what's on now"). On save, leaving it out keeps
+	 *  the options the step had; `[]` stops it being a slot. */
+	options?: number[] | null;
+	/** What the slot is called, when it has a name ("On the go"). */
+	slot_name?: string | null;
+}
+
+/** One slot of a chain, as "what's on now" shows it. */
+export interface Slot {
+	position: number;
+	slot_name: string | null;
+	/** The gear the step is wired with: every play before the first switch. */
+	wired: number;
+	/** The gear on now. */
+	on: number;
+	/** When the gear on now went on; null when it has been on all along. */
+	on_since: number | null;
+	options: SlotOption[];
+}
+
+export interface SlotOption {
+	equipment_id: number;
+	name: string;
+	brand: string | null;
+	equipment_type: string | null;
+	purchased_at: number | null;
+	/** First play through any chain. "In use since" is the purchase date, else this. */
+	first_play: number | null;
+	/** Outputs that pick this option by themselves, by their reported name. */
+	picked_by: string[];
+}
+
+export interface WhatsOn {
+	chain_id: number;
+	slots: Slot[];
+	/** When the chain's last play ended: "right after the last play here". */
+	last_play_end: number | null;
+}
+
+/** What a switch did, or would do (`dry_run`). */
+export interface FitOutcome {
+	/** Plays (skips excluded) filed with the new pick. */
+	moved: number;
+	since: number;
+	/** The next recorded switch of the same step, where the change stops;
+	 *  null when there is none and the new pick is on now. */
+	until: number | null;
+	now_on: boolean;
+}
+
+/** `merge`: two chains that differ at one box past the player. */
+export interface InboxMerge {
+	chain_id: number;
+	chain_name: string;
+	chain_hours: number;
+	other_chain_id: number;
+	other_chain_name: string;
+	other_hours: number;
+	position: number;
+	gear: string;
+	other_gear: string;
+}
+
+/** `moods`: a named setup that changes no gear. */
+export interface InboxSetup {
+	id: number;
+	name: string;
+	chain_id: number;
+	chain_name: string;
+	plays: number;
+	/** Sittings its plays are in with no title yet. */
+	sessions: number;
 }
 
 export interface ChainInput {
@@ -618,11 +704,28 @@ export interface PatchArtist {
 	mine: number;
 }
 
-export interface DeckChain {
-	name: string;
-	icon: string | null;
-	components: string;
-	hours: number;
+/** A listen's format and transcode details, as a **shared** chain hands them
+ *  to somebody else. Every field is null when the chain is not shared, when
+ *  the listen ran through no chain, or when the source never reported it.
+ *
+ *  A signal chain is private by design, shared or not: nobody else is ever
+ *  told its name, gear or hours. Sharing one shares what the signal was. */
+export interface SharedFormat {
+	format_type: string | null;
+	codec: string | null;
+	bitrate: number | null;
+	sample_rate: number | null;
+	bit_depth: number | null;
+	is_lossless: boolean | null;
+	dsd_rate: number | null;
+	dsd_multiplier: number | null;
+	dsd_to_pcm_converted: boolean | null;
+	delivery_codec: string | null;
+	delivery_bitrate: number | null;
+	delivery_sample_rate: number | null;
+	delivery_bit_depth: number | null;
+	is_transcoded: boolean | null;
+	transcode_reason: string | null;
 }
 
 /** Somebody else's deck, seen through an accepted patch. */
@@ -635,7 +738,6 @@ export interface DeckView {
 	created_at: number;
 	/** Listens through their **shared** chains — not their history. */
 	listens: number;
-	chains: DeckChain[];
 	both_play: string[];
 	/** Null when they have no ActivityPub identity, which is a normal state. */
 	actor: string | null;
@@ -664,7 +766,6 @@ export interface InstancePulse {
 	 *  list is cut to the top 8 for the panel. */
 	artists_heard: number;
 	artists: PatchArtist[];
-	chains: { name: string; plays: number }[];
 	/** Raw (timestamp, hours) pairs — the day boundary is the reader's. */
 	daily: { at: number; hours: number }[];
 }
@@ -827,10 +928,9 @@ export interface ArtistDeck {
  *
  *  Gated by exactly the rule the Reel uses — an accepted patch, and then
  *  either the deck has opened up or the listen ran through a chain they share.
- *  `chain_name` is therefore nullable: `null` with `has_chain` means "Private
- *  signal chain", and `null` without it means the listen ran through nothing
- *  anybody recorded. Two different facts, drawn differently. */
-export interface LiveDeck {
+ *  The format fields are filled only for a shared chain; the chain is never
+ *  named. */
+export interface LiveDeck extends SharedFormat {
 	user_id: number;
 	username: string;
 	display_name: string | null;
@@ -844,16 +944,7 @@ export interface LiveDeck {
 	 *  playhead. Drawn as an estimate, never as a measurement. */
 	position_known: boolean;
 	paused: boolean;
-	/** Named only when its owner shares the chain — see the note above. */
-	chain_name: string | null;
-	/** Whether there was a chain at all, whatever its owner shares. */
-	has_chain: boolean;
 	artwork_url: string | null;
-	format_type: string | null;
-	codec: string | null;
-	bit_depth: number | null;
-	sample_rate: number | null;
-	is_lossless: boolean | null;
 }
 
 /** A sitting somebody handed you. **A document, never captures** — it enters
@@ -886,7 +977,7 @@ export interface HandedSitting {
 	ended_at: number | null;
 }
 
-export interface HandedListen {
+export interface HandedListen extends SharedFormat {
 	title: string;
 	artist: string;
 	album: string | null;
@@ -895,7 +986,6 @@ export interface HandedListen {
 	artwork_url: string | null;
 	caa_id: number | null;
 	caa_release_mbid: string | null;
-	chain_name: string | null;
 }
 
 export interface HandedSittingDetail {
@@ -958,8 +1048,9 @@ export interface PatchDecks {
 	followers: PatchPeer[];
 }
 
-/** A listen on someone else's deck, reaching you through a patch. */
-export interface ReelListen {
+/** A listen on someone else's deck, reaching you through a patch. Its format
+ *  fields are filled only when the chain it ran through is shared. */
+export interface ReelListen extends SharedFormat {
 	id: number;
 	timestamp: number;
 	title: string;
@@ -968,12 +1059,6 @@ export interface ReelListen {
 	artwork_url: string | null;
 	caa_id: number | null;
 	caa_release_mbid: string | null;
-	format_type: string | null;
-	codec: string | null;
-	bitrate: number | null;
-	sample_rate: number | null;
-	bit_depth: number | null;
-	is_lossless: boolean | null;
 	submission_client: string | null;
 	user_id: number;
 	username: string;
@@ -984,16 +1069,6 @@ export interface ReelListen {
 	 *  with no actor has no published address, and showing one would invent
 	 *  something that resolves nowhere. */
 	actor_uri: string | null;
-	/** The chain, **when its owner shares it**.
-	 *
-	 *  `null` has two meanings and the row must not conflate them, which is
-	 *  what `has_chain` is for: a chain kept private reads "Private signal
-	 *  chain", and a listen that ran through no chain at all says nothing. */
-	chain_name: string | null;
-	chain_icon: string | null;
-	chain_components: string | null;
-	/** Whether there was a chain, whatever its owner shares. */
-	has_chain: boolean;
 }
 
 export interface ReelPage {
@@ -1034,12 +1109,62 @@ export interface EquipmentInput {
 	 *  Note the update endpoint is a whole-record replace, so every caller has
 	 *  to send this back or tagging a spare clears it. */
 	status?: string | null;
+	/** Other names this box reports as. Absent leaves them alone: the one
+	 *  field the whole-record replace does not clear. */
+	aliases?: string[];
 }
 
 export interface Connection {
 	service: string;
 	username: string | null;
 	connected_at: number;
+}
+
+/** An output learned from one box (a device or token tied to a piece of
+ *  gear). Outranks a `Binding` of the same name. */
+export interface DeviceBinding {
+	id: number;
+	equipment_id: number;
+	equipment_name: string;
+	identifier: string;
+	interface: string | null;
+	chain_id: number | null;
+	chain_variant_id: number | null;
+	last_seen: number;
+	hits: number;
+}
+
+/** A device or token, as the inbox names it. */
+export interface InboxReporter {
+	kind: 'device' | 'token';
+	id: number;
+	name: string;
+	sub: string;
+	equipment_id: number | null;
+}
+
+/** One question in the Signal Chains inbox. */
+export interface InboxQuestion {
+	key: string;
+	kind: 'same_box' | 'which_box' | 'where' | 'merge' | 'moods' | 'spool';
+	equipment_id?: number;
+	equipment_name?: string;
+	reporters?: InboxReporter[];
+	plays?: number;
+	first?: number;
+	last?: number;
+	since?: number;
+	device?: InboxReporter;
+	token?: InboxReporter;
+	output?: string;
+	source_name?: string;
+	/** What an answer remembers: an output of a box, an output by name, the
+	 *  token's or the device's default chain, or nothing at all. */
+	rule?: 'device_output' | 'output' | 'token' | 'device' | 'none';
+	merge?: InboxMerge;
+	setups?: InboxSetup[];
+	/** `spool`: accepted Shared Spool plays on no chain. */
+	spool?: { plays: number; first: number | null; last: number | null };
 }
 
 export interface Binding {
@@ -1064,6 +1189,8 @@ export interface Device {
 	default_chain_id: number | null;
 	total_listens: number;
 	last_seen: number;
+	/** The box this device is, once tied to one. */
+	equipment_id?: number | null;
 }
 
 /** Your own account. `avatar` is a URL the browser can load directly — either
@@ -1105,6 +1232,9 @@ export interface ChainVariant {
 	overrides: VariantOverride[];
 	created_at: number;
 	total_hours: number;
+	/** Kept by Tapedeck for a set of slot picks; its name is internal. Show
+	 *  what it puts on instead (`variantLabel`). */
+	auto: boolean;
 }
 
 /** Two chains that look like the same rig, and what folding one into the other
@@ -1182,6 +1312,10 @@ export interface Equipment {
 	/** Which chains and variants `total_hours` is made of, largest first. Empty
 	 *  for gear nothing has logged time through. */
 	sources: GearHours[];
+	/** Other names this box reports as (a model number). */
+	aliases: string[];
+	/** The devices and tokens tied to this box, by name. */
+	reporters: string[];
 }
 
 /** Live playback state. Field names mirror `Scrobble` so `qualityLabel()` works on it. */
@@ -3159,8 +3293,71 @@ class TapedeckAPI {
 		return this.put('/api/v1/radio/settings', body);
 	}
 
-	async getChains(): Promise<{ chains: SignalChain[] }> { return this.get('/api/v1/chains'); }
+	/** `last_used` is unix seconds of the newest listen through each chain, keyed
+	 *  by chain id (a JSON object, so the keys arrive as strings). A chain
+	 *  nothing played through is absent. */
+	async getChains(): Promise<{
+		chains: SignalChain[];
+		last_used: Record<string, number>;
+		/** chain id → (step position → equipment id on now), for chains with slots. */
+		on_now: Record<string, Record<string, number>>;
+		/** The built-in At a friend's chain, once it exists. */
+		friend_chain_id: number | null;
+		/** A chain Shared Spool plays land on instead, named the old way. */
+		spool_chain_id: number | null;
+	}> {
+		return this.get('/api/v1/chains');
+	}
+	async getWhatsOn(chainId: number): Promise<WhatsOn> {
+		return this.get(`/api/v1/chains/${chainId}/whats-on`);
+	}
+	/** Switch a slot, now (`since` absent) or since a moment. `dry_run` only
+	 *  counts what would move. */
+	async fitSlot(
+		chainId: number,
+		body: { position: number; equipment_id: number; since?: number | null; dry_run: boolean }
+	): Promise<FitOutcome> {
+		return this.post(`/api/v1/chains/${chainId}/fit`, body);
+	}
+	/** Save the route editor's steps. `keep`: plays already logged keep the
+	 *  route they had; `rewrite`: every past play is read through the new one. */
+	async saveRoute(
+		chainId: number,
+		body: { components: ChainComponent[]; past: 'keep' | 'rewrite' }
+	): Promise<{ past: string; kept: number; unchanged: boolean }> {
+		return this.request('PUT', `/api/v1/chains/${chainId}/route`, body);
+	}
+	/** Merge a chain that differs at one box into this one, as an option. Not reversible. */
+	async mergeChain(chainId: number, fromChainId: number): Promise<FoldOutcome> {
+		return this.post(`/api/v1/chains/${chainId}/merge`, { from_chain_id: fromChainId });
+	}
+	/** File accepted Shared Spool plays on no chain, At a friend's when
+	 *  `chainId` is null. */
+	async fileSpool(chainId: number | null): Promise<{ moved: number; chain_id: number }> {
+		return this.post('/api/v1/chains/inbox/spool', { chain_id: chainId });
+	}
+	/** Named setups that change no gear become titles on their sittings. */
+	async retireMoods(variantIds: number[]): Promise<{ sessions_titled: number; removed: number }> {
+		return this.post('/api/v1/chains/inbox/moods', { variant_ids: variantIds });
+	}
 	async getChain(id: number): Promise<SignalChain> { return this.get(`/api/v1/chains/${id}`); }
+	async getRooms(): Promise<{ rooms: Room[] }> {
+		return this.get('/api/v1/rooms');
+	}
+	async createRoom(name: string, icon: string | null): Promise<{ id: number }> {
+		return this.post('/api/v1/rooms', { name, icon });
+	}
+	/** Absent fields are left alone; `icon: null` clears the icon. */
+	async updateRoom(id: number, body: { name?: string; icon?: string | null; sort?: number }): Promise<{ id: number }> {
+		return this.patch(`/api/v1/rooms/${id}`, body);
+	}
+	async deleteRoom(id: number): Promise<void> {
+		return this.delNoBody(`/api/v1/rooms/${id}`);
+	}
+	/** Replaces the chain's rooms; `[]` takes it out of every room. */
+	async setChainRooms(chainId: number, roomIds: number[]): Promise<{ id: number }> {
+		return this.put(`/api/v1/chains/${chainId}/rooms`, { room_ids: roomIds });
+	}
 	async createChain(data: ChainInput): Promise<{ id: number }> {
 		return this.post('/api/v1/chains', data);
 	}
@@ -3891,14 +4088,51 @@ class TapedeckAPI {
 	async deleteEquipment(id: number): Promise<void> { return this.delNoBody(`/api/v1/equipment/${id}`); }
 
 	// ── Output-device → chain bindings ──
-	async getBindings(): Promise<{ bindings: Binding[] }> { return this.get('/api/v1/bindings'); }
+	async getBindings(): Promise<{ bindings: Binding[]; device_bindings: DeviceBinding[] }> {
+		return this.get('/api/v1/bindings');
+	}
+	async deleteDeviceBinding(id: number): Promise<void> {
+		return this.delNoBody(`/api/v1/device-bindings/${id}`);
+	}
+	async getChainInbox(): Promise<{ questions: InboxQuestion[]; window_days: number }> {
+		return this.get('/api/v1/chains/inbox');
+	}
+	async answerInboxWhere(body: {
+		device_id: number | null;
+		token_id: number | null;
+		output: string | null;
+		source_name: string;
+		since: number;
+		chain_id: number;
+		chain_variant_id?: number | null;
+		backfill: boolean;
+	}): Promise<{ rule: string; moved: number }> {
+		return this.post('/api/v1/chains/inbox/where', body);
+	}
+	async answerInboxBox(body: {
+		equipment_id: number;
+		device_ids: number[];
+		token_ids: number[];
+		alias?: string | null;
+	}): Promise<void> {
+		await this.post('/api/v1/chains/inbox/box', body);
+	}
+	async dismissInbox(key: string): Promise<void> {
+		await this.post('/api/v1/chains/inbox/dismiss', { key });
+	}
 	/** The setup always travels with the chain: leaving it out clears it. */
 	async setBinding(
 		identifier: string,
 		chain_id: number | null,
-		chain_variant_id: number | null = null
+		chain_variant_id: number | null = null,
+		equipment_id: number | null = null
 	): Promise<void> {
-		await this.request('PUT', '/api/v1/bindings', { identifier, chain_id, chain_variant_id });
+		await this.request('PUT', '/api/v1/bindings', {
+			identifier,
+			chain_id,
+			chain_variant_id,
+			...(equipment_id != null ? { equipment_id } : {})
+		});
 	}
 	async deleteBinding(id: number): Promise<void> { return this.delNoBody(`/api/v1/bindings/${id}`); }
 

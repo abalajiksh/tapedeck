@@ -1,43 +1,33 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import { goto } from '$app/navigation';
 	import { api } from '$lib/api';
-	import type { SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant, FoldSuggestion } from '$lib/api';
+	import type { DeviceBinding, InboxQuestion, Room, SignalChain, Equipment, ChainComponent, ChainInput, EquipmentInput, Binding, Device, ChainVariant, FoldSuggestion, WhatsOn } from '$lib/api';
 	import { formatHours, timeAgo, toDateInput, fromDateInput, ownedFor, formatDateTime } from '$lib/utils';
 	import ChainIcon, { CHAIN_ICONS, CHAIN_ICON_LABELS } from '$lib/components/ChainIcon.svelte';
+	import ChainGraph from '$lib/components/chains/ChainGraph.svelte';
+	import ChainList from '$lib/components/chains/ChainList.svelte';
+	import ChainDrawer, { type RuleChange } from '$lib/components/chains/ChainDrawer.svelte';
+	import ShelfLine from '$lib/components/chains/ShelfLine.svelte';
+	import RoomChips from '$lib/components/chains/RoomChips.svelte';
+	import RoomSuggest from '$lib/components/chains/RoomSuggest.svelte';
+	import InboxCard from '$lib/components/chains/InboxCard.svelte';
+	import FirstRun from '$lib/components/chains/FirstRun.svelte';
+	import { gearInUse } from '$lib/components/chains/layout';
+	import { lastUsedPhrase } from '$lib/components/chains/format';
+	import { syncUrl } from '$lib/url';
 
 	let chains: SignalChain[] = [];
 	let variants: ChainVariant[] = [];
 	let equipment: Equipment[] = [];
 	let bindings: Binding[] = [];
+	/** Outputs learned per box, from reporters tied to a piece of gear. */
+	let deviceBindings: DeviceBinding[] = [];
 	let devices: Device[] = [];
 	let loading = true;
 	let error = '';
 
-	$: unmapped = bindings.filter((b) => b.chain_id == null);
-	$: mapped = bindings.filter((b) => b.chain_id != null);
-	$: unmappedDevices = devices.filter((d) => d.default_chain_id == null);
 
-	// ── Variants ──
-	//
-	// A chain with one step swapped. Two cartridges on one turntable, or the
-	// same commute on different IEMs, are one chain and a choice — modelling
-	// them as separate chains is what turns a modest gear collection into a page
-	// of near-duplicates, and it is also what makes per-stylus hours
-	// unanswerable, since "which chain" does not say what was fitted.
-	$: variantsFor = (chainId: number | null | undefined) =>
-		variants.filter((v) => v.chain_id === chainId);
-
-	/** What a variant actually changes, for the chip's tooltip. */
-	function overrideSummary(c: SignalChain, v: ChainVariant): string {
-		if (!v.overrides.length) return 'Same as the chain';
-		return v.overrides
-			.map((o) => {
-				const was = c.components?.[o.position]?.name;
-				const now = o.name ?? equipment.find((e) => e.id === o.equipment_id)?.name ?? '—';
-				return was ? `${was} → ${now}` : `+ ${now}`;
-			})
-			.join(', ');
-	}
 
 	// ── The role palette ──
 	//
@@ -80,33 +70,6 @@
 	// the whole list would otherwise reload under an open drawer.
 	let sharingChain: number | null = null;
 
-	/// Make a variant the chain, and the chain a variant.
-	///
-	/// `confirm`, not `prompt` — this page and the rest of the app use dialogs
-	/// and `confirm`, and `prompt` would be the only one in the codebase. The
-	/// setup the chain is demoted to needs a name, so it takes the chain's own,
-	/// which is what somebody would call it after the fact; the ✎ beside it
-	/// renames it in one click if they want something else.
-	///
-	/// Worth confirming even though nothing is destroyed: it rewrites the chain
-	/// everything else on this page is described in terms of, and the reassuring
-	/// half — that no hours move — is not guessable from the button.
-	async function promote(chain: SignalChain, v: ChainVariant) {
-		const ok = confirm(
-			`Make “${v.name}” the chain itself?\n\n` +
-				`“${chain.name}” as it stands now becomes a setup, keeping that name. ` +
-				`Nothing about what was fitted for any listen changes and no gear's hours move — ` +
-				`it is a relabelling.`
-		);
-		if (!ok) return;
-		try {
-			await api.promoteVariant(v.id, chain.name);
-			await load();
-		} catch (e) {
-			alert(e instanceof Error ? e.message : 'Could not do that');
-		}
-	}
-
 	async function toggleShared(chain: SignalChain, on: boolean) {
 		sharingChain = chain.id;
 		try {
@@ -129,239 +92,140 @@
 	// variant you just added.
 	let openChainId: number | null = null;
 	$: openChain = chains.find((c) => c.id === openChainId) ?? null;
+
+	// What's on now at the open chain's slots: fetched when the drawer opens
+	// and after every change made in it.
+	let whatsOn: WhatsOn | null = null;
+	let drawerNotice = '';
+	let whatsOnFor: number | null = null;
+	$: if (openChainId !== whatsOnFor) {
+		whatsOnFor = openChainId;
+		drawerNotice = '';
+		void loadWhatsOn();
+	}
+	async function loadWhatsOn() {
+		const id = openChainId;
+		if (id == null) { whatsOn = null; return; }
+		try {
+			const w = await api.getWhatsOn(id);
+			if (openChainId === id) whatsOn = w;
+		} catch {
+			if (openChainId === id) whatsOn = null;
+		}
+	}
+	async function drawerChanged(text: string) {
+		drawerNotice = text;
+		await load();
+		await loadWhatsOn();
+	}
 	// Sorted by hours: the chain you actually listen through is the one worth
 	// putting at the top, and a page of chains ordered by creation date buries
 	// it under whatever you set up most recently.
 	$: chainRows = [...chains].sort((a, b) => b.total_hours - a.total_hours || a.name.localeCompare(b.name));
 	$: loggingCount = chains.filter((c) => c.total_hours > 0).length;
+
+	// ── Which chain the graph lights ──
+	//
+	// Separate from the drawer: choosing a chain lights its route, and the
+	// drawer opens from the bar under the graph. In the URL (`?chain=`) so a
+	// lit route survives a reload and Back undoes a pick, through `syncUrl`.
+	let selectedChainId: number | null = null;
+	let lastUsed: Record<string, number> = {};
+	/** chain id → (step position → gear on now), for chains with slots. */
+	let onNow: Record<string, Record<string, number>> = {};
+
+	// ── Rooms ──
+	// Where chains live. A filter on the list and the graph, in the URL
+	// (`?room=`) so a room view can be bookmarked; it never re-lays the graph
+	// out. Rooms do not touch attribution, so a failure to load them leaves the
+	// page working without them rather than showing an error.
+	// ── The inbox ──
+	// Questions about plays that landed in no chain. The first one sits at the
+	// top of the page; the rest are a click away. Like rooms, a failure to load
+	// it leaves the page working rather than showing an error.
+	let inbox: InboxQuestion[] = [];
+	let inboxDone = '';
+	async function loadInbox() {
+		try {
+			inbox = (await api.getChainInbox()).questions;
+		} catch {
+			inbox = [];
+		}
+	}
+	async function inboxAnswered(text: string) {
+		inboxDone = text;
+		await Promise.all([load(), loadInbox()]);
+		setTimeout(() => (inboxDone = ''), 6000);
+	}
+
+	let rooms: Room[] = [];
+	let roomFilter: number | null = null;
+	let movingRooms = false;
+	$: if (roomFilter != null && rooms.length && !rooms.some((r) => r.id === roomFilter)) roomFilter = null;
+	$: filterRoom = rooms.find((r) => r.id === roomFilter) ?? null;
+	// Picking a room keeps the lit chain when it is in the room, and otherwise
+	// lights the room's busiest, as the design does.
+	$: if (filterRoom && selectedChainId != null && !filterRoom.chain_ids.includes(selectedChainId)) {
+		const first = chainRows.find((c) => filterRoom?.chain_ids.includes(c.id));
+		if (first) selectedChainId = first.id;
+	}
+	async function loadRooms() {
+		try {
+			rooms = (await api.getRooms()).rooms;
+		} catch {
+			rooms = [];
+		}
+	}
+	function pickRoom(id: number | null) {
+		roomFilter = id;
+		const url = new URL(window.location.href);
+		if (id == null) url.searchParams.delete('room');
+		else url.searchParams.set('room', String(id));
+		syncUrl(url.pathname + url.search);
+	}
+	async function moveChainRooms(chain: SignalChain, ids: number[]) {
+		movingRooms = true;
+		try {
+			await api.setChainRooms(chain.id, ids);
+			await loadRooms();
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not change the rooms');
+		} finally {
+			movingRooms = false;
+		}
+	}
+	$: if (chains.length && !chains.some((c) => c.id === selectedChainId)) selectedChainId = chainRows[0]?.id ?? null;
+	$: selectedChain = chains.find((c) => c.id === selectedChainId) ?? null;
+	$: usedGear = gearInUse(chains, variants);
+	$: stepGear = gearInUse(chains, []);
+	$: selectedLine = selectedChain
+		? [
+				(selectedChain.components ?? []).filter((s) => s.name.trim()).map((s) => s.name).join(' → ') ||
+					'No steps yet',
+				`${formatHours(selectedChain.total_hours)} on this chain`,
+				lastUsedPhrase(lastUsed[String(selectedChain.id)])
+			].join(' · ')
+		: '';
+	function selectChain(id: number) {
+		selectedChainId = id;
+		const url = new URL(window.location.href);
+		url.searchParams.set('chain', String(id));
+		syncUrl(url.pathname + url.search);
+	}
 	$: totalChainHours = chains.reduce((a, c) => a + c.total_hours, 0);
-
-	// ── The setups overview ──
-	//
-	// One picture of a chain and every variant of it, read-only. A variant is
-	// stored as *only what differs*, which is what makes editing one cheap and
-	// what makes the arrangement hard to hold in your head once there are three
-	// of them: the drawer can tell you a variant swaps the cartridge, and not
-	// what the whole shelf of possibilities looks like at once.
-	//
-	// It is a grid rather than a canvas, and that is not a compromise — a chain
-	// is a *line* (`components` is an array), so the only branching there can be
-	// is at a known position. Columns are positions, rows are setups, and the
-	// top row is the chain itself: the standard. A variant's row shows its
-	// overrides and passes everything else through, which means a variant that
-	// swaps **two** boxes reads as one row with two changes rather than as two
-	// separate things — the shape today's editor cannot create but the schema
-	// has always allowed.
-	let overviewOpen = false;
-
-	/** How many columns the picture needs: the chain's own steps, plus any
-	 *  position a variant adds past the end. */
-	function overviewSlots(c: SignalChain, vs: ChainVariant[]): number {
-		const base = c.components?.length ?? 0;
-		return vs.reduce(
-			(n, v) => v.overrides.reduce((m, o) => Math.max(m, o.position + 1), n),
-			base
-		);
-	}
-
-	/** What a variant puts at one position — `null` where the chain's own step
-	 *  passes straight through, which is most of them. */
-	function overrideAt(v: ChainVariant, i: number) {
-		return v.overrides.find((o) => o.position === i) ?? null;
-	}
-
-	/** The name a cell shows for an override. The stored snapshot wins over the
-	 *  gear table for the reason `ChainComponent.name` is written at all: gear
-	 *  can be deleted, and a row that goes blank is worse than one that is out
-	 *  of date. */
-	function overrideName(o: { equipment_id?: number | null; name?: string | null }): string {
-		return o.name ?? equipment.find((e) => e.id === o.equipment_id)?.name ?? '—';
-	}
 
 	function onKey(e: KeyboardEvent) {
 		if (e.key === 'Escape') {
 			// Innermost first, or Escape closes the drawer out from under the
 			// overlay sitting on top of it.
-			if (overviewOpen) overviewOpen = false;
-			else if (openChainId != null) openChainId = null;
+			if (openChainId != null) openChainId = null;
 		}
-	}
-
-	// The variant editor, which is also the swap editor.
-	//
-	// `vMode` is what makes a node in the path clickable. Swapping a box has two
-	// honest meanings and the old dialog could only say one of them: *this chain
-	// is wired differently now* (replace the step), or *this is the other stylus
-	// I sometimes fit* (a variant). They are not the same claim about the past —
-	// replacing rewrites what every listen through this chain is taken to have
-	// run through, where a variant leaves them alone — so the choice is on the
-	// dialog rather than inferred, and `variant` is the default because it is
-	// the non-destructive one.
-	let vOpen = false;
-	let vChain: SignalChain | null = null;
-	let vId: number | null = null;
-	let vMode: 'variant' | 'chain' = 'variant';
-	let vName = '';
-	let vSlot = 0;
-	let vGear: number | null = null;
-	let vErr = '';
-	let vSaving = false;
-
-	/**
-	 * Click a node in the path.
-	 *
-	 * v0.62.0 fixed *browsing* — cards became rows and a drawer — and left
-	 * *editing* as the form dialog it always was. These are different screens
-	 * and only the first was ever touched, which is why the editor still asked
-	 * you to find a step in a list of selects rather than pointing at the one on
-	 * screen. The path in the drawer is already drawn; this makes it the thing
-	 * you act on.
-	 */
-	function openSwap(c: SignalChain, i: number) {
-		bindFor = null;
-		vChain = c;
-		vId = null;
-		vMode = 'variant';
-		vName = '';
-		vErr = '';
-		vSlot = i;
-		vGear = c.components?.[i]?.equipment_id ?? null;
-		vOpen = true;
-	}
-
-	function newVariant(c: SignalChain) {
-		bindFor = null;
-		vChain = c;
-		vId = null;
-		vMode = 'variant';
-		vName = '';
-		vErr = '';
-		// The last step is the usual thing you swap — headphones, IEMs, a
-		// cartridge at the other end. Not a rule, just the better default.
-		vSlot = Math.max(0, (c.components?.length ?? 1) - 1);
-		vGear = null;
-		vOpen = true;
-	}
-
-	/**
-	 *  Open the editor on a variant that already exists.
-	 *
-	 *  `saveVariant` has always handled the update — `vId != null` calls
-	 *  `api.updateVariant`, and the dialog even titles itself "Edit variant" for
-	 *  it. Nothing ever set `vId`, so that branch and that title could not be
-	 *  reached: the only way to change a variant was to delete it and build it
-	 *  again, which takes its hours with it. Reported after folding two chains
-	 *  together, because a fold *creates* a variant and there was then no way
-	 *  back into it.
-	 *
-	 *  The editor holds one override, so it opens on the variant's first — which
-	 *  is the only one anything in this UI can create.
-	 */
-	function editVariant(c: SignalChain, v: ChainVariant) {
-		bindFor = null;
-		vChain = c;
-		vId = v.id;
-		// Editing an existing variant is never a chain rewrite: the variant is
-		// the thing being opened, and offering to redirect the save onto the
-		// chain instead would be a different, destructive operation wearing the
-		// same button.
-		vMode = 'variant';
-		vName = v.name;
-		vErr = '';
-		const first = v.overrides?.[0];
-		vSlot = first?.position ?? Math.max(0, (c.components?.length ?? 1) - 1);
-		vGear = first?.equipment_id ?? null;
-		vOpen = true;
-	}
-
-	async function saveVariant() {
-		if (!vChain?.id) return;
-		if (vGear == null) { vErr = 'Pick the gear that goes in that slot.'; return; }
-		// Replacing a step in the chain needs no name — the chain already has
-		// one. Only a variant is a new thing that has to be called something.
-		if (vMode === 'chain') return replaceStep();
-		if (!vName.trim()) { vErr = 'A setup needs a name.'; return; }
-		vSaving = true;
-		vErr = '';
-		try {
-			const overrides = [{
-				position: vSlot,
-				equipment_id: vGear,
-				name: equipment.find((e) => e.id === vGear)?.name ?? null
-			}];
-			if (vId == null) {
-				const made = await api.createVariant({ chain_id: vChain.id, name: vName.trim(), overrides });
-				// Opened from an output: the setup exists so that output can carry it.
-				if (bindFor) await api.setBinding(bindFor.identifier, vChain.id, made.id);
-			} else await api.updateVariant(vId, { name: vName.trim(), overrides });
-			vOpen = false;
-			bindFor = null;
-			await load();
-		} catch (e) {
-			vErr = String(e).replace(/^API \d+: /, '');
-		}
-		vSaving = false;
-	}
-
-	/**
-	 * Rewire the chain itself, rather than recording a variant of it.
-	 *
-	 * The consequence to be clear about, and the dialog says it: this is
-	 * **retroactive**. Chain hours are derived from the listens
-	 * (`db::CHAIN_COLUMNS`), so replacing a step moves every hour ever logged
-	 * through this chain onto the new box — including the ones that ran through
-	 * the old one. That is right when you sold the amp and the chain is simply
-	 * different now, and wrong when you swap between two you still own, which is
-	 * what a variant is for.
-	 *
-	 * A step past the end appends, matching what `chain_variants` allows: a
-	 * chain that never named a cartridge can gain one without being rewritten.
-	 */
-	async function replaceStep() {
-		const c = vChain;
-		if (!c || vGear == null) return;
-		const g = equipment.find((e) => e.id === vGear);
-		if (!g) { vErr = 'That gear is no longer in your equipment.'; return; }
-		vSaving = true;
-		vErr = '';
-		try {
-			const comps = (c.components ?? []).map((x) => ({ ...x }));
-			const was = comps[vSlot];
-			const step: ChainComponent = {
-				// The slot's own type wins where there is a slot: it is what the
-				// chain says this position *is*, and the gear type is only a
-				// guess at it. A new step at the end has no slot to ask.
-				type: was?.type ?? componentTypeForGear[g.equipment_type] ?? 'transducer',
-				name: g.name,
-				// The detail described the box that was here, not the position —
-				// "Ortofon 2M Red" under a step now naming an Audio-Technica is
-				// worse than nothing, and nothing errors. Kept only when the gear
-				// did not actually change, which is the case where the user opened
-				// the swap and picked what was already there.
-				detail: was?.equipment_id === g.id ? (was?.detail ?? null) : null,
-				equipment_id: g.id
-			};
-			if (vSlot < comps.length) comps[vSlot] = step;
-			else comps.push(step);
-			await api.updateChain(c.id, {
-				name: c.name,
-				description: c.description || undefined,
-				listening_context: c.listening_context,
-				icon: c.icon,
-				components: comps
-			});
-			vOpen = false;
-			await load();
-		} catch (e) {
-			vErr = String(e).replace(/^API \d+: /, '');
-		}
-		vSaving = false;
 	}
 
 	async function removeVariant(v: ChainVariant) {
-		// The listens keep their chain and fall back to its base components,
-		// which is what a null variant means everywhere — so this is not the
-		// destructive act deleting a chain would be, and needs no confirmation.
+		// The listens keep their chain and fall back to it as wired, which is
+		// what a null variant means everywhere — so this is not the destructive
+		// act deleting a chain would be, and needs no confirmation.
 		try {
 			await api.deleteVariant(v.id);
 			await load();
@@ -370,109 +234,75 @@
 		}
 	}
 
-	// ── Folding a near-duplicate chain in ──
+	// ── Merging a chain that swaps one box ──
 	//
-	// Variants shipped forward-looking: build one, and listens tagged with it
-	// from then on credit the gear fitted. But the case they were designed
-	// against already existed as two chains — the same commute with different
-	// IEMs — each holding real hours. Creating the variant did nothing to the
-	// duplicate: it kept its own listens, its own total, and its own row on the
-	// page whose whole complaint was near-duplicate rows.
-	//
-	// So the fold moves the listening across and deletes the chain, and the
-	// hours that were split across two rows that could not be compared add up
-	// on one.
+	// Two chains that differ at one box past the player (Commute Phone on the
+	// HD 569, Summer Commute on the Hexa) are one chain with a slot. The inbox
+	// asks once; this is the same thing from the drawer, any time. The other
+	// chain's listening moves across filed with its gear, and it is deleted.
 	let dupes: FoldSuggestion[] = [];
 
-	let fOpen = false;
-	let fInto: SignalChain | null = null;      // the chain being kept
-	let fFrom: number | null = null;           // the chain folding into it
-	// Either a variant that exists, or a name to derive one from — never both,
-	// which is why this is one control with a sentinel rather than two fields
-	// that can disagree.
-	let fVariant: number | 'new' = 'new';
-	let fName = '';
-	let fErr = '';
-	let fBusy = false;
-	let fDone: string | null = null;
+	let mOpen = false;
+	let mInto: SignalChain | null = null; // the chain kept
+	let mFrom: number | null = null; // the chain that becomes an option
+	let mErr = '';
+	let mBusy = false;
+	let mDone: string | null = null;
 
-	/** Chains that could fold into this one: everything else the user owns,
-	 *  nearest wiring first, and never one carrying variants of its own. */
-	$: foldable = (into: SignalChain | null) =>
+	const PLAYERS = new Set(['source', 'transport']);
+	/** Chains that can merge into this one as an option: one box apart at a
+	 *  step past the player, and carrying no setups of their own. */
+	$: mergeable = (into: SignalChain | null) =>
 		into?.id == null
 			? []
-			: chains
-					.filter((c) => c.id !== into.id && !variants.some((v) => v.chain_id === c.id))
-					.map((c) => ({
-						chain: c,
-						// `distance` comes from the server for the pairs it
-						// considers near-duplicates; anything else is simply a
-						// different rig and sorts last.
-						dupe: dupes.find(
-							(d) =>
-								(d.base_chain_id === into.id && d.fold_chain_id === c.id) ||
-								(d.fold_chain_id === into.id && d.base_chain_id === c.id)
-						)
-					}))
-					.sort((a, b) => (a.dupe?.distance ?? 99) - (b.dupe?.distance ?? 99));
+			: dupes
+					.filter((d) => d.distance === 1 && d.overrides.length === 1 && (d.base_chain_id === into.id || d.fold_chain_id === into.id))
+					.map((d) => {
+						const other = chains.find((c) => c.id === (d.base_chain_id === into.id ? d.fold_chain_id : d.base_chain_id));
+						const pos = d.overrides[0].position;
+						return { other, pos, mine: into.components?.[pos], theirs: other?.components?.[pos] };
+					})
+					.filter(
+						(m) =>
+							m.other &&
+							m.mine?.equipment_id != null &&
+							m.theirs?.equipment_id != null &&
+							!PLAYERS.has(m.mine.type) &&
+							(m.other.components?.length ?? 0) === (into.components?.length ?? 0) &&
+							!variants.some((v) => v.chain_id === m.other?.id)
+					);
 
-	function openFold(into: SignalChain, from?: number) {
-		fInto = into;
-		fErr = '';
-		fDone = null;
-		const options = foldable(into);
-		fFrom = from ?? options[0]?.chain.id ?? null;
-		pickFoldDefaults();
-		fOpen = true;
+	function openMerge(into: SignalChain, from?: number) {
+		mInto = into;
+		mErr = '';
+		mDone = null;
+		mFrom = from ?? mergeable(into)[0]?.other?.id ?? null;
+		mOpen = true;
 	}
 
-	/** Preselect the variant they already built for this pairing, if there is
-	 *  one — that is the whole state this feature exists to resolve, and
-	 *  offering to create a second variant wired identically would be the wrong
-	 *  default in exactly the case that matters. */
-	function pickFoldDefaults() {
-		const d = dupes.find(
-			(x) => x.base_chain_id === fInto?.id && x.fold_chain_id === fFrom
-		);
-		if (d?.matching_variant) {
-			fVariant = d.matching_variant[0];
-			fName = '';
-		} else {
-			fVariant = 'new';
-			fName = chains.find((c) => c.id === fFrom)?.name ?? '';
-		}
-	}
-
-	async function doFold() {
-		if (fFrom == null || fInto?.id == null) { fErr = 'Pick a chain to fold in.'; return; }
-		if (fVariant === 'new' && !fName.trim()) { fErr = 'Name the setup it becomes.'; return; }
-		fBusy = true;
-		fErr = '';
+	async function doMerge() {
+		if (mFrom == null || mInto?.id == null) { mErr = 'Pick a chain to merge in.'; return; }
+		mBusy = true;
+		mErr = '';
 		try {
-			const r = await api.foldChain(fFrom, {
-				into_chain_id: fInto.id,
-				...(fVariant === 'new' ? { variant_name: fName.trim() } : { variant_id: fVariant })
-			});
-			// Said rather than assumed: a fold that moved no listens is a real
-			// outcome (an unused duplicate), and reporting "done" for both
-			// hides the difference.
-			fDone =
-				`Folded into “${fInto.name}” as “${r.variant_name}”. ` +
+			const m = mergeable(mInto).find((x) => x.other?.id === mFrom);
+			const r = await api.mergeChain(mInto.id, mFrom);
+			// Said rather than assumed: a merge that moved no listens is a real
+			// outcome (an unused duplicate).
+			mDone =
+				`${m?.theirs?.name ?? 'Its gear'} is an option on “${mInto.name}” now. ` +
 				(r.listens
-					? `${r.listens} listen${r.listens > 1 ? 's' : ''} moved` +
-					  (r.sides ? `, ${r.sides} side${r.sides > 1 ? 's' : ''}` : '') +
+					? `${r.listens} listen${r.listens > 1 ? 's' : ''} moved with it` +
 					  (r.devices || r.tokens || r.bindings
-							? `, and ${r.devices + r.tokens + r.bindings} attribution rule${
-									r.devices + r.tokens + r.bindings > 1 ? 's' : ''
-							  }`
+							? `, and ${r.devices + r.tokens + r.bindings} rule${r.devices + r.tokens + r.bindings > 1 ? 's' : ''} for where plays go`
 							: '') +
 					  '.'
 					: 'It had no listening of its own.');
 			await load();
 		} catch (e) {
-			fErr = String(e).replace(/^API \d+: /, '');
+			mErr = String(e).replace(/^API \d+: /, '');
 		}
-		fBusy = false;
+		mBusy = false;
 	}
 
 	const contexts = ['active', 'active-mobile', 'passive', 'background', 'unknown'];
@@ -610,16 +440,13 @@
 	 *  when Tapedeck first saw it — most gear is owned well before it is
 	 *  catalogued, and burn-in hours are counted from the purchase. */
 	let gBought = '';
+	/** Other names this box reports as, comma-separated in the dialog. */
+	let gAliases = '';
 	let savingGear = false;
 	let confirmGear: Equipment | null = null;
 	// Set when the gear dialog was opened from inside a chain component row, so
 	// the new gear drops straight into the slot that asked for it.
 	let gearForComp: number | null = null;
-
-	function ctxClass(ctx: string): string {
-		const map: Record<string, string> = { active: 'tag-accent-2', 'active-mobile': 'tag-accent-2', passive: 'tag-accent' };
-		return 'tag ' + (map[ctx] ?? 'tag-neutral');
-	}
 
 	async function load() {
 		try {
@@ -628,10 +455,15 @@
 				api.getChainDuplicates()
 			]);
 			chains = c.chains;
+			lastUsed = c.last_used ?? {};
+			onNow = c.on_now ?? {};
+			friendChainId = c.friend_chain_id ?? null;
+			spoolChainId = c.spool_chain_id ?? null;
 			variants = v.variants;
 			dupes = dup.duplicates;
 			equipment = g.equipment;
 			bindings = b.bindings;
+			deviceBindings = b.device_bindings ?? [];
 			devices = d.devices;
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Failed to load data';
@@ -639,105 +471,25 @@
 		loading = false;
 	}
 
-	// ── Outputs: a chain, or one setup of it ──
-	//
-	// One picker rather than a chain picker and a setup picker beside it
-	// (Ashwin's call, 2026-11-04): each chain with setups is a group, so the
-	// choice is a single value and a setup can never be paired with the wrong
-	// chain. It also carries the two ways to make what is missing, because an
-	// output that fits nothing you have is exactly when you want one.
-	//
-	// Values: '' unmapped · `c:<chain>` as wired · `v:<variant>` a setup ·
-	// `new-chain` / `new-setup` open an editor.
-
-	/** The output a chain or setup editor was opened from. Saving maps it. */
+	// Outputs and machines are set from the chain drawer ("How plays find
+	// this chain"), the route editor's source box and the inbox, since the
+	// Outputs and Machines tabs went (phase 4). `bindFor` is the output a new
+	// chain was started from; nothing sets it today, the save still honours it.
 	let bindFor: Binding | null = null;
 
-	const bindingValue = (b: Binding) =>
-		b.chain_id == null ? '' : b.chain_variant_id != null ? `v:${b.chain_variant_id}` : `c:${b.chain_id}`;
-
-	async function assignBinding(b: Binding, sel: HTMLSelectElement) {
-		const value = sel.value;
-		if (value === 'new-chain' || value === 'new-setup') {
-			// Put the select back on what is saved: the editor might be cancelled,
-			// and a picker reading "+ New chain…" over an output that is still
-			// unmapped would be a lie.
-			sel.value = bindingValue(b);
-			if (value === 'new-chain') newChainForOutput(b);
-			else newSetupForOutput(b);
-			return;
-		}
-		let cid: number | null = null;
-		let vid: number | null = null;
-		if (value.startsWith('c:')) cid = Number(value.slice(2));
-		else if (value.startsWith('v:')) {
-			const v = variants.find((x) => x.id === Number(value.slice(2)));
-			if (!v) return;
-			cid = v.chain_id;
-			vid = v.id;
-		}
-		try {
-			await api.setBinding(b.identifier, cid, vid);
-			bindings = bindings.map((x) =>
-				x.id === b.id ? { ...x, chain_id: cid, chain_variant_id: vid } : x
-			);
-		} catch (e) {
-			sel.value = bindingValue(b);
-			alert('Failed to map that output: ' + e);
-		}
-	}
-
-	/** A new chain named after the output. When the output's name is a piece of
-	 *  gear you have already added — a DAC reports itself by name — that gear is
-	 *  the first step, so the chain starts as something rather than a blank. */
-	function newChainForOutput(b: Binding) {
-		newChain();
-		bindFor = b;
-		cName = b.identifier;
-		const id = b.identifier.trim().toLowerCase();
-		const g = equipment.find((e) => e.name.trim().toLowerCase() === id);
-		if (g) {
-			cComps = [{
-				...blankComp(componentTypeForGear[g.equipment_type] ?? 'dac'),
-				name: g.name,
-				equipment_id: g.id
-			}];
-		}
-	}
-
-	/** A new setup for this output, of the chain it is on already, or of the
-	 *  chain you listen through most when it is on none. The dialog lets you
-	 *  pick a different chain either way. */
-	function newSetupForOutput(b: Binding) {
-		const c = chains.find((x) => x.id === b.chain_id) ?? chainRows[0];
-		if (!c) return;
-		newVariant(c);
-		bindFor = b;
-	}
-
-	/** The setup dialog's chain picker, shown only when it was opened from an
-	 *  output. Changing chain starts the swap over: the slot and the gear were
-	 *  positions in the other chain. */
-	function pickSetupChain(raw: string) {
-		const c = chains.find((x) => x.id === Number(raw));
-		if (!c) return;
-		vChain = c;
-		vSlot = Math.max(0, (c.components?.length ?? 1) - 1);
-		vGear = null;
-	}
-
 	function closeChainEditor() { chainOpen = false; bindFor = null; }
-	function closeSetupEditor() { vOpen = false; bindFor = null; }
-	async function removeBinding(b: Binding) {
-		try { await api.deleteBinding(b.id); bindings = bindings.filter((x) => x.id !== b.id); } catch (e) { alert('Delete failed: ' + e); }
-	}
-
-	async function assignDevice(d: Device, value: string) {
-		const cid = value ? Number(value) : null;
+	// ── How plays find a chain, changed from its drawer ──
+	async function changeRule(r: RuleChange) {
 		try {
-			await api.setDeviceChain(d.id, cid);
-			devices = devices.map((x) => (x.id === d.id ? { ...x, default_chain_id: cid } : x));
-		} catch (e) { alert('Failed to set device chain: ' + e); }
+			if (r.kind === 'device') await api.setDeviceChain(r.id, r.chainId);
+			else if (r.chainId == null && r.kind === 'binding') await api.deleteBinding(r.id);
+			else if (r.chainId == null && r.kind === 'device_binding') await api.deleteDeviceBinding(r.id);
+			else await api.setBinding(r.identifier, r.chainId, null, r.kind === 'device_binding' ? r.equipmentId : null);
+			drawerNotice = r.chainId == null ? `${r.label} no longer comes here.` : `${r.label} goes to ${chains.find((c) => c.id === r.chainId)?.name ?? 'that chain'} now.`;
+			await load();
+		} catch (e) {
+			alert(e instanceof Error ? e.message : 'Could not change that');
+		}
 	}
 
 	// ── chain editor ──
@@ -886,7 +638,7 @@
 
 	// ── equipment editor ──
 	function newGear() {
-		gearId = null; gName = ''; gType = 'headphones'; gBrand = ''; gModel = ''; gNotes = '';
+		gearId = null; gName = ''; gType = 'headphones'; gBrand = ''; gModel = ''; gNotes = ''; gAliases = '';
 		gBought = ''; gStatus = null;
 		gearOpen = true;
 	}
@@ -898,6 +650,7 @@
 		gNotes = e.notes ?? '';
 		gStatus = e.status ?? null;
 		gBought = toDateInput(e.purchased_at);
+		gAliases = (e.aliases ?? []).join(', ');
 		gearOpen = true;
 	}
 	function closeGear() { gearOpen = false; gearForComp = null; }
@@ -918,7 +671,11 @@
 			// editing a brand doesn't clear the tag.
 			const result = gearId == null
 				? await api.createEquipment(data)
-				: await api.updateEquipment(gearId, { ...data, status: gStatus });
+				: await api.updateEquipment(gearId, {
+						...data,
+						status: gStatus,
+						aliases: gAliases.split(',').map((a) => a.trim()).filter(Boolean)
+					});
 			// Refresh gear without reloading chains — the chain editor may be open
 			// behind this dialog with unsaved edits in it.
 			equipment = (await api.getEquipment()).equipment;
@@ -980,7 +737,6 @@
 	// one page — the single biggest source of scrolling on this screen — behind
 	// one control. Not remembered across visits: Equipment is the answer to
 	// "what do I own", which is what people come here for.
-	let secTab: 'equipment' | 'outputs' | 'machines' = 'equipment';
 
 	// A `[[gear:…]]` shortcode in a liner note links to /chains?gear=<id>. There
 	// is no gear detail page yet, so the link highlights the row it means rather
@@ -991,32 +747,44 @@
 	// question is "is this number right", asked of one piece at a time.
 	let openGearHours: number | null = null;
 
-	// Which chain a play accepted out of somebody else's sitting is filed
-	// under. Unset by default, and unset is the old behaviour exactly.
+	// Where accepted Shared Spool plays land: At a friend's, unless a chain
+	// was named the old way (the "Rooms you sit in" picker, gone in phase 5).
+	let friendChainId: number | null = null;
 	let spoolChainId: number | null = null;
-
-	async function saveSpoolChain(raw: string) {
-		const id = raw ? Number(raw) : null;
+	// At a friend's alone is not a start: the first-run screen shows until
+	// the person has a chain of their own.
+	$: ownChains = chains.filter((c) => c.id !== friendChainId);
+	async function saveSpoolChain(id: number | null) {
 		try {
 			await api.setSpoolChain(id);
 			spoolChainId = id;
+			drawerNotice = id == null ? 'Spool plays land here.' : `Spool plays land on ${chains.find((c) => c.id === id)?.name ?? 'that chain'} instead.`;
 		} catch (e) {
-			error = e instanceof Error ? e.message : 'Could not save that';
+			alert(e instanceof Error ? e.message : 'Could not save that');
 		}
 	}
 
 	onMount(async () => {
-		const g = new URLSearchParams(window.location.search).get('gear');
+		const q = new URLSearchParams(window.location.search);
+		const g = q.get('gear');
 		highlightGear = g ? Number(g) : null;
-		await load();
-		// Failing to read it leaves the picker on "No chain", which is the
-		// default and therefore honest — never an error banner over a
-		// preference nobody was setting.
-		try {
-			spoolChainId = (await api.getSpoolChain()).chain_id;
-		} catch {
-			/* the picker shows the default */
+		const picked = Number(q.get('chain'));
+		if (picked) selectedChainId = picked;
+		// Back from the route editor: open the chain and say what the save did.
+		const saved = q.get('saved');
+		if (picked && saved) {
+			openChainId = picked;
+			whatsOnFor = picked;
+			void loadWhatsOn().then(() => (drawerNotice = saved));
+			const url = new URL(window.location.href);
+			url.searchParams.delete('saved');
+			syncUrl(url.pathname + url.search);
 		}
+		const inRoom = Number(q.get('room'));
+		if (inRoom) roomFilter = inRoom;
+		void loadRooms();
+		void loadInbox();
+		await load();
 		if (highlightGear != null) {
 			// Equipment is the default tab, so the row is rendered by now.
 			await tick();
@@ -1035,7 +803,7 @@
 		<h1 class="h-display" style="font-size:38px;">Signal Chains</h1>
 		<p style="margin:6px 0 0;color:var(--td-muted);font-size:15px;">The path your music takes, from source to ears.</p>
 	</div>
-	<button class="btn btn-primary" on:click={newChain}>+ New chain</button>
+	<a class="btn btn-primary" href="/chains/new">+ New chain</a>
 </div>
 
 {#if loading}
@@ -1060,175 +828,73 @@
 		<div class="tile">
 			<div class="tile-big">{equipment.length}</div>
 			<div class="tile-label">pieces of gear</div>
-			<div class="tile-sub">{spareGear.length} not in a chain</div>
+			<div class="tile-sub">{equipment.length - [...usedGear].filter((id) => equipment.some((e) => e.id === id)).length} on the shelf</div>
 		</div>
 	</div>
 
-	<!-- The nudges.
-	     v0.62.0 allowed exactly **one** of these, on the reasoning that two
-	     stacked banners are the clutter this page was being rescued from. That
-	     was wrong in a way only real use showed: an unmapped device you never
-	     intend to map is permanent, so it starved the queue behind it and the
-	     duplicate-chain prompt — added in v0.67.0 — was never once visible on
-	     the instance that had near-duplicate chains to fold.
-
-	     A nudge nobody can reach is worse than a second thin line. So the two
-	     that describe *data being lost or split right now* both show; the
-	     output one, which is only ever a tidy-up, still waits for both to
-	     clear. Two lines maximum. -->
-	{#if unmappedDevices.length}
-		<button class="nudge" aria-label="Review machines with no default chain" on:click={() => (secTab = 'machines')}>
-			<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
-			<span style="flex:1;font-size:13.5px;">
-				{unmappedDevices.length} machine{unmappedDevices.length > 1 ? 's have' : ' has'} no default chain —
-				listens through {unmappedDevices.length > 1 ? 'them' : 'it'} won’t be attributed.
-			</span>
-			<span class="nudge-cta">Review →</span>
-		</button>
+	<!-- The chains and how they are wired, side by side.
+	     The list is how you get around (one button per chain, keyboard and all);
+	     the graph is a picture of the same thing with every piece of gear drawn
+	     once, the chosen chain's route lit. The drawer opens from the bar under
+	     the graph, so scanning never pops a panel over what you were reading. -->
+	{#if inboxDone}<div class="inbox-done">✓ {inboxDone}</div>{/if}
+	{#if inbox.length}
+		<div class="inbox-top">
+			{#key inbox[0].key}
+				<InboxCard q={inbox[0]} {chains} {equipment} position="1 of {inbox.length}"
+					on:done={(e) => inboxAnswered(e.detail)} />
+			{/key}
+			{#if inbox.length > 1}<a class="btn btn-ghost inbox-all" href="/chains/inbox">See all {inbox.length} →</a>{/if}
+		</div>
 	{/if}
-	<!-- Two chains that are the same rig split their hours across two rows that
-	     cannot be compared — wrong *now*, not merely wrong for future listens. -->
-	{#if dupes.length}
-		<button class="nudge" aria-label="Fold near-duplicate chains together"
-			on:click={() => {
-				const d = dupes[0];
-				const into = chains.find((c) => c.id === d.base_chain_id);
-				if (into) openFold(into, d.fold_chain_id);
-			}}>
-			<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><path d="M8 3v6l-4 3 4 3v6M16 3v6l4 3-4 3v6"/></svg>
-			<span style="flex:1;font-size:13.5px;">
-				{dupes.length === 1 ? '“' + dupes[0].fold_name + '” is' : dupes.length + ' chains are'}
-				near-{dupes.length === 1 ? 'identical to “' + dupes[0].base_name + '”' : 'duplicates of another'} —
-				fold {dupes.length === 1 ? 'it' : 'them'} in as {dupes.length === 1 ? 'a setup' : 'setups'} and the hours add up.
-			</span>
-			<span class="nudge-cta">Fold →</span>
-		</button>
-	{/if}
-	{#if unmapped.length && !unmappedDevices.length && !dupes.length}
-		<button class="nudge" aria-label="Review unmapped outputs" on:click={() => (secTab = 'outputs')}>
-			<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><circle cx="12" cy="12" r="9"/><path d="M12 8h.01M11 12h1v4h1"/></svg>
-			<span style="flex:1;font-size:13.5px;">
-				{unmapped.length} output{unmapped.length > 1 ? 's are' : ' is'} detected but unmapped —
-				map {unmapped.length > 1 ? 'them' : 'it'} once and every future listen attributes itself.
-			</span>
-			<span class="nudge-cta">Review →</span>
-		</button>
-	{/if}
-
-	<!-- Rooms you sit in.
-	     A play accepted out of a Shared Spool used to land with no chain at
-	     all, so those listens earned no gear hours, carried no fidelity and
-	     could never reach the Reel. Defensible — it was not your gear — and not
-	     the whole truth, because you were in the room hearing real speakers.
-
-	     Here rather than in Settings because the question is "which of my
-	     chains", and this is the page holding the answer to it. Rendered only
-	     once there is a chain to pick: a picker with nothing in it is a control
-	     that reads as broken. -->
-	{#if chainRows.length}
-		<div class="spoolchain">
-			<div class="sc-main">
-				<div class="sc-title">Rooms you sit in</div>
-				<div class="sc-sub">
-					Where a play lands when you accept it out of somebody else's Shared Spool.
-					Leave it unset and those listens carry no chain, which is what they have
-					always done.
+	{#if ownChains.length}
+		<RoomSuggest chains={chainRows} {equipment} {rooms} on:done={loadRooms} />
+		<RoomChips {rooms} chainCount={chains.length} roomId={roomFilter} on:pick={(e) => pickRoom(e.detail)} />
+		<div class="wired">
+			<div class="wlist">
+				<ChainList chains={chainRows} {equipment} {onNow} {friendChainId} {lastUsed} {rooms} roomId={roomFilter}
+					selectedId={selectedChainId} on:select={(e) => selectChain(e.detail)} />
+			</div>
+			<section class="panel wgraph" aria-label="How it is wired">
+				<div class="whead">
+					<div>
+						<h2 class="h-display" style="font-size:22px;">How it’s wired</h2>
+						<p class="wsub">
+							Pick a chain to light its route. Every piece of gear shows up once, with its
+							hours; <span class="wswap">⇄</span> marks gear you swap at a step.
+						</p>
+					</div>
 				</div>
-			</div>
-			<select
-				class="input sc-pick"
-				aria-label="Chain for plays accepted out of a Shared Spool"
-				value={spoolChainId ?? ''}
-				on:change={(e) => saveSpoolChain(e.currentTarget.value)}
-			>
-				<option value="">No chain</option>
-				{#each chainRows as c (c.id)}
-					<option value={String(c.id)}>{c.name}</option>
-				{/each}
-			</select>
+				<ChainGraph {chains} {equipment} {onNow} {rooms} roomId={roomFilter}
+					selectedId={selectedChainId} on:select={(e) => selectChain(e.detail)} />
+				{#if selectedChain}
+					<div class="wsel">
+						<div style="flex:1 1 320px;min-width:0;">
+							<div style="font-weight:700;">{selectedChain.name}</div>
+							<div class="wsub" style="margin:0;">{selectedLine}</div>
+						</div>
+						<button class="btn btn-secondary" on:click={() => (openChainId = selectedChain?.id ?? null)}>
+							Open {selectedChain.name}
+						</button>
+					</div>
+				{/if}
+			</section>
 		</div>
+	{:else}
+		<FirstRun {equipment} {devices} hasFriendChain={friendChainId != null} />
 	{/if}
 
-	<!-- Chain rows.
-	     One line each, path included, instead of a card with three icon buttons
-	     and a collapsible path. Eight chains used to be eight blocks; they are
-	     now eight lines you can scan, and everything that was in the card lives
-	     in the drawer a click away. -->
-	<div class="rows">
-		{#if chainRows.length}
-			{#each chainRows as c (c.id)}
-				<!-- Named explicitly: the row's text is a name, a path and a running
-				     time in nested divs, which reads as a paragraph rather than as
-				     what the control does. -->
-				<button class="crow" class:on={openChainId === c.id}
-					aria-label="Open {c.name}" aria-expanded={openChainId === c.id}
-					on:click={() => (openChainId = c.id)}>
-					<div class="cname">
-						<div class="cname-t"><ChainIcon name={c.icon} size={16} title={c.name} />{c.name}</div>
-						{#if c.description}<div class="cname-d">{c.description}</div>{/if}
-					</div>
-					<div class="cpath">
-						{#if c.components?.length}
-							{#each c.components as step, i}
-								<span class="cstep">
-									<span class="dot" style="background:{roleColour(step.type)};"></span>
-									<span>{step.name}</span>
-								</span>
-								{#if i < c.components.length - 1}<span class="arrow">→</span>{/if}
-							{/each}
-						{:else}
-							<span class="cnone">No steps yet</span>
-						{/if}
-						{#if variantsFor(c.id).length}
-							<span class="setups" title="One chain, {variantsFor(c.id).length + 1} ways of wiring it">
-								{variantsFor(c.id).length + 1} setups
-							</span>
-						{/if}
-						<!-- An indicator, not a switch. `.crow` is itself a <button>,
-						     and a nested interactive element is invalid markup that
-						     browsers resolve however they like. The design puts the
-						     switch on the row; the row here cannot hold one, so the
-						     row *shows* the state and the switch lives one click away
-						     in the drawer — which is where v0.62.0 moved everything
-						     else the card used to carry. -->
-						{#if c.shared}
-							<span class="shared-pill" title="Listens through this chain reach the Reel of anyone patched into you">
-								Shared
-							</span>
-						{/if}
-					</div>
-					<div class="cend">
-						<span class="chrs" class:zero={c.total_hours <= 0}>{formatHours(c.total_hours)}</span>
-						<svg viewBox="0 0 24 24" width="17" fill="none" stroke="var(--td-muted-3)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
-					</div>
-				</button>
-			{/each}
-		{:else}
-			<div class="panel" style="border-radius:22px;padding:44px;text-align:center;color:var(--td-muted);">
-				No signal chains yet — <button class="btn btn-ghost" on:click={newChain}>create your first</button>
-			</div>
-		{/if}
-	</div>
+	<ShelfLine {equipment} inUse={usedGear} onGraph={stepGear} on:edit={(e) => editGear(e.detail)} />
 
-	<!-- Equipment / Outputs / Machines behind one control.
-	     Outputs before Machines because that is the order the ladder tries them:
-	     an output's mapping wins over everything but an explicit chain name, and
-	     a machine's default is the last fallback. "Machines" rather than
-	     "Devices" (2026-11-04) — the outputs are what clients call an *output
-	     device*, and two tabs both called a device was half the confusion. -->
+	<!-- The gear table. Outputs and machines used to be two tabs beside it;
+	     they are set from a chain's drawer, the route editor and the inbox
+	     now (phase 4). -->
 	<div class="sechead">
-		<div class="seg">
-			<button class="seg-btn" class:on={secTab === 'equipment'} on:click={() => (secTab = 'equipment')}>Equipment · {equipment.length}</button>
-			<button class="seg-btn" class:on={secTab === 'outputs'} on:click={() => (secTab = 'outputs')}>Outputs · {bindings.length}</button>
-			<button class="seg-btn" class:on={secTab === 'machines'} on:click={() => (secTab = 'machines')}>Machines · {devices.length}</button>
-		</div>
-		{#if secTab === 'equipment'}
-			<button class="btn btn-secondary" on:click={newGear}>+ Add gear</button>
-		{/if}
+		<h2 class="h-display" style="font-size:20px;margin:0;">Gear · {equipment.length}</h2>
+		<button class="btn btn-secondary" on:click={newGear}>+ Add gear</button>
 	</div>
 
-	{#if secTab === 'equipment'}
-		{#if equipment.length}
+	{#if equipment.length}
 			{#if inChainGear.length}
 				<div class="panel sectable">
 					<div class="secsub">In your chains</div>
@@ -1347,574 +1013,91 @@
 				<p>Add the boxes you listen through and they become one-click steps in a chain.</p>
 				<button class="btn btn-ghost" on:click={newGear}>Add your first</button>
 			</div>
-		{/if}
 	{/if}
 
-	{#if secTab === 'machines'}
-		<p class="sechint">The computers and phones that submit listens. A machine's default chain is the last fallback — an output's mapping and an app token's chain both win over it.</p>
-		{#if devices.length}
-			<div class="panel" style="border-radius:20px;padding:8px;">
-				{#each devices as d (d.id)}
-					<div class="drow">
-						<div class="dicon">
-							<svg viewBox="0 0 24 24" width="19" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
-						</div>
-						<div style="flex:1;min-width:160px;">
-							<div style="font-weight:600;font-size:14.5px;">
-								{d.name ?? d.machine_id}
-								{#if d.platform}<span style="font-weight:400;font-size:12px;color:var(--td-muted-3);margin-left:5px;">{d.platform}</span>{/if}
-							</div>
-							<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:1px;">{d.total_listens} listens · last seen {timeAgo(d.last_seen)}</div>
-						</div>
-						<select class="input assign" class:needs={d.default_chain_id == null}
-							value={d.default_chain_id ?? ''} aria-label="Default chain for {d.name ?? d.machine_id}"
-							on:change={(e) => assignDevice(d, e.currentTarget.value)}>
-							<option value="">— no default —</option>
-							{#each chains as c}<option value={c.id}>{c.name}</option>{/each}
-						</select>
-					</div>
-				{/each}
-			</div>
-		{:else}
-			<div class="panel empty">
-				<div class="empty-t">No machines yet</div>
-				<p>They appear here once a client submits a listen carrying a machine id.</p>
-			</div>
-		{/if}
-	{/if}
-
-	{#if secTab === 'outputs'}
-		<p class="sechint">
-			Map each playback output once — to a chain, or to one setup of it — and every future listen
-			through it lands there. It is the most specific rule, so it wins over an app token and the
-			machine. Listens already logged stay as they are; retag those from History.
-		</p>
-		{#if bindings.length}
-			<div class="panel" style="border-radius:20px;padding:8px;">
-				{#each [...unmapped, ...mapped] as b (b.id)}
-					<div class="drow">
-						<div class="dicon">
-							<svg viewBox="0 0 24 24" width="19" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/></svg>
-						</div>
-						<div style="flex:1;min-width:160px;">
-							<div style="font-weight:600;font-size:14.5px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-								{b.identifier}
-								{#if b.interface}<span class="tag tag-neutral">{b.interface}</span>{/if}
-							</div>
-							<div style="font-size:12.5px;color:var(--td-muted-2);margin-top:1px;">{b.hits} plays · last seen {timeAgo(b.last_seen)}</div>
-						</div>
-						<!-- One picker: a chain with setups is a group of them, so the
-						     choice is one value and a setup cannot land on the wrong
-						     chain. Option text repeats the chain because a closed
-						     select shows only the option, not its group. -->
-						<select class="input assign" class:needs={b.chain_id == null}
-							value={bindingValue(b)} aria-label="Chain or setup for {b.identifier}"
-							on:change={(e) => assignBinding(b, e.currentTarget)}>
-							<option value="">— unmapped —</option>
-							{#each chainRows as c (c.id)}
-								{#if variantsFor(c.id).length}
-									<optgroup label={c.name}>
-										<option value="c:{c.id}">{c.name} · as wired</option>
-										{#each variantsFor(c.id) as v (v.id)}
-											<option value="v:{v.id}">{c.name} · {v.name}</option>
-										{/each}
-									</optgroup>
-								{:else}
-									<option value="c:{c.id}">{c.name}</option>
-								{/if}
-							{/each}
-							<optgroup label="Nothing fits?">
-								<option value="new-chain">+ New chain from “{b.identifier}”…</option>
-								{#if chains.length}
-									<option value="new-setup">
-										+ New setup of {b.chain_id != null ? `“${chains.find((c) => c.id === b.chain_id)?.name ?? 'a chain'}”` : 'a chain'}…
-									</option>
-								{/if}
-							</optgroup>
-						</select>
-						<button class="icon-btn danger" title="Forget this output" on:click={() => removeBinding(b)} aria-label="Delete binding">✕</button>
-					</div>
-				{/each}
-			</div>
-		{:else}
-			<div class="panel empty dashed">
-				<div class="empty-icon">
-					<svg viewBox="0 0 24 24" width="24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/></svg>
-				</div>
-				<div class="empty-t">No outputs detected yet</div>
-				<p>They appear here automatically once a client reports its output device — a USB DAC, Bluetooth endpoint, or headphone jack.</p>
-			</div>
-		{/if}
-	{/if}
 {/if}
 
 <!-- ── Chain detail drawer ──
-     Everything the card used to carry, at the size it deserves: the path drawn
-     vertically with its roles, the variants with their own hours, and what
-     actually attributes to this chain. -->
+     The design's "Place" layout on today's data; see `ChainDrawer`. Every
+     action comes back here, where the dialogs and the data live. -->
 {#if openChain}
-	<div class="drawer-back" on:click={() => (openChainId = null)} on:keydown={() => {}} role="presentation"></div>
-	<aside class="drawer" aria-label="Chain detail">
-		<div class="drawer-head">
-			<div style="min-width:0;">
-				<div class="h-display" style="font-size:23px;line-height:1.15;display:flex;align-items:center;gap:9px;">
-					<ChainIcon name={openChain.icon} size={20} title={openChain.name} />{openChain.name}
-				</div>
-				{#if openChain.description}<div style="font-size:13px;color:var(--td-muted);margin-top:4px;">{openChain.description}</div>{/if}
-			</div>
-			<button class="icon-btn" on:click={() => (openChainId = null)} aria-label="Close">
-				<svg viewBox="0 0 24 24" width="20" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
-			</button>
-		</div>
-
-		<div class="drawer-body">
-			<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:20px;">
-				<span class="hours-pill">
-					<svg viewBox="0 0 24 24" width="14" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3.5 2"/></svg>
-					{formatHours(openChain.total_hours)} logged on this chain
-				</span>
-				<span class={ctxClass(openChain.listening_context)}>{openChain.listening_context}</span>
-			</div>
-
-			<!-- The sharing switch. **The same state as Patch → Decks** — one
-			     state, two places — because both call
-			     `PUT /api/v1/patch/chains/:id/shared`. It is here rather than
-			     buried in the editor because it is a standing decision about
-			     how you listen, not a property of the wiring. -->
-			<div class="share-row">
-				<div style="min-width:0;">
-					<div style="font-size:14px;font-weight:600;">Who hears this chain</div>
-					<div style="font-size:12.5px;color:var(--td-muted);line-height:1.45;max-width:46ch;">
-						<strong>Private</strong> is the default and means nobody but you.
-						<strong>Shared</strong> means listens through it reach the Reel of anyone
-						patched into your deck — and it is the only thing that publishes a
-						listen, so there is no per-listen setting.
-					</div>
-				</div>
-				<!--
-					A segmented pair, not a checkbox. The checkbox was labelled with
-					the *current state* ("Private" when unshared), and a checkbox
-					label conventionally says what ticking it does — so "☐ Private"
-					read as "tick to make private", which is the opposite of what it
-					did. Two segments cannot be misread: the lit one is the state.
-				-->
-				<div class="seg share-seg" role="group" aria-label="Who hears this chain">
-					<button
-						class="seg-btn"
-						class:on={!openChain.shared}
-						aria-pressed={!openChain.shared}
-						disabled={sharingChain === openChain.id}
-						on:click={() => openChain?.shared && toggleShared(openChain, false)}
-					>Private</button>
-					<button
-						class="seg-btn"
-						class:on={openChain.shared}
-						aria-pressed={openChain.shared}
-						disabled={sharingChain === openChain.id}
-						on:click={() => openChain && !openChain.shared && toggleShared(openChain, true)}
-					>Shared</button>
-					<!-- Each guard means clicking the segment that is already lit
-					     does nothing, rather than spending a PUT to set the state
-					     it is already in. -->
-				</div>
-			</div>
-
-			<div class="drawer-label">Signal path</div>
-			{#if openChain.components?.length}
-				<div style="display:flex;flex-direction:column;">
-					{#each openChain.components as step, i}
-						<!-- Stretched rather than `flex-start`: the connector grows to
-						     whatever height the step's text takes, so a step carrying a
-						     `detail` line doesn't leave a visible break in the path. -->
-						<div style="display:flex;gap:14px;align-items:stretch;">
-							<div style="display:flex;flex-direction:column;align-items:center;flex:none;">
-								<span class="pdot" style="background:{roleColour(step.type)};box-shadow:0 0 0 4px color-mix(in srgb, {roleColour(step.type)} 16%, transparent);"></span>
-								{#if i < openChain.components.length - 1}<span class="pconn"></span>{/if}
-							</div>
-							<!-- The node is the control. The path was already drawn here and
-							     was the one thing on the screen that named the step you want
-							     to change, while the editor asked you to find it again in a
-							     select. `aria-label` because the visible content is a role,
-							     a name and a marker in nested divs, which reads as a
-							     paragraph rather than as what the button does. -->
-							<button class="pstep" on:click={() => openChain && openSwap(openChain, i)}
-								title="Swap this step — as a setup, or in the chain itself"
-								aria-label="Swap {step.name}">
-								<div class="prole">{roleLabel(step)}</div>
-								<div style="font-size:15.5px;font-weight:600;margin-top:1px;display:flex;align-items:center;gap:6px;">
-									{step.name}
-									{#if step.equipment_id != null}<span title="From your equipment" style="color:var(--td-accent);font-size:10px;">●</span>{/if}
-									<span class="pswap" aria-hidden="true">swap</span>
-								</div>
-								{#if step.detail}<div style="font-size:12.5px;color:var(--td-muted-2);">{step.detail}</div>{/if}
-								<!-- Only where there is one: the great majority of steps have
-								     been there as long as the chain has, and saying so on
-								     every row would bury the one that has not. -->
-								{#if step.since}<div class="psince">{sinceLabel(step.since)}</div>{/if}
-							</button>
-						</div>
-					{/each}
-				</div>
-			{:else}
-				<p style="font-size:13.5px;color:var(--td-muted);margin:0;">No steps yet — edit the chain to describe the path.</p>
-			{/if}
-
-			<!-- Variants: the same chain with one step swapped. Two cartridges on
-			     one turntable are a choice, not two decks. -->
-			<div class="drawer-label" style="margin-top:26px;">Setups</div>
-			{#each variantsFor(openChain.id) as v (v.id)}
-				<div class="vrow" title={overrideSummary(openChain, v)}>
-					<span style="font-size:14px;min-width:0;">{v.name}</span>
-					<span style="display:flex;align-items:center;gap:6px;flex:none;">
-						<span style="font-size:12.5px;color:var(--td-muted-2);font-variant-numeric:tabular-nums;">{formatHours(v.total_hours)}</span>
-						<!-- The common case this exists for: the variant is the one
-						     actually in use most of the time, so it should be what the
-						     chain *is*. A relabelling — nothing about what was fitted
-						     for any listen changes, and neither do anyone's hours. -->
-						<button class="icon-btn" style="width:26px;height:26px;" title="Make this the chain"
-							aria-label="Make {v.name} the chain"
-							on:click={() => openChain && promote(openChain, v)}>★</button>
-						<button class="icon-btn" style="width:26px;height:26px;" title="Edit this setup"
-							aria-label="Edit setup {v.name}"
-							on:click={() => openChain && editVariant(openChain, v)}>✎</button>
-						<button class="icon-btn danger" style="width:26px;height:26px;" title="Delete this setup"
-							aria-label="Delete setup {v.name}" on:click={() => removeVariant(v)}>✕</button>
-					</span>
-				</div>
-			{:else}
-				<p style="font-size:12.5px;color:var(--td-muted-2);margin:0 0 8px;">
-					Just the one. Add a setup when you swap a single box — the other stylus, the other IEMs —
-					and its hours land on the gear that was actually fitted.
-				</p>
-			{/each}
-			<div style="display:flex;gap:8px;flex-wrap:wrap;">
-				<button class="vadd" on:click={() => openChain && newVariant(openChain)}>+ setup</button>
-				<!-- Only offered where there is something to compare. With no
-				     variants the path above this *is* the overview, and a button
-				     opening a picture of one line is a button that does nothing. -->
-				{#if openChain && variantsFor(openChain.id).length}
-					<button class="vadd" on:click={() => (overviewOpen = true)}
-						title="See the chain and every setup of it side by side">
-						⛓ see all setups
-					</button>
-				{/if}
-				<!-- The other way to get a variant: an existing chain that is
-				     really this one wired differently. Only offered when there
-				     is something to fold. -->
-				{#if openChain && foldable(openChain).length}
-					<button class="vadd" on:click={() => openChain && openFold(openChain)}
-						title="Move another chain's listening onto this one as a setup">
-						⤵ fold a chain in
-					</button>
-				{/if}
-			</div>
-
-			{#if devices.some((d) => d.default_chain_id === openChain?.id) || bindings.some((b) => b.chain_id === openChain?.id)}
-				<div class="drawer-label" style="margin-top:26px;">Attributing to this chain</div>
-				{#each devices.filter((d) => d.default_chain_id === openChain?.id) as d (d.id)}
-					<div class="arow">
-						<svg viewBox="0 0 24 24" width="16" fill="none" stroke="var(--td-muted-2)" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg>
-						<span style="font-size:14px;">{d.name ?? d.machine_id}</span>
-						{#if d.platform}<span style="font-size:12px;color:var(--td-muted-3);">{d.platform}</span>{/if}
-					</div>
-				{/each}
-				{#each bindings.filter((b) => b.chain_id === openChain?.id) as b (b.id)}
-					<div class="arow">
-						<svg viewBox="0 0 24 24" width="16" fill="none" stroke="var(--td-muted-2)" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" style="flex:none;"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M19 5a9 9 0 0 1 0 14"/></svg>
-						<span style="font-size:14px;">{b.identifier}</span>
-						{#if b.interface}<span style="font-size:12px;color:var(--td-muted-3);">{b.interface}</span>{/if}
-						<!-- Which setup, so the drawer answers what the output puts
-						     in the path and not only which chain. -->
-						<span style="font-size:12px;color:var(--td-muted-2);margin-left:auto;">
-							{variants.find((v) => v.id === b.chain_variant_id)?.name ?? 'as wired'}
-						</span>
-					</div>
-				{/each}
-			{/if}
-		</div>
-
-		<div class="drawer-foot">
-			<button class="btn btn-ghost" style="color:#b2622d;" on:click={() => (confirmChain = openChain)}>Delete</button>
-			<div style="display:flex;gap:8px;">
-				<button class="btn btn-secondary" on:click={() => openChain && duplicateChain(openChain)}>Duplicate</button>
-				<button class="btn btn-primary" on:click={() => openChain && editChain(openChain)}>Edit chain</button>
-			</div>
-		</div>
-	</aside>
+	<ChainDrawer
+		chain={openChain}
+		{variants}
+		{equipment}
+		{devices}
+		{bindings}
+		{deviceBindings}
+		{chains}
+		{friendChainId}
+		{spoolChainId}
+		{whatsOn}
+		notice={drawerNotice}
+		lastUsed={lastUsed[String(openChain.id)] ?? null}
+		sharing={sharingChain === openChain.id}
+		canMerge={mergeable(openChain).length > 0}
+		{rooms}
+		{movingRooms}
+		on:rooms={(e) => openChain && moveChainRooms(openChain, e.detail)}
+		on:close={() => (openChainId = null)}
+		on:share={(e) => openChain && toggleShared(openChain, e.detail)}
+		on:changed={(e) => drawerChanged(e.detail)}
+		on:removeVariant={(e) => removeVariant(e.detail)}
+		on:rule={(e) => changeRule(e.detail)}
+		on:spoolChain={(e) => saveSpoolChain(e.detail)}
+		on:merge={() => openChain && openMerge(openChain)}
+		on:delete={() => (confirmChain = openChain)}
+		on:duplicate={() => openChain && duplicateChain(openChain)}
+		on:edit={() => openChain && goto(`/chains/${openChain.id}/route`)}
+		on:rename={() => openChain && editChain(openChain)}
+	/>
 {/if}
 
-<!-- Variant editor: pick a slot, pick what goes in it. Deliberately one slot
-     at a time — the whole reason variants exist is that swapping *one* thing
-     should not mean rebuilding a chain, and a full editor here would just be
-     the chain editor again. -->
-<!-- ── The setups overview ──
-     Read-only on purpose: editing lives on the nodes in the drawer, and a
-     picture that also edits would be two interactions competing over the same
-     click. This one answers "what have I actually got set up here". -->
-{#if overviewOpen && openChain}
-	{@const vs = variantsFor(openChain.id)}
-	{@const slots = overviewSlots(openChain, vs)}
-	<div class="dialog-backdrop" on:click={() => (overviewOpen = false)} on:keydown={() => {}} role="presentation">
-		<div class="dialog ov" style="width:min(980px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
-			<div class="dialog-title">{openChain.name} — every setup</div>
-			<div class="dialog-body">
-				<p class="ov-intro">
-					The top line is the chain as it stands. Each row below swaps only what it
-					says it swaps and passes the rest through, so the hours land on the box
-					that was actually fitted.
-				</p>
-				<!-- Scrolls in its own container. A long chain must not make the
-				     page scroll sideways — the rule the equipment table already
-				     had to learn. -->
-				<div class="ov-wrap">
-					<!-- The names stay put while the path scrolls. `position:sticky`
-					     was the obvious way and it does not work here: a grid item's
-					     containing block is its own grid area, so a sticky label can
-					     only travel within its own 170px column — it scrolls away
-					     looking exactly like no sticky at all. So the labels are a
-					     separate column outside the scroller, and the two are kept in
-					     step by a fixed row height rather than by hoping the content
-					     matches. -->
-					<div class="ov-labels">
-						<div class="ov-side ov-std">
-							<div class="ov-name">Standard</div>
-							<div class="ov-sub">{formatHours(openChain.total_hours)}</div>
-						</div>
-						{#each vs as v (v.id)}
-							<div class="ov-side">
-								<div class="ov-name">{v.name}</div>
-								<div class="ov-sub">{formatHours(v.total_hours)}</div>
-							</div>
-						{/each}
-					</div>
-					<div class="ov-scroll">
-					<div class="ov-grid" style="grid-template-columns:repeat({slots}, minmax(150px, 1fr));">
-						{#each Array(slots) as _, i}
-							{@const step = openChain.components?.[i]}
-							<div class="ov-cell">
-								{#if step}
-									<div class="ov-node" style="border-color:{roleColour(step.type)};">
-										<span class="ov-dot" style="background:{roleColour(step.type)};"></span>
-										<span class="ov-role">{roleLabel(step)}</span>
-										<span class="ov-label">{step.name}</span>
-									</div>
-								{:else}
-									<!-- A position only a variant reaches: the chain itself
-									     has nothing here, which is a real state and not a
-									     gap to fill in. -->
-									<div class="ov-none">nothing here</div>
-								{/if}
-							</div>
-						{/each}
-
-						{#each vs as v (v.id)}
-							{#each Array(slots) as _, i}
-								{@const o = overrideAt(v, i)}
-								{@const step = openChain.components?.[i]}
-								<div class="ov-cell">
-									{#if o}
-										<div class="ov-node ov-swap">
-											<span class="ov-dot" style="background:var(--td-accent);"></span>
-											<span class="ov-role">{step ? 'swapped' : 'added'}</span>
-											<span class="ov-label">{overrideName(o)}</span>
-										</div>
-									{:else}
-										<!-- Passed through. Drawn as the line it is rather
-										     than as a repeat of the standard's node: the
-										     row would then read as a whole second chain,
-										     which is exactly what a variant is not. -->
-										<div class="ov-thru" aria-label="same as the chain"></div>
-									{/if}
-								</div>
-							{/each}
-						{/each}
-					</div>
-					</div>
-				</div>
-			</div>
-			<div class="dialog-actions">
-				<button class="btn btn-secondary" on:click={() => (overviewOpen = false)}>Close</button>
-			</div>
-		</div>
-	</div>
-{/if}
-
-{#if vOpen && vChain}
-	<div class="dialog-backdrop" on:click={closeSetupEditor} on:keydown={() => {}} role="presentation">
-		<div class="dialog" style="width:min(520px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
-			<div class="dialog-title">
-				{vId == null ? (vMode === 'chain' ? 'Swap a step in' : 'New setup of') : 'Edit setup of'}
-				{vChain.name}
-			</div>
-			<div class="dialog-body">
-				<div style="display:flex;flex-direction:column;gap:13px;">
-					<!-- Opened from an output: which chain this is a setup of is the
-					     first question, and saving maps the output to it. There is
-					     no "replace in the chain" here — rewiring a chain is not
-					     something to do on the way to mapping an output. -->
-					{#if bindFor && vId == null}
-						<div class="field">
-							<label for="vc">A setup of</label>
-							<select id="vc" class="input" value={String(vChain.id)}
-								on:change={(e) => pickSetupChain(e.currentTarget.value)}>
-								{#each chainRows as c (c.id)}<option value={String(c.id)}>{c.name}</option>{/each}
-							</select>
-							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-								Saving maps “{bindFor.identifier}” to it.
-							</p>
-						</div>
-					{/if}
-					<!-- The two meanings of swapping a box, stated rather than
-					     guessed at. Only offered when creating: editing an
-					     existing variant is about that variant, and redirecting
-					     the save onto the chain would be a different and
-					     destructive operation behind the same button. -->
-					{#if vId == null && !bindFor}
-						<div class="vmode">
-							<button class="vmode-btn" class:on={vMode === 'variant'}
-								on:click={() => (vMode = 'variant')}>
-								<span class="vmode-t">Save as a setup</span>
-								<span class="vmode-s">Both stay yours. Hours split between them.</span>
-							</button>
-							<button class="vmode-btn" class:on={vMode === 'chain'}
-								on:click={() => (vMode = 'chain')}>
-								<span class="vmode-t">Replace it in the chain</span>
-								<span class="vmode-s">The chain is simply wired this way now.</span>
-							</button>
-						</div>
-					{/if}
-					{#if vMode === 'variant'}
-						<div class="field">
-							<label for="vn">Name</label>
-							<input id="vn" class="input" bind:value={vName} placeholder="Microlinear" />
-							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-								What is different about it — the stylus fitted, the headphones on.
-							</p>
-						</div>
-					{/if}
-					<div class="field">
-						<label for="vs">Swap which step</label>
-						<select id="vs" class="input" bind:value={vSlot}>
-							{#each vChain.components ?? [] as step, i}
-								<option value={i}>{compTypeLabel(step.type)} · {step.name}</option>
-							{/each}
-							<option value={(vChain.components ?? []).length}>+ add a step at the end</option>
-						</select>
-					</div>
-					<div class="field">
-						<label for="vg">For</label>
-						<select id="vg" class="input" bind:value={vGear}>
-							<option value={null}>— pick from your gear —</option>
-							{#each equipment as e}
-								<option value={e.id}>{e.name}{e.brand ? ` · ${e.brand}` : ''}</option>
-							{/each}
-						</select>
-						{#if vMode === 'variant'}
-							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-								Listens through this setup credit their hours here instead of
-								whatever the chain names at that step — which is what makes
-								per-stylus wear answerable.
-							</p>
-						{:else}
-							<!-- Said plainly because it cannot be seen. Chain hours are
-							     derived from the listens, so rewiring the chain moves
-							     every hour ever logged through it onto the new box —
-							     including the ones that ran through the old one. -->
-							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-								This is retroactive: hours are worked out from the listens, so
-								every hour already logged through this chain moves onto the new
-								box. Right when you replaced the old one for good — use a
-								setup if you still swap between them.
-							</p>
-						{/if}
-					</div>
-					{#if vErr}<p style="font-size:13px;color:#b2622d;margin:0;">{vErr}</p>{/if}
-				</div>
-			</div>
-			<div class="dialog-actions">
-				<button class="btn btn-secondary" on:click={closeSetupEditor}>Cancel</button>
-				<button class="btn btn-primary" on:click={saveVariant} disabled={vSaving}>
-					{vSaving ? 'Saving…' : vMode === 'chain' ? 'Replace in the chain' : bindFor ? 'Save and map' : 'Save setup'}
-				</button>
-			</div>
-		</div>
-	</div>
-{/if}
-
-<!-- Fold dialog.
-     Two chains that are the same rig with one box swapped are one chain and a
-     choice — but saying so after the fact has to *move the listening*, or the
-     hours stay split across a row that no longer exists in the user's head.
-     Not reversible, and the dialog says so rather than burying it. -->
-{#if fOpen && fInto}
-	<div class="dialog-backdrop" on:click={() => (fOpen = false)} on:keydown={() => {}} role="presentation">
+<!-- Merge dialog.
+     A chain that swaps one box is one chain with a slot, but saying so after
+     the fact has to *move the listening*, or the hours stay split across a row
+     that no longer exists in the person's head. Not reversible, and the
+     dialog says so rather than burying it. -->
+{#if mOpen && mInto}
+	{@const opts = mergeable(mInto)}
+	<div class="dialog-backdrop" on:click={() => (mOpen = false)} on:keydown={() => {}} role="presentation">
 		<div class="dialog" style="width:min(560px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
-			<div class="dialog-title">Fold a chain into “{fInto.name}”</div>
+			<div class="dialog-title">Merge a chain into “{mInto.name}” as an option</div>
 			<div class="dialog-body">
-				{#if fDone}
-					<p style="font-size:13.5px;margin:0;">{fDone}</p>
+				{#if mDone}
+					<p style="font-size:13.5px;margin:0;">{mDone}</p>
 				{:else}
 					<div style="display:flex;flex-direction:column;gap:13px;">
 						<div class="field">
-							<label for="ff">Which chain is really this one?</label>
-							<select id="ff" class="input" bind:value={fFrom} on:change={pickFoldDefaults}>
-								{#each foldable(fInto) as o}
-									<option value={o.chain.id}>
-										{o.chain.name}{o.dupe
-											? o.dupe.distance === 0
-												? ' — identical wiring'
-												: ` — ${o.dupe.distance} step${o.dupe.distance > 1 ? 's' : ''} differ${o.dupe.distance > 1 ? '' : 's'}`
-											: ''}{o.chain.total_hours > 0 ? ` · ${formatHours(o.chain.total_hours)}` : ''}
+							<label for="mf">Which chain is this one with other gear on?</label>
+							<select id="mf" class="input" bind:value={mFrom}>
+								{#each opts as o (o.other?.id)}
+									<option value={o.other?.id}>
+										{o.other?.name} — {o.theirs?.name} instead of {o.mine?.name}{(o.other?.total_hours ?? 0) > 0 ? ` · ${formatHours(o.other?.total_hours ?? 0)}` : ''}
 									</option>
 								{/each}
 							</select>
 							<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-								Its listening moves onto “{fInto.name}” and the chain itself is deleted.
-								A chain carrying setups of its own can’t fold — its overrides point at
-								steps this would replace.
+								Its gear becomes an option at that step, so you pick which is on. Its listening moves onto
+								“{mInto.name}” filed with that gear, with its outputs, machines and rooms, and the chain itself
+								is deleted.
 							</p>
 						</div>
-						<div class="field">
-							<label for="fv">Logged as</label>
-							<select id="fv" class="input" bind:value={fVariant}>
-								<option value="new">— a new setup —</option>
-								{#each variantsFor(fInto.id) as v}
-									<option value={v.id}>{v.name}</option>
-								{/each}
-							</select>
-							{#if fVariant === 'new'}
-								<input class="input" style="margin-top:8px;" bind:value={fName} placeholder="Summer" />
-								<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-									What it swaps is worked out from the two chains, so the moved hours
-									credit the gear that chain actually named — not this one’s.
-								</p>
-							{:else}
-								<p style="font-size:12px;color:var(--td-muted-2);margin:5px 0 0;">
-									The moved listens credit whatever this setup swaps in. Pick the one
-									that matches how that chain was wired.
-								</p>
-							{/if}
-						</div>
 						<p style="font-size:12.5px;color:var(--td-muted-2);margin:0;border-left:2px solid var(--td-muted-3);padding-left:10px;">
-							Not reversible. The listens keep everything else — only which chain and
-							setup they went through changes.
+							Not reversible. The listens keep everything else; only which chain they went through changes.
 						</p>
-						{#if fErr}<p style="font-size:13px;color:#b2622d;margin:0;">{fErr}</p>{/if}
+						{#if mErr}<p style="font-size:13px;color:var(--td-bad-fg);margin:0;">{mErr}</p>{/if}
 					</div>
 				{/if}
 			</div>
 			<div class="dialog-actions">
-				<!-- The drawer is opened on the way out rather than alongside the
-				     result: both are overlays, and raising the drawer while the
-				     dialog still holds the "what moved" line buries the one
-				     thing worth reading. -->
 				<button class="btn btn-secondary"
-					on:click={() => { const keep = fDone ? fInto?.id ?? null : null; fOpen = false; if (keep != null) openChainId = keep; }}>
-					{fDone ? 'Close' : 'Cancel'}
+					on:click={() => { const keep = mDone ? mInto?.id ?? null : null; mOpen = false; if (keep != null) openChainId = keep; }}>
+					{mDone ? 'Close' : 'Cancel'}
 				</button>
-				{#if !fDone}
-					<button class="btn btn-primary" on:click={doFold} disabled={fBusy || fFrom == null}>
-						{fBusy ? 'Folding…' : 'Fold in'}
+				{#if !mDone}
+					<button class="btn btn-primary" on:click={doMerge} disabled={mBusy || mFrom == null}>
+						{mBusy ? 'Merging…' : 'Merge it in'}
 					</button>
 				{/if}
 			</div>
@@ -1926,7 +1109,7 @@
 {#if chainOpen}
 	<div class="dialog-backdrop" on:click={closeChainEditor} on:keydown={() => {}} role="presentation">
 		<div class="dialog" style="width:min(620px,100%);" on:click|stopPropagation on:keydown|stopPropagation role="presentation">
-			<div class="dialog-title">{chainId == null ? 'New signal chain' : 'Edit chain'}</div>
+			<div class="dialog-title">{chainId == null ? 'New signal chain' : 'Rename and describe'}</div>
 			{#if bindFor && chainId == null}
 				<p style="font-size:12.5px;color:var(--td-muted-2);margin:-4px 0 10px;">
 					For listens through “{bindFor.identifier}” — saving maps that output to it.
@@ -1935,7 +1118,7 @@
 			<div class="dialog-body" style="max-height:70vh;overflow-y:auto;">
 				<div style="display:flex;flex-direction:column;gap:13px;">
 					<div class="field"><label for="cn">Name</label><input id="cn" class="input" bind:value={cName} placeholder="Desktop Reference"></div>
-					<div class="field"><label for="cd">Description</label><input id="cd" class="input" bind:value={cDesc} placeholder="Primary desk setup"></div>
+					<div class="field"><label for="cd">Description</label><input id="cd" class="input" bind:value={cDesc} placeholder="The main desk rig"></div>
 					<div class="field"><label for="cx">Listening context</label>
 						<select id="cx" class="input" bind:value={cContext}>{#each contexts as ct}<option value={ct}>{ct}</option>{/each}</select>
 					</div>
@@ -1960,6 +1143,9 @@
 							{/each}
 						</div>
 					</div>
+					<!-- A chain that exists changes its route in the route editor,
+					     which asks what happens to plays already logged. -->
+					{#if chainId == null}
 					<div class="field">
 						<div style="font-size:12px;margin-bottom:5px;color:var(--td-muted);">Components (source → ears)</div>
 						<div style="display:flex;flex-direction:column;gap:8px;">
@@ -2012,6 +1198,7 @@
 							<button class="btn btn-ghost" style="align-self:flex-start;" on:click={addComp}>+ Add component</button>
 						</div>
 					</div>
+					{/if}
 				</div>
 			</div>
 			<div class="dialog-actions">
@@ -2056,6 +1243,15 @@
 						</div>
 					</div>
 					<div class="field"><label for="go">Notes</label><input id="go" class="input" bind:value={gNotes}></div>
+					{#if gearId != null}
+						<!-- Remembered from the inbox, editable here: an app that reports
+						     one of these names is suggested as this box, never tied to it
+						     without asking. -->
+						<div class="field">
+							<label for="galias">Also reports as</label>
+							<input id="galias" class="input" bind:value={gAliases} placeholder="A model number, say XQ-DQ54">
+						</div>
+					{/if}
 				</div>
 			</div>
 			<div class="dialog-actions">
@@ -2107,77 +1303,6 @@
 	.tile-big { font-family: 'Caprasimo', serif; font-size: 28px; line-height: 1; letter-spacing: -.01em; }
 	.tile-label { font-size: 13px; color: var(--td-muted); margin-top: 7px; }
 	.tile-sub { font-size: 11.5px; color: var(--td-muted-3); margin-top: 2px; }
-
-	/* ── The nudge ── */
-	.nudge {
-		display: flex; align-items: center; gap: 11px; width: 100%; text-align: left;
-		cursor: pointer; font-family: inherit; color: var(--td-text);
-		background: var(--td-good-bg); border: 1px solid var(--td-border);
-		border-radius: 14px; padding: 11px 16px; margin-bottom: 18px;
-	}
-	.nudge:hover { border-color: var(--td-accent); }
-	.nudge-cta { font-size: 13px; font-weight: 600; color: var(--td-accent); white-space: nowrap; }
-
-	/* ── Chain rows ──
-	   One line per chain. This is the whole decluttering: a card per chain with
-	   its own icon buttons and a collapsible path turned eight setups into a
-	   page you scroll; eight lines is a page you scan. */
-	.rows { display: flex; flex-direction: column; gap: 9px; margin-bottom: 34px; }
-	.crow {
-		display: flex; align-items: center; gap: 16px; width: 100%; text-align: left;
-		cursor: pointer; background: var(--td-surface);
-		border: 1px solid var(--td-border); border-radius: 16px; padding: 13px 18px;
-		font-family: inherit; color: var(--td-text);
-		transition: border-color .16s ease, background .16s ease;
-	}
-	.crow:hover { border-color: var(--td-accent); background: var(--td-surface2); }
-	.crow.on { border-color: var(--td-accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--td-accent) 30%, transparent); }
-	@media (prefers-reduced-motion: reduce) { .crow { transition: none; } }
-	.cname { flex: 0 0 auto; width: 158px; min-width: 0; }
-	.cname-t {
-		font-weight: 600; font-size: 15px; display: flex; align-items: center; gap: 7px;
-		white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-	}
-	.cname-d { font-size: 12.5px; color: var(--td-muted-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-	.cpath { flex: 1; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
-	.cstep { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; white-space: nowrap; }
-	.dot { width: 9px; height: 9px; border-radius: 999px; flex: none; }
-	.arrow { color: var(--td-muted-3); font-size: 12px; }
-	.cnone { font-size: 13px; color: var(--td-muted-3); font-style: italic; }
-	.setups {
-		display: inline-flex; align-items: center; font-size: 11px; color: var(--td-muted-2);
-		background: var(--td-surface2); border: 1px solid var(--td-border);
-		border-radius: 999px; padding: 2px 9px; white-space: nowrap;
-	}
-
-	/* An indicator on the row, a switch in the drawer — see the markup note.
-	   Green rather than accent: accent is "this is selected", and a chain that
-	   publishes to other people is a state, not a selection. */
-	.shared-pill {
-		font-size: 11px;
-		font-weight: 600;
-		padding: 2px 8px;
-		border-radius: 999px;
-		background: var(--td-good-bg);
-		color: var(--td-good-fg);
-		white-space: nowrap;
-		flex: none;
-	}
-	.share-row {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		gap: 16px;
-		flex-wrap: wrap;
-		padding: 14px 16px;
-		margin-bottom: 20px;
-		border-radius: 16px;
-		background: var(--td-surface2);
-	}
-	.share-seg { flex: none; align-self: flex-start; }
-	.share-seg .seg-btn { font-size: 12.5px; }
-	.share-seg .seg-btn:disabled { opacity: .6; cursor: default; }
-	.cend { flex: 0 0 auto; display: flex; align-items: center; gap: 14px; }
 	/* — where a gear total came from —
 	   The figure is derived from listens across possibly several chains, so it
 	   reads as a claim. This turns it into an addition you can check. */
@@ -2213,28 +1338,8 @@
 		border-top: 1px solid var(--td-muted-3);
 	}
 
-	.chrs { font-variant-numeric: tabular-nums; font-weight: 600; font-size: 14px; white-space: nowrap; color: var(--td-good-fg); }
-	.chrs.zero { color: var(--td-muted-3); }
-	@media (max-width: 720px) {
-		.crow { flex-wrap: wrap; gap: 10px; }
-		.cname { flex: 1 1 100%; width: auto; }
-		.cpath { flex: 1 1 auto; }
-		/* Once the path wraps to its own line the hours follow it and land on
-		   the left, under the dots. Pushed back to the right so the column of
-		   running times reads down the page the way it does on a wide screen. */
-		.cend { margin-left: auto; }
-	}
-
 	/* ── The secondary panel ── */
 	.sechead { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
-	.seg { display: flex; gap: 4px; background: var(--td-sidebar); border-radius: 999px; padding: 4px; flex-wrap: wrap; }
-	.seg-btn {
-		white-space: nowrap; text-align: center; border: none; cursor: pointer;
-		font-family: inherit; font-size: 13.5px; padding: 9px 16px; border-radius: 999px;
-		background: transparent; color: var(--td-nav-fg); font-weight: 500;
-	}
-	.seg-btn.on { background: var(--td-accent); color: #fbf5ea; font-weight: 600; }
-	.sechint { margin: 0 0 14px; color: var(--td-muted); font-size: 13.5px; }
 	.sectable { border-radius: 20px; padding: 4px 20px 12px; margin-bottom: 18px; }
 	.secsub {
 		font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
@@ -2248,25 +1353,8 @@
 	.tablewrap { overflow-x: auto; }
 
 	.empty { border-radius: 20px; padding: 40px 28px; text-align: center; }
-	.empty.dashed { border-style: dashed; border-color: var(--td-muted-3); }
-	.empty-icon {
-		display: inline-flex; align-items: center; justify-content: center;
-		width: 52px; height: 52px; border-radius: 16px;
-		background: var(--td-surface2); color: var(--td-muted-2); margin-bottom: 14px;
-	}
 	.empty-t { font-family: 'Caprasimo', serif; font-size: 19px; margin-bottom: 6px; }
 	.empty p { margin: 0 auto 12px; max-width: 46ch; color: var(--td-muted); font-size: 13.5px; line-height: 1.55; }
-
-	.drow { display: flex; align-items: center; gap: 14px; padding: 12px 14px; border-radius: 14px; flex-wrap: wrap; }
-	.drow:hover { background: var(--td-surface2); }
-	.dicon {
-		width: 38px; height: 38px; flex: none; border-radius: 11px;
-		background: var(--td-surface2); border: 1px solid var(--td-border);
-		display: flex; align-items: center; justify-content: center; color: var(--td-muted);
-	}
-	.assign { width: auto; min-width: 170px; font-size: 13px; padding: 8px 12px; }
-	/* An unassigned row is the one thing on this tab worth looking at. */
-	.assign.needs { border-color: var(--td-accent); color: var(--td-accent); font-weight: 600; }
 
 	/* The gear tag. A select styled as a pill: same four choices as the design's
 	   popover, reachable from a keyboard, and no positioning code. */
@@ -2277,27 +1365,6 @@
 		font-size: 12px; font-family: inherit; cursor: pointer;
 	}
 	.tagsel.tagged { font-weight: 600; }
-
-	/* ── The node as a control ──
-	   A step is a button now, so it has to stop looking like one: no chrome
-	   until it is pointed at, since a column of framed buttons would undo the
-	   thing v0.62.0 was for. `text-align:left` because a button centres its
-	   content and the path reads as a list. */
-	.pstep {
-		border: none;
-		background: transparent;
-		font: inherit;
-		color: inherit;
-		text-align: left;
-		padding: 0 8px 10px;
-		margin: 0 0 0 -8px;
-		border-radius: 10px;
-		min-width: 0;
-		cursor: pointer;
-		display: block;
-		width: 100%;
-	}
-	.pstep:hover, .pstep:focus-visible { background: var(--td-surface2); }
 	/* Svelte scopes styles per component, so this is repeated here rather than
 	   inherited from the four other pages that use it — matching them exactly
 	   matters more than deduplicating, and a class defined nowhere renders as a
@@ -2314,145 +1381,6 @@
 	.linkish:hover { color: var(--td-accent-hi); }
 	.cwhen { display: flex; align-items: center; gap: 8px; margin: -2px 0 4px 176px; }
 	@media (max-width: 560px) { .cwhen { margin-left: 0; } }
-	.psince { font-size: 12px; color: var(--td-muted-2); font-style: italic; margin-top: 1px; }
-	.pswap {
-		font-size: 10.5px;
-		letter-spacing: .1em;
-		text-transform: uppercase;
-		color: var(--td-muted-3);
-		opacity: 0;
-		transition: opacity .12s;
-	}
-	.pstep:hover .pswap, .pstep:focus-visible .pswap { opacity: 1; }
-	@media (prefers-reduced-motion: reduce) { .pswap { transition: none; } }
-
-	/* ── The two meanings of a swap ── */
-	.vmode { display: flex; gap: 8px; flex-wrap: wrap; }
-	.vmode-btn {
-		flex: 1 1 200px;
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
-		text-align: left;
-		padding: 10px 12px;
-		border-radius: 12px;
-		border: 1px solid var(--td-border);
-		background: var(--td-surface2);
-		color: inherit;
-		font: inherit;
-		cursor: pointer;
-	}
-	.vmode-btn.on { border-color: var(--td-accent); background: color-mix(in srgb, var(--td-accent) 10%, transparent); }
-	.vmode-t { font-size: 13.5px; font-weight: 600; }
-	.vmode-s { font-size: 11.5px; color: var(--td-muted-2); }
-
-	/* ── The setups overview ── */
-	.ov-intro { font-size: 13px; color: var(--td-muted); margin: 0 0 16px; max-width: 66ch; text-wrap: pretty; }
-	/* Wide content scrolls inside its own box; the page body never does.
-	   `min-width:0` in both places is the load-bearing half and it is not
-	   obvious: a grid column floor of 150px makes the grid's min-content wider
-	   than the dialog, that contribution propagates up through the block to the
-	   flex item, and a flex item's default `min-width:auto` refuses to shrink
-	   below it — so `width:min(980px,100%)` was quietly losing and the dialog
-	   grew past the viewport instead of scrolling inside itself. Found by
-	   opening it, not by any check. */
-	.dialog.ov { min-width: 0; }
-	/* One row height for both columns, which is what keeps the names lined up
-	   with the setups they name. Deriving it from the content instead would put
-	   the two columns in separate formatting contexts and let them drift the
-	   moment a gear name wrapped. */
-	.ov-wrap { display: flex; gap: 12px; --ov-row: 64px; }
-	.ov-labels { flex: none; width: 150px; display: flex; flex-direction: column; gap: 10px; }
-	.ov-scroll { overflow-x: auto; min-width: 0; flex: 1; padding-bottom: 4px; }
-	.ov-grid { display: grid; gap: 10px; }
-	.ov-side {
-		height: var(--ov-row);
-		display: flex;
-		flex-direction: column;
-		justify-content: center;
-		min-width: 0;
-	}
-	/* Clamped rather than allowed to wrap freely: the row height is fixed, so a
-	   long name would otherwise be cut off mid-letter with nothing to say so. */
-	.ov-name { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; line-clamp: 2; -webkit-box-orient: vertical; }
-	.ov-std .ov-name { font-family: 'Caprasimo', serif; font-weight: 400; }
-	.ov-sub { font-size: 12px; color: var(--td-muted-2); font-variant-numeric: tabular-nums; }
-	.ov-cell { height: var(--ov-row); display: flex; align-items: center; min-width: 0; }
-	.ov-node {
-		display: flex;
-		flex-direction: column;
-		justify-content: center;
-		gap: 1px;
-		width: 100%;
-		height: 100%;
-		min-width: 0;
-		padding: 0 11px;
-		border-radius: 12px;
-		border: 1px solid var(--td-border);
-		border-left-width: 3px;
-		background: var(--td-surface2);
-	}
-	.ov-swap { border-color: var(--td-accent); background: color-mix(in srgb, var(--td-accent) 9%, transparent); }
-	.ov-dot { width: 7px; height: 7px; border-radius: 50%; }
-	.ov-role { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--td-muted-3); }
-	.ov-label { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-	/* Passed through: the line the signal takes when this row changes nothing
-	   here. Deliberately not a repeat of the standard's node — the row would
-	   then read as a whole second chain. */
-	.ov-thru { width: 100%; height: 2px; border-radius: 2px; background: var(--td-muted-3); opacity: .3; }
-	.ov-none { font-size: 12px; color: var(--td-muted-3); font-style: italic; }
-
-	/* ── Chain drawer ── */
-	.drawer-back {
-		position: fixed; inset: 0; z-index: 80;
-		background: rgba(27, 23, 18, .42); backdrop-filter: blur(2px);
-		animation: td-fade-in .2s ease;
-	}
-	.drawer {
-		position: fixed; top: 0; right: 0; z-index: 81;
-		width: min(440px, 100%); height: 100vh;
-		background: var(--td-surface); border-left: 1px solid var(--td-border);
-		box-shadow: -14px 0 44px rgba(46, 43, 37, .22);
-		display: flex; flex-direction: column;
-		animation: td-slide-in .28s cubic-bezier(.4, 0, .2, 1);
-	}
-	@media (prefers-reduced-motion: reduce) {
-		.drawer, .drawer-back { animation: none; }
-	}
-	.drawer-head {
-		display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
-		padding: 22px 22px 16px; border-bottom: 1px solid var(--td-border);
-	}
-	.drawer-body { flex: 1; overflow-y: auto; padding: 20px 22px; }
-	.drawer-foot {
-		display: flex; align-items: center; justify-content: space-between; gap: 10px;
-		padding: 14px 22px; border-top: 1px solid var(--td-border); flex-wrap: wrap;
-	}
-	.drawer-label {
-		font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
-		color: var(--td-muted-3); margin-bottom: 11px;
-	}
-	.hours-pill {
-		display: inline-flex; align-items: center; gap: 8px; font-size: 13px;
-		color: var(--td-good-fg); background: var(--td-good-bg);
-		border-radius: 999px; padding: 5px 13px;
-	}
-	.pdot { width: 14px; height: 14px; border-radius: 999px; flex: none; margin-top: 3px; }
-	/* Not `--td-border`, which the design used: at 8–12% alpha a 2px rule is
-	   invisible, and the vertical path is the main thing in this drawer. This is
-	   a line you are meant to see, so it is the hairline the shelf's dividers
-	   are, not the almost-nothing a panel edge is. */
-	.pconn {
-		width: 2px; flex: 1; min-height: 22px; margin: 3px 0;
-		background: color-mix(in srgb, var(--td-muted-3) 55%, transparent);
-	}
-	.prole { font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase; color: var(--td-muted-3); }
-	.vrow {
-		display: flex; align-items: center; justify-content: space-between; gap: 10px;
-		background: var(--td-surface2); border: 1px solid var(--td-border);
-		border-radius: 12px; padding: 7px 8px 7px 14px; margin-bottom: 7px;
-	}
-	.arow { display: flex; align-items: center; gap: 10px; padding: 7px 2px; }
 
 	/* ── Shared bits ── */
 	/* A grid of toggles rather than a dropdown: a glyph is quicker to recognise
@@ -2478,13 +1406,6 @@
 
 	.spin { animation: td-spin 0.7s linear infinite; }
 
-	.vadd {
-		background: none; border: 1px dashed var(--td-border); border-radius: 999px;
-		padding: 4px 12px; font-size: 12.5px; color: var(--td-muted); cursor: pointer;
-		font-family: inherit;
-	}
-	.vadd:hover { border-color: var(--td-accent); color: var(--td-text); }
-
 	.icon-btn {
 		border: none; background: transparent; cursor: pointer; color: var(--td-muted-2);
 		width: 30px; height: 30px; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center;
@@ -2495,21 +1416,28 @@
 		background: color-mix(in srgb, var(--td-accent) 12%, transparent);
 	}
 
-	/* Rooms you sit in — the chain an accepted Shared Spool play lands on. */
-	.spoolchain {
-		display: flex;
-		align-items: center;
-		gap: 14px;
-		flex-wrap: wrap;
-		padding: 14px 16px;
-		margin-bottom: 16px;
-		background: var(--td-surface2);
-		border: 1px solid var(--td-border);
-		border-radius: 14px;
+	/* ── The chain list and the graph, side by side ──
+	   The list keeps a reading width; the graph takes the rest and drops under
+	   the list on a narrow screen rather than shrinking past legibility. */
+	.wired { display: flex; flex-wrap: wrap; gap: 20px; align-items: flex-start; margin: 4px 0 16px; }
+	.wlist { flex: 1 1 260px; max-width: 320px; }
+	.wgraph { flex: 999 1 560px; min-width: 0; border-radius: 22px; padding: 18px 18px 14px; }
+	.whead { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 0 4px 12px; }
+	.wsub { font-size: 13px; color: var(--td-muted); margin: 3px 0 0; }
+	.wswap { padding: 0 6px; border-radius: 999px; border: 1px dashed var(--td-muted-3); }
+	.wsel {
+		display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+		padding: 14px 6px 2px; border-top: 1px solid var(--td-border); margin-top: 12px;
 	}
-	.sc-main { flex: 1; min-width: 240px; }
-	.sc-title { font-weight: 600; font-size: 14px; }
-	.sc-sub { font-size: 12.5px; color: var(--td-muted); margin-top: 2px; line-height: 1.45; }
-	.sc-pick { width: auto; min-width: 160px; }
+	@media (max-width: 720px) {
+		.wlist { max-width: none; }
+	}
 
+	/* ── The inbox at the top ── */
+	.inbox-top { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+	.inbox-all { align-self: flex-end; }
+	.inbox-done {
+		margin-bottom: 12px; padding: 10px 14px; border-radius: 14px;
+		background: var(--td-good-bg); color: var(--td-good-fg); font-size: 13.5px;
+	}
 </style>

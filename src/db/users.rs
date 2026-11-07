@@ -330,10 +330,26 @@ impl Database {
             // failed on the foreign key.
             "sessions",
             "tokens",
-            "signal_chains",
-            "devices",
-            "equipment",
+            // Everything below that names a chain or a setup clears before
+            // `chain_variants` and `signal_chains`. Until 2026-11-06 the
+            // variants were never cleared at all, and bindings, devices and
+            // pairing requests came after the chains, so deleting anyone with a
+            // setup, a mapped output, a machine with a default chain or a
+            // pairing in flight failed on the foreign key.
+            "pairing_requests",
             "chain_bindings",
+            "device_bindings",
+            "chain_inbox_dismissed",
+            // Slot-pick history names a chain and a variant.
+            "chain_fittings",
+            "devices",
+            // A room's link rows point at a chain and a room, so they clear
+            // before both; the rooms point at nothing else.
+            "chain_rooms",
+            "rooms",
+            "chain_variants",
+            "signal_chains",
+            "equipment",
             "import_jobs",
             "web_sessions",
             "user_connections",
@@ -633,7 +649,7 @@ impl Database {
     pub async fn list_tokens(&self, user_id: i64) -> Result<Vec<TokenRecord>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
             "SELECT t.id, t.name, t.scopes, t.created_at, t.last_used_at, t.default_chain_id,
-                    t.imports_are_live, c.name AS default_chain_name
+                    t.imports_are_live, c.name AS default_chain_name, t.equipment_id
              FROM tokens t LEFT JOIN signal_chains c ON c.id = t.default_chain_id
              WHERE t.user_id = ? ORDER BY t.created_at ASC",
         ))

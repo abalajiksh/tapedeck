@@ -365,7 +365,8 @@ heard, and its share of that artist's listening.",
                 "How they listen: each chain is an ordered path of equipment, with the hours \
 logged through it derived from the listens attributed to it. Variants are one chain with a \
 step swapped — two cartridges on one turntable, a different pair of IEMs — and carry their \
-own hours.",
+own hours. `rooms` says where chains live (a chain may be in several; \"On the go\" is built in), \
+and `last_used` is each chain's newest listen.",
             scope: scopes::LIBRARY_READ,
             read_only: true,
             schema: no_args(),
@@ -892,8 +893,17 @@ pub async fn call(
         }
 
         "signal_chains" => {
-            handler_json(crate::server::chains::list_chains(st(), read()).await.into_response())
-                .await?
+            let mut out = handler_json(
+                crate::server::chains::list_chains(st(), read()).await.into_response(),
+            )
+            .await?;
+            // Rooms beside the chains, so "what do I use in the car?" is one
+            // call. A chain may be in several rooms.
+            let rooms =
+                handler_json(crate::server::chains::list_rooms(st(), read()).await.into_response())
+                    .await?;
+            out["rooms"] = rooms["rooms"].clone();
+            out
         }
 
         "equipment" => {

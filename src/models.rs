@@ -619,6 +619,21 @@ pub struct ChainComponent {
     // date is usually a few days before anybody got round to recording it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<i64>,
+    /// The gear that can be on at this step, as equipment ids, the gear the
+    /// step is wired with first. **Two or more makes the step a slot**: "what's
+    /// on now" picks one, and every listen from then on is filed with that
+    /// pick. Omitted when the step is not a slot.
+    ///
+    /// On save, **omitted keeps the options the step already had**; send `[]`
+    /// to stop it being a slot. Ids that are not your gear are dropped.
+    // Carried over on omission because the route editor predates slots and
+    // round-trips steps it did not build; losing a slot to a rename would
+    // re-file nothing but would hide every option's hours from the picker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<i64>>,
+    /// What the slot is called on screen ("On the go"), when it has a name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_name: Option<String>,
 }
 
 /// One step of a chain, replaced.
@@ -895,6 +910,8 @@ mod tests {
             detail: None,
             since: None,
             equipment_id: gear,
+            options: None,
+            slot_name: None,
         }
     }
 
@@ -1222,6 +1239,8 @@ pub fn resolve_variant(
                     // gear it would assert a date that box was never there.
                     since: if o.equipment_id == c.equipment_id { c.since } else { None },
                     equipment_id: o.equipment_id,
+                    options: None,
+                    slot_name: None,
                 });
             }
             None => out.push(c.clone()),
@@ -1247,6 +1266,8 @@ pub fn resolve_variant(
             // variant, so there is nothing for a date to add here.
             since: None,
             equipment_id: o.equipment_id,
+            options: None,
+            slot_name: None,
         });
     }
 
@@ -1304,6 +1325,8 @@ mod variant_promotion_tests {
             detail: None,
             since: None,
             equipment_id: id,
+            options: None,
+            slot_name: None,
         }
     }
 

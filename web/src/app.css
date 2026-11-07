@@ -19,6 +19,10 @@
   --td-border:rgba(32,30,29,.08); --td-topbar:rgba(245,234,216,.92);
   /* accents are theme-independent */
   --td-accent:#c67139; --td-accent-hi:#e07a55; --td-accent-2:#7a8a5e;
+  /* Text and glyphs on the accent: the cream `.btn-primary` has always used,
+     named so new components stop repeating the hex. Theme-independent, like
+     the accent under it. */
+  --td-on-accent:#fbf5ea;
 }
 :root[data-theme="dark"] {
   --td-bg:#17120e; --td-surface:#221b15; --td-sidebar:#1c1611; --td-surface2:#2b2219;
@@ -272,4 +276,27 @@
   margin-top: 5px;
   font-size: 11.5px;
   color: var(--td-muted-3);
+}
+
+/* ── Svelte Flow (the Signal Chains graph) ──
+   Its own palette mapped onto ours once, here, so both themes follow the
+   tokens above. `.svelte-flow` beats the library's `:root` defaults by being
+   on the element itself, and it is loaded after them on the chains route. */
+.svelte-flow {
+  --xy-background-color: var(--td-bg);
+  --xy-background-pattern-color: var(--td-border);
+  --xy-node-background-color: var(--td-surface);
+  --xy-node-border: 1.5px solid var(--td-border);
+  --xy-node-border-radius: 18px;
+  --xy-node-color: var(--td-text);
+  --xy-edge-stroke: var(--td-track);
+  --xy-edge-stroke-selected: var(--td-accent);
+  --xy-handle-background-color: var(--td-surface);
+  --xy-handle-border-color: var(--td-track);
+  --xy-minimap-background-color: var(--td-surface);
+  --xy-controls-button-background-color: var(--td-surface);
+  --xy-controls-button-background-color-hover: var(--td-surface2);
+  --xy-controls-button-color: var(--td-muted);
+  --xy-controls-button-color-hover: var(--td-text);
+  --xy-controls-button-border-color: var(--td-border);
 }

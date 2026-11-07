@@ -131,7 +131,7 @@ impl Database {
     }
     pub async fn list_variants(&self, user_id: i64) -> Result<Vec<ChainVariant>, sqlx::Error> {
         sqlx::query_as::<_, ChainVariantRow>(&crate::sql!(
-            "SELECT v.id, v.user_id, v.chain_id, v.name, v.overrides, v.created_at,
+            "SELECT v.id, v.user_id, v.chain_id, v.name, v.overrides, v.created_at, v.auto,
                     CAST(COALESCE((
                         SELECT SUM(sc.duration) FROM scrobbles sc
                          WHERE sc.user_id = v.user_id AND sc.chain_variant_id = v.id
@@ -209,7 +209,13 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         // An output mapped to this setup keeps its chain and falls back to the
         // chain as wired, like the listens.
-        for table in ["scrobbles", "physical_plays", "physical_releases", "chain_bindings"] {
+        for table in [
+            "scrobbles",
+            "physical_plays",
+            "physical_releases",
+            "chain_bindings",
+            "device_bindings",
+        ] {
             sqlx::query(&crate::sql!(&format!(
                 "UPDATE {table} SET chain_variant_id = NULL
                   WHERE chain_variant_id = ? AND user_id = ?"
@@ -219,6 +225,14 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
+        // A stretch of history fitted with it reads as the chain as wired.
+        sqlx::query(&crate::sql!(
+            "UPDATE chain_fittings SET variant_id = NULL WHERE variant_id = ? AND user_id = ?"
+        ))
+        .bind(id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
         let res =
             sqlx::query(&crate::sql!("DELETE FROM chain_variants WHERE user_id = ? AND id = ?"))
                 .bind(user_id)
@@ -420,6 +434,18 @@ impl Database {
             .await?;
             *slot = res.rows_affected();
         }
+        // Outputs learned per box move the same way, counted with the others.
+        out.bindings += sqlx::query(&crate::sql!(
+            "UPDATE device_bindings SET chain_id = ?, chain_variant_id = ?
+              WHERE chain_id = ? AND user_id = ?"
+        ))
+        .bind(into_chain_id)
+        .bind(variant_id)
+        .bind(from_chain_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
 
         // Everything that names a chain and has no variant slot. A session's
         // variant is read off its listens, which have just moved.
@@ -453,6 +479,34 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
+
+        // The folded chain's rooms become the kept chain's too: it was the same
+        // rig, so wherever either of them lived, the one left lives there now.
+        sqlx::query(&crate::sql!(
+            "INSERT INTO chain_rooms (user_id, chain_id, room_id)
+             SELECT user_id, ?, room_id FROM chain_rooms
+              WHERE chain_id = ? AND user_id = ?
+                AND room_id NOT IN (SELECT room_id FROM chain_rooms WHERE chain_id = ?)"
+        ))
+        .bind(into_chain_id)
+        .bind(from_chain_id)
+        .bind(user_id)
+        .bind(into_chain_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(&crate::sql!("DELETE FROM chain_rooms WHERE chain_id = ? AND user_id = ?"))
+            .bind(from_chain_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        // Its picks history described a chain that is now one option of
+        // another; every listen it covered has just been filed with that
+        // option, so there is nothing left for it to say.
+        sqlx::query(&crate::sql!("DELETE FROM chain_fittings WHERE chain_id = ? AND user_id = ?"))
+            .bind(from_chain_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
 
         sqlx::query(&crate::sql!("DELETE FROM signal_chains WHERE id = ? AND user_id = ?"))
             .bind(from_chain_id)
@@ -800,7 +854,7 @@ impl Database {
         let mut rows: Vec<EquipmentRow> = sqlx::query_as(&crate::sql!(
             "SELECT e.id, e.user_id, e.name, e.type, e.brand, e.model,
                     0.0 AS total_hours,
-                    e.first_used, e.last_used, e.notes, e.purchased_at, e.status
+                    e.first_used, e.last_used, e.notes, e.purchased_at, e.status, e.aliases
                FROM equipment e
               WHERE e.user_id = ?"
         ))
@@ -825,7 +879,29 @@ impl Database {
                 .into_iter()
                 .collect();
 
+        // Who reports from each box: devices by their name (or product, or
+        // machine id) and tokens by theirs.
+        let mut reporters: Vec<(i64, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT equipment_id, COALESCE(name, product, machine_id) FROM devices
+              WHERE user_id = ? AND equipment_id IS NOT NULL"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        reporters.extend(
+            sqlx::query_as::<_, (i64, String)>(&crate::sql!(
+                "SELECT equipment_id, name FROM tokens WHERE user_id = ? AND equipment_id IS NOT NULL"
+            ))
+            .bind(user_id)
+            .fetch_all(&self.pool)
+            .await?,
+        );
+
         for r in &mut rows {
+            r.aliases = crate::db::parse_aliases(r.aliases_raw.as_deref());
+            r.reporters =
+                reporters.iter().filter(|(eq, _)| *eq == r.id).map(|(_, n)| n.clone()).collect();
+            r.reporters.sort();
             r.total_hours = seconds.get(&r.id).copied().unwrap_or(0) as f64 / 3600.0;
             let mut sources: Vec<GearHours> = split
                 .iter()
@@ -892,11 +968,31 @@ impl Database {
         Ok(res.rows_affected() > 0)
     }
     pub async fn delete_equipment(&self, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Reporters tied to this box come loose, and the outputs learned from
+        // it go with it: they described this box and no other.
+        for table in ["devices", "tokens"] {
+            sqlx::query(&crate::sql!(&format!(
+                "UPDATE {table} SET equipment_id = NULL WHERE equipment_id = ? AND user_id = ?"
+            )))
+            .bind(id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        sqlx::query(&crate::sql!(
+            "DELETE FROM device_bindings WHERE equipment_id = ? AND user_id = ?"
+        ))
+        .bind(id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
         let res = sqlx::query(&crate::sql!("DELETE FROM equipment WHERE id = ? AND user_id = ?"))
             .bind(id)
             .bind(user_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
     pub async fn assign_session(

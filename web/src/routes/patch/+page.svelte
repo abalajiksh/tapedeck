@@ -24,14 +24,15 @@
 		HandedSitting,
 		HandedSittingDetail,
 		SignalChain,
-		LiveDeck
+		LiveDeck,
+		SharedFormat
 	} from '$lib/api';
 	import CoverArt from '$lib/components/CoverArt.svelte';
-	import ChainIcon from '$lib/components/ChainIcon.svelte';
 	import ToTop from '$lib/components/ToTop.svelte';
 	import AddToSitting from '$lib/components/AddToSitting.svelte';
 	import { goto } from '$app/navigation';
 	import { syncUrl } from '$lib/url';
+	import PatchGlossary from '$lib/components/PatchGlossary.svelte';
 	import { openArtist } from '$lib/entities';
 	import { lovedKeys, isLovedNamed, toggleLoveByName, loadLoves } from '$lib/loves';
 
@@ -46,7 +47,7 @@
 	// more, since an overlay scrollbar shows nothing until you touch it.
 	const CAPTURE_PREVIEW = 7;
 
-	type Tab = 'reel' | 'artists' | 'decks' | 'sittings' | 'discover' | 'instance' | 'inbox';
+	type Tab = 'reel' | 'artists' | 'decks' | 'sittings' | 'discover' | 'instance' | 'inbox' | 'glossary';
 	let tab: Tab = 'reel';
 	const TABS: Tab[] = [
 		'reel',
@@ -55,7 +56,8 @@
 		'sittings',
 		'discover',
 		'instance',
-		'inbox'
+		'inbox',
+		'glossary'
 	];
 	const TAB_LABELS: Record<Tab, string> = {
 		reel: 'The Reel',
@@ -64,7 +66,8 @@
 		sittings: 'Sittings',
 		discover: 'Discover',
 		instance: 'Instance',
-		inbox: 'Inbox'
+		inbox: 'Inbox',
+		glossary: 'Glossary'
 	};
 
 	let decks: PatchPeer[] = [];
@@ -1214,14 +1217,6 @@
 		}
 	}
 
-	function steps(l: ReelListen): { name: string; type: string }[] {
-		try {
-			return JSON.parse(l.chain_components ?? '[]');
-		} catch {
-			return [];
-		}
-	}
-
 	const ROLE_COLOURS: Record<string, string> = {
 		source: 'var(--td-accent)',
 		dac: 'var(--td-accent-2)',
@@ -1245,21 +1240,30 @@
 		return l.duration ? `${head} / ${clockOf(l.duration)}` : head;
 	}
 
-	function liveBadge(l: LiveDeck): string {
-		if (l.format_type === 'dsd') return 'DSD';
-		if (l.is_lossless && l.sample_rate && l.bit_depth)
-			return `${(l.codec ?? 'FLAC').toUpperCase()} ${l.bit_depth}/${Math.round(l.sample_rate / 1000)}`;
-		if (l.is_lossless) return (l.codec ?? 'Lossless').toUpperCase();
-		return '';
+	/** What a shared chain hands over: the format a listen arrived in, and what
+	 *  it was delivered as when that differs. Never the chain. Empty when the
+	 *  chain is private, absent, or the source reported nothing. */
+	function formatBadge(f: SharedFormat): string {
+		let base = '';
+		if (f.format_type === 'dsd') base = 'DSD';
+		else if (f.is_lossless && f.sample_rate && f.bit_depth)
+			base = `${(f.codec ?? 'FLAC').toUpperCase()} ${f.bit_depth}/${Math.round(f.sample_rate / 1000)}`;
+		else if (f.is_lossless) base = (f.codec ?? 'Lossless').toUpperCase();
+		else if (f.bitrate) base = `${(f.codec ?? 'MP3').toUpperCase()} ${f.bitrate}`;
+		else if (f.codec) base = f.codec.toUpperCase();
+		const out = f.delivery_codec
+			? `${f.delivery_codec.toUpperCase()}${f.delivery_bitrate ? ` ${f.delivery_bitrate}` : ''}`
+			: f.dsd_to_pcm_converted
+				? 'PCM'
+				: '';
+		if (base && out) return `${base} → ${out}`;
+		return base || (out ? `→ ${out}` : '');
 	}
 
-	function badge(l: ReelListen) {
-		if (l.format_type === 'dsd') return 'DSD';
-		if (l.is_lossless && l.sample_rate && l.bit_depth)
-			return `${(l.codec ?? 'FLAC').toUpperCase()} ${l.bit_depth}/${Math.round(l.sample_rate / 1000)}`;
-		if (l.is_lossless) return (l.codec ?? 'Lossless').toUpperCase();
-		if (l.bitrate) return `${(l.codec ?? 'MP3').toUpperCase()} ${l.bitrate}`;
-		return '';
+	function formatTitle(f: SharedFormat): string | undefined {
+		if (f.transcode_reason) return `Transcoded: ${f.transcode_reason}`;
+		if (f.is_transcoded) return 'Transcoded on the way';
+		return undefined;
 	}
 </script>
 
@@ -1268,7 +1272,10 @@
 <div class="head">
 	<div>
 		<h1 class="h-display">Patch</h1>
-		<p class="sub">Patch into another deck and hear what it's running.</p>
+		<p class="sub">
+			Patch into another deck and hear what it's running.
+			<button class="linkish" on:click={() => go('glossary')}>What the words mean</button>
+		</p>
 	</div>
 	<div class="headright">
 		<div class="whoami">
@@ -1479,16 +1486,9 @@
 						<div style="width:{l.duration ? Math.min(100, (livePos(l, livesSec) / l.duration) * 100) : 0}%"></div>
 					</div>
 					<div class="livefoot">
-						<!-- Named when they share it; "Private signal chain" when they
-						     do not; nothing at all when the listen ran through no chain
-						     anybody recorded. Three states, because collapsing the last
-						     two would claim a chain exists where none does. -->
-						{#if l.chain_name}
-							<span class="tag">{l.chain_name}</span>
-						{:else if l.has_chain}
-							<span class="privtag">Private signal chain</span>
-						{/if}
-						{#if liveBadge(l)}<span class="tag">{liveBadge(l)}</span>{/if}
+						<!-- The format, when they share the chain. The chain itself is
+						     never named: private by design, shared or not. -->
+						{#if formatBadge(l)}<span class="tag" title={formatTitle(l)}>{formatBadge(l)}</span>{/if}
 						<!-- Built in one expression rather than with an inline
 						     `{#if}`: Svelte trims the whitespace around a block, so
 						     the separator came out as "3:16/ 5:48". An estimate is
@@ -1567,7 +1567,7 @@
 					class="input"
 					bind:value={reelQ}
 					on:input={onReelQ}
-					placeholder="Search track, artist, chain or deck"
+					placeholder="Search track, artist, album or deck"
 					aria-label="Search the Reel"
 				/>
 			</div>
@@ -1625,24 +1625,9 @@
 									<div class="lsub">
 										<a class="lwho" href="/users/{l.username}">{l.display_name || l.username}</a>
 										{#if handleOf(l)}<span class="rhandle">{handleOf(l)}</span>{/if}
-										{#if l.chain_name}
-											<span class="lchain">
-												<ChainIcon name={l.chain_icon} size={13} title={l.chain_name} />
-												{l.chain_name}
-											</span>
-										{:else if l.has_chain}
-											<span class="lchain privchain" title="They keep this chain private">
-												Private signal chain
-											</span>
-										{/if}
 									</div>
 								</div>
-								<div class="ldots" title={steps(l).map((x) => x.name).join(' → ')}>
-									{#each steps(l).slice(0, 4) as st}
-										<span class="dot" style="background:{roleColour(st.type)};"></span>
-									{/each}
-								</div>
-								{#if badge(l)}<span class="tag">{badge(l)}</span>{/if}
+								{#if formatBadge(l)}<span class="tag" title={formatTitle(l)}>{formatBadge(l)}</span>{/if}
 								<span class="lago">{ago(l.timestamp)}</span>
 								<!--
 									Loving somebody else's listen loves the *track*, into
@@ -1699,9 +1684,9 @@
 
 	<p class="footnote">
 		A listen reaches the Reel when its owner has an accepted patch with you and has either
-		opened their deck to the decks they let in, or played it through a chain they share. The
-		chain is named only where it is shared — everything else reads
-		<em>Private signal chain</em>. <button class="linkish" on:click={() => go('decks')}
+		opened their deck to the decks they let in, or played it through a chain they share. A
+		shared chain adds the format the listen arrived in; nobody's chain is ever named here.
+		<button class="linkish" on:click={() => go('decks')}
 		>Choose what your own deck publishes</button>.
 	</p>
 {:else if tab === 'artists'}
@@ -1972,13 +1957,6 @@
 					<div class="esub">Nothing with a known length has played in this window.</div>
 				{/if}
 
-				<h3 class="h-display" style="font-size:18px;margin:22px 0 4px;">Most-shared chains</h3>
-				<p class="esub" style="margin-bottom:14px;">By listens, not by hours.</p>
-				<div class="chips">
-					{#each pulse.chains as c}<span class="chip neutral">{c.name} · {c.plays}</span>{:else}
-						<span class="esub">No shared chains yet.</span>
-					{/each}
-				</div>
 			</div>
 		</div>
 
@@ -2018,6 +1996,8 @@
 	{:else}
 		<div class="panel note">Loading…</div>
 	{/if}
+{:else if tab === 'glossary'}
+	<PatchGlossary />
 {:else if tab === 'decks'}
 	<!--
 		What your deck publishes. **One state, two places**: this and the drawer
@@ -2061,8 +2041,8 @@
 					{#if myShareAll === null}
 						…
 					{:else if myShareAll}
-						See everything you play. A chain you keep private is still never
-						<em>named</em> to them — it reads "Private signal chain".
+						See everything you play. No chain is ever named to them; a chain you
+						share below adds the format each listen arrived in.
 					{:else}
 						See a listen only when it ran through a chain you share below. Anything
 						else — a private chain, or no chain at all — is invisible to them.
@@ -2088,8 +2068,10 @@
 		</div>
 
 		<p class="esub" style="margin:14px 0 10px;max-width:60ch;">
-			Below is per chain, off by default, and it decides three more things whatever the
-			switch above says: whether the chain is <em>named</em>, whether these listens reach
+			Below is per chain, off by default. Sharing a chain never names it, its gear or its
+			hours to anybody: it shares the <em>format</em> of what ran through it (codec, rate,
+			depth, and what it was transcoded to). It also decides, whatever the switch above
+			says, whether these listens reach
 			the <button class="linkish" on:click={() => go('instance')}>Instance</button> figures
 			and Discover — where there is no patch behind the number — and whether a Shared Spool
 			may capture a play into somebody else's history. The same switch sits in each chain's
@@ -2567,7 +2549,7 @@
 									<div class="sltitle">{l.title}</div>
 									<div class="slsub">
 										{l.artist}{l.album ? ` — ${l.album}` : ''}
-										{#if l.chain_name}<span class="slchain">{l.chain_name}</span>{/if}
+										{#if formatBadge(l)}<span class="slchain" title={formatTitle(l)}>{formatBadge(l)}</span>{/if}
 									</div>
 								</div>
 								<span class="sltime">
@@ -2805,49 +2787,6 @@
 	.lartist { font-size: 12.5px; color: var(--td-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 	.lsub { display: flex; align-items: center; gap: 10px; margin-top: 2px; min-width: 0; }
 	.lwho { font-size: 12.5px; color: var(--td-muted-2); white-space: nowrap; }
-	.lchain {
-		display: inline-flex;
-		align-items: center;
-		gap: 5px;
-		font-size: 12px;
-		color: var(--td-muted-3);
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
-	}
-	/* A chain its owner keeps private. Dashed, italic and muted — the idiom
-	   this codebase already uses for "shown to you, but not yours", the same
-	   treatment the unowned genre neighbours carry. It must not read as a chain
-	   actually *called* "Private signal chain", which a plain tag would. */
-	/* Deliberately **not** `.tag`. `app.css` re-colours `.tag` per theme
-	   (`:root[data-theme="dark"] .tag { color: var(--td-text) }`) at a
-	   specificity a scoped class cannot beat, so the marker came out in
-	   full-strength text in dark mode and read like a chain actually *called*
-	   "Private signal chain". Its own class owes nothing to that cascade.
-	   Caught by reading the computed colour in both themes, not by any check. */
-	.privtag {
-		display: inline-flex;
-		align-items: center;
-		font-size: 11px;
-		letter-spacing: .02em;
-		padding: 3px 10px;
-		border-radius: 12px;
-		white-space: nowrap;
-		font-style: italic;
-		color: var(--td-muted-3);
-		border: 1px dashed var(--td-border);
-		background: none;
-	}
-	/* The Reel row's own chain line already sets the layout and a muted tone;
-	   this only says "withheld". */
-	.privchain {
-		font-style: italic;
-		color: var(--td-muted-3);
-		border: 1px dashed var(--td-border);
-		border-radius: 10px;
-		padding: 1px 7px;
-		background: none;
-	}
 	.ldots { display: flex; gap: 3.5px; flex: none; }
 	.dot { width: 7px; height: 7px; border-radius: 999px; display: block; }
 	.lago {
@@ -3600,7 +3539,6 @@
 		background: var(--td-good-bg);
 		color: var(--td-good-fg);
 	}
-	.chip.neutral { background: var(--td-surface2); color: var(--td-muted); }
 	.remote {
 		background: var(--td-surface2);
 		border: 1px dashed color-mix(in srgb, var(--td-accent) 36%, transparent);

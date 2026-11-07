@@ -212,20 +212,19 @@ pub struct HandedSitting {
     pub ended_at: Option<i64>,
 }
 
-/// Whether a patched deck may see a listen, and whether it may be told what it
-/// ran through.
+/// Whether a patched deck may see a listen, and whether its format goes with
+/// it.
 ///
 /// Two answers rather than one because since 2026-08-26 they can differ: a deck
-/// that has opened up shows every listen, and names the chain only on the ones
-/// whose chain it shares.
+/// that has opened up shows every listen, and shows its format only on the
+/// ones whose chain it shares.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Visible {
     /// Not shown at all.
     No,
-    /// Shown. `Some(name)` when the chain may be named, `None` when it may not
-    /// — which the screen renders as "Private signal chain" rather than as a
-    /// hole.
-    Yes(Option<String>),
+    /// Shown. `true` when the chain is shared, so the listen's format and
+    /// transcode details may go with it; the chain itself is never named.
+    Yes { format_shared: bool },
 }
 
 /// One sitting **you** passed on, for the sender's own list.
@@ -264,7 +263,10 @@ pub struct HandedListen {
     pub artwork_url: Option<String>,
     pub caa_id: Option<i64>,
     pub caa_release_mbid: Option<String>,
-    pub chain_name: Option<String>,
+    /// Format and transcode details, **only when the chain is shared**.
+    #[sqlx(flatten)]
+    #[serde(flatten)]
+    pub format: SharedFormat,
 }
 
 /// The document a hand-over renders to.
@@ -2142,15 +2144,36 @@ impl Database {
         WHERE p.follower_user_id = ? AND p.state = 'accepted' AND s.skipped = FALSE \
           AND (u.share_all_with_patched = 1 OR c.shared = TRUE)";
 
-    /// How a chain is named to somebody who may see the listen.
+    /// What a chain hands to somebody else who may see the listen.
     ///
-    /// Shared chains are named; a chain its owner keeps private is present but
-    /// unnamed, and the screen says *"Private signal chain"* rather than
-    /// leaving a hole. A listen with no chain at all says nothing — those are
-    /// different facts and the row draws them differently.
-    pub(crate) const CHAIN_VISIBILITY: &'static str =
-        "CASE WHEN c.shared = TRUE THEN c.name END AS chain_name, \
-         CASE WHEN s.chain_id IS NULL THEN 0 ELSE 1 END AS has_chain";
+    /// **A signal chain is private by design, shared or not** (Ashwin,
+    /// 2026-11-06). Switching one to shared unlocks the *listen's own* format
+    /// and transcode fields and nothing about the chain: no name, no icon, no
+    /// components, no hours. Not shared, or no chain at all, and every one of
+    /// these is NULL, so the row draws no format rather than a guess.
+    //
+    // Replaces `CHAIN_VISIBILITY`, which named a shared chain and labelled an
+    // unshared one "Private signal chain". That made sense while a chain was a
+    // thing you published; it is now one person's description of their own
+    // room, and the only part of it worth another person's attention is what
+    // the signal was when it got there. `c.shared = TRUE` over a missing chain
+    // is NULL, which CASE treats as false.
+    pub(crate) const SHARED_FORMAT: &'static str =
+        "CASE WHEN c.shared = TRUE THEN s.format_type END AS format_type, \
+         CASE WHEN c.shared = TRUE THEN s.codec END AS codec, \
+         CASE WHEN c.shared = TRUE THEN s.bitrate END AS bitrate, \
+         CASE WHEN c.shared = TRUE THEN s.sample_rate END AS sample_rate, \
+         CASE WHEN c.shared = TRUE THEN s.bit_depth END AS bit_depth, \
+         CASE WHEN c.shared = TRUE THEN s.is_lossless END AS is_lossless, \
+         CASE WHEN c.shared = TRUE THEN s.dsd_rate END AS dsd_rate, \
+         CASE WHEN c.shared = TRUE THEN s.dsd_multiplier END AS dsd_multiplier, \
+         CASE WHEN c.shared = TRUE THEN s.dsd_to_pcm_converted END AS dsd_to_pcm_converted, \
+         CASE WHEN c.shared = TRUE THEN s.delivery_codec END AS delivery_codec, \
+         CASE WHEN c.shared = TRUE THEN s.delivery_bitrate END AS delivery_bitrate, \
+         CASE WHEN c.shared = TRUE THEN s.delivery_sample_rate END AS delivery_sample_rate, \
+         CASE WHEN c.shared = TRUE THEN s.delivery_bit_depth END AS delivery_bit_depth, \
+         CASE WHEN c.shared = TRUE THEN s.is_transcoded END AS is_transcoded, \
+         CASE WHEN c.shared = TRUE THEN s.transcode_reason END AS transcode_reason";
 
     // ── Dubs: a record passed hand to hand ──
 
@@ -2238,6 +2261,31 @@ pub struct PatchPeer {
     pub shares_everything: bool,
 }
 
+/// A listen's format and transcode details, as a shared chain hands them to
+/// somebody else. Every field is null when the chain is not shared, when the
+/// listen ran through no chain, or when the source never reported it.
+//
+// See `Database::SHARED_FORMAT`. Flattened into every row another person
+// reads, so the gate is written once and a new surface cannot forget a field.
+#[derive(Debug, Default, Clone, FromRow, serde::Serialize, utoipa::ToSchema)]
+pub struct SharedFormat {
+    pub format_type: Option<String>,
+    pub codec: Option<String>,
+    pub bitrate: Option<i64>,
+    pub sample_rate: Option<i64>,
+    pub bit_depth: Option<i64>,
+    pub is_lossless: Option<bool>,
+    pub dsd_rate: Option<i64>,
+    pub dsd_multiplier: Option<i64>,
+    pub dsd_to_pcm_converted: Option<bool>,
+    pub delivery_codec: Option<String>,
+    pub delivery_bitrate: Option<i64>,
+    pub delivery_sample_rate: Option<i64>,
+    pub delivery_bit_depth: Option<i64>,
+    pub is_transcoded: Option<bool>,
+    pub transcode_reason: Option<String>,
+}
+
 /// A listen on somebody else's deck, reaching this user through a patch.
 //
 // Deliberately **not** `ScrobbleRecord`. That type is the shape of the
@@ -2255,12 +2303,10 @@ pub struct ReelListen {
     pub artwork_url: Option<String>,
     pub caa_id: Option<i64>,
     pub caa_release_mbid: Option<String>,
-    pub format_type: Option<String>,
-    pub codec: Option<String>,
-    pub bitrate: Option<i64>,
-    pub sample_rate: Option<i64>,
-    pub bit_depth: Option<i64>,
-    pub is_lossless: Option<bool>,
+    /// Format and transcode details, **only when the chain is shared**.
+    #[sqlx(flatten)]
+    #[serde(flatten)]
+    pub format: SharedFormat,
     pub submission_client: Option<String>,
     pub user_id: i64,
     pub username: String,
@@ -2276,18 +2322,6 @@ pub struct ReelListen {
     // has no published address, and the row shows none rather than inventing
     // one that resolves nowhere.
     pub actor_uri: Option<String>,
-    /// The chain, **when its owner shares it**.
-    //
-    // `None` has two meanings and the row must not conflate them, which is
-    // what `has_chain` is for: a chain kept private reads *"Private signal
-    // chain"*, and a listen that ran through no chain at all says nothing.
-    // Before 2026-08-26 this was a non-`Option` `String`, because the chain
-    // *was* the gate and a row could not exist without one.
-    pub chain_name: Option<String>,
-    pub chain_icon: Option<String>,
-    pub chain_components: Option<String>,
-    /// Whether there was a chain, whatever its owner shares.
-    pub has_chain: bool,
 }
 
 /// An artist seen across the decks a user is patched into.
@@ -2314,15 +2348,6 @@ pub struct PatchArtist {
     pub genre: Option<String>,
 }
 
-/// One chain a deck publishes.
-#[derive(Debug, FromRow, serde::Serialize, utoipa::ToSchema)]
-pub struct DeckChain {
-    pub name: String,
-    pub icon: Option<String>,
-    pub components: String,
-    pub hours: f64,
-}
-
 /// Somebody else's deck, as the person patched into it may see it.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct DeckView {
@@ -2336,7 +2361,8 @@ pub struct DeckView {
     /// have opened up, and otherwise only what ran through a chain they
     /// publish. Not, either way, their whole history: skips never appear.
     pub listens: i64,
-    pub chains: Vec<DeckChain>,
+    // `chains` (name, icon, components, hours of every shared chain) was
+    // removed on 2026-11-06: a chain is private by design, shared or not.
     /// Overlap only — no score.
     pub both_play: Vec<String>,
     /// Their actor URI, when they have an identity at all. `None` is a normal
@@ -2392,7 +2418,9 @@ pub struct InstancePulse {
     // Counting `artists.len()` would report 8 forever.
     pub artists_heard: i64,
     pub artists: Vec<PatchArtist>,
-    pub chains: Vec<ChainTally>,
+    // `chains` (the instance's top chains by name) went on 2026-11-06, for the
+    // reason `DeckView` lost its list: a shared chain shares a format, not
+    // itself.
     pub daily: Vec<DailyHour>,
 }
 
@@ -3253,6 +3281,9 @@ pub struct TokenRecord {
     /// The default chain's name.
     // Joined for display so the token list doesn't need a second round-trip.
     pub default_chain_name: Option<String>,
+    /// The box this token's app runs on, when it has been tied to one.
+    #[sqlx(default)]
+    pub equipment_id: Option<i64>,
 }
 
 /// How big a history is and how much of it is actually populated.
@@ -3502,6 +3533,7 @@ pub struct ChainVariantRow {
     pub overrides: String,
     pub created_at: i64,
     pub total_hours: f64,
+    pub auto: bool,
 }
 
 /// What a fold moved, so the caller can say it rather than claim success.
@@ -3581,6 +3613,9 @@ pub struct ChainVariant {
     /// question from a chain's total — a chain's hours include every variant
     /// of it, since they all ran through the same chain.
     pub total_hours: f64,
+    /// Kept by Tapedeck for a set of slot picks ("what's on now"); its name
+    /// is internal and never shown. False for a setup someone named.
+    pub auto: bool,
 }
 
 impl From<ChainVariantRow> for ChainVariant {
@@ -3593,6 +3628,7 @@ impl From<ChainVariantRow> for ChainVariant {
             overrides: serde_json::from_str(&r.overrides).unwrap_or_default(),
             created_at: r.created_at,
             total_hours: r.total_hours,
+            auto: r.auto,
         }
     }
 }
@@ -3647,6 +3683,9 @@ pub struct DeviceRow {
     pub first_seen: i64,
     pub last_seen: i64,
     pub total_listens: i64,
+    /// The box this device is, when it has been tied to one (the inbox asks).
+    #[sqlx(default)]
+    pub equipment_id: Option<i64>,
 }
 
 /// Where one piece of gear's hours came from.
@@ -3735,6 +3774,19 @@ pub struct EquipmentRow {
     /// usual state and means nothing has been said. Free text: the UI owns the
     /// vocabulary.
     pub status: Option<String>,
+    /// Other names this box reports as (a phone's model number), remembered
+    /// from inbox answers or typed in. A reporter matching one is suggested as
+    /// this box, never tied to it without asking.
+    #[sqlx(skip)]
+    pub aliases: Vec<String>,
+    #[sqlx(rename = "aliases", default)]
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub aliases_raw: Option<String>,
+    /// The devices and tokens tied to this box, by name: the apps and players
+    /// that report plays from it.
+    #[sqlx(skip)]
+    pub reporters: Vec<String>,
 }
 
 mod auth;
@@ -3766,7 +3818,20 @@ mod rediscovery;
 pub use ratings::{IncomingRating, LibraryRatingRow, RatingApply, RatingSourceSummary};
 mod relayed;
 pub use relayed::{RelayedApplied, RelayedPreview};
+mod inbox;
+pub use inbox::{
+    parse_aliases, DeviceBindingRow, InboxQuestion, InboxReporter, ListenOrigin, WhereAnswered,
+    INBOX_WINDOW_SECS,
+};
+mod fittings;
+pub use fittings::{FitOutcome, FitRefusal, InboxMerge, InboxSetup, MoodsRetired, Picks, WhatsOn};
+mod friend;
+pub use friend::InboxSpool;
+mod route;
+pub use route::RouteSaved;
+mod rooms;
 mod sanitise;
+pub use rooms::{Room, RoomRefusal};
 mod schema;
 mod sources;
 mod stats;

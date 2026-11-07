@@ -22,8 +22,16 @@ pub const ACTIVITY_JSON: &str = "application/activity+json";
 pub const JRD_JSON: &str = "application/jrd+json";
 
 /// The namespace for the terms this application adds to ActivityStreams — the
-/// signal chain and the audio format, which is the half that makes a Tapedeck
-/// listen a Tapedeck listen rather than a sentence.
+/// audio format and how it was delivered, which is the half that makes a
+/// Tapedeck listen a Tapedeck listen rather than a sentence.
+///
+/// **No signal chain term, ever** (Ashwin, 2026-11-06). A chain is private by
+/// design, shared or not: sharing one hands over the format of what ran
+/// through it, and its name, gear and hours never leave the instance. This
+/// replaces the 2026-09-03 plan for a `td:chain` label on the object. Where
+/// ActivityStreams or Rocksky already has a word (`Create`, `Follow`, `Like`,
+/// `Delete`, `Tombstone`, a scrobble), the wire uses it rather than one of
+/// ours; Patch, Reel, Spool, Dub and Love are screen names only.
 ///
 /// **FROZEN** (Ashwin, 2026-08-26). `tapedeck.cc` is the project's own domain
 /// and will host the page explaining what Tapedeck is, which makes it the one
@@ -45,7 +53,7 @@ pub const JRD_JSON: &str = "application/jrd+json";
 /// Nothing dereferences a namespace IRI in practice — Mastodon never fetches
 /// `joinmastodon.org/ns#` — but the next person implementing against a
 /// Tapedeck `Create` will paste it into a browser, and a 404 is a poor answer
-/// to "what is `td:chain`?".
+/// to "what is `td:Listen`?".
 pub const TD_NS: &str = "https://tapedeck.cc/ns#";
 
 /// The `@context` every document this server emits carries.
@@ -315,7 +323,7 @@ mod tests {
              it needs a migration plan for peers, not a new string."
         );
         // A namespace that is not a prefix would concatenate into nonsense:
-        // `td:chain` has to resolve to `…/ns#chain`, not `…/nschain`.
+        // `td:Listen` has to resolve to `…/ns#Listen`, not `…/nsListen`.
         assert!(
             TD_NS.ends_with('#') || TD_NS.ends_with('/'),
             "a namespace IRI must end in a separator or every term name runs into it"

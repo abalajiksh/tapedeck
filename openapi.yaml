@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.128.1
+  version: 0.129.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -5202,6 +5202,485 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           $ref: '#/components/responses/NotFound'
+  /api/v1/chains/inbox:
+    get:
+      tags:
+      - Chains
+      summary: The questions about plays that landed in no chain, and about slots.
+      description: |-
+        Session-only. From the last 30 days, grouped by where the plays came from:
+        first which box a device or token is (`same_box`, `which_box`), then where
+        unfiled plays should have gone (`where`), most plays first. Then chains
+        that differ at one box and could be one chain with an option (`merge`),
+        and named setups that change no gear (`moods`). Questions put off with
+        "not now" are left out for 30 days.
+      operationId: chain_inbox
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InboxList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/chains/inbox/where:
+    post:
+      tags:
+      - Chains
+      summary: Answer "where were you?" for plays that landed in no chain.
+      description: |-
+        Session-only. Writes the most specific rule the plays allow, so future
+        ones find the chain: an output (of the box when the reporter is tied to
+        one), else the token's default chain, else the device's. With none of
+        those (`rule: none`) nothing can be remembered and only the counted plays
+        can be filed. `backfill` files the plays the question counted, no others.
+      operationId: answer_inbox_where
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnswerWhereRequest'
+        required: true
+      responses:
+        '200':
+          description: The rule written and the plays filed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WhereAnswered'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/chains/inbox/box:
+    post:
+      tags:
+      - Chains
+      summary: Tie devices and tokens to the box they are.
+      description: |-
+        Session-only. Answers "are these your Xperia?" and "which box is this?".
+        Hours never move: grouping changes how reporters are drawn and which
+        outputs are learned per box, not where any listen was attributed. Ids that
+        are not yours are ignored. `alias` is remembered on the box.
+      operationId: answer_inbox_box
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnswerBoxRequest'
+        required: true
+      responses:
+        '200':
+          description: Tied. `status` is `ok`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/chains/inbox/dismiss:
+    post:
+      tags:
+      - Chains
+      summary: Put an inbox question off for 30 days.
+      description: Session-only.
+      operationId: dismiss_inbox
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DismissRequest'
+        required: true
+      responses:
+        '200':
+          description: Put off. `status` is `ok`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Ok'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/device-bindings/{id}:
+    delete:
+      tags:
+      - Chains
+      summary: Remove an output learned per box.
+      description: Session-only.
+      operationId: delete_device_binding
+      parameters:
+      - name: id
+        in: path
+        description: The output.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '204':
+          description: Deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/rooms:
+    get:
+      tags:
+      - Chains
+      summary: Your rooms, in order, with the chains in each.
+      description: |-
+        Scope: `read`. The built-in "On the go" room is created the first time this
+        is asked, so it is always there to pick. A chain may appear in several
+        rooms' `chain_ids`.
+      operationId: list_rooms
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      security:
+      - sessionCookie: []
+      - apiToken:
+        - read
+    post:
+      tags:
+      - Chains
+      summary: Make a room of your own.
+      description: Session-only. Names are unique per person, ignoring case.
+      operationId: create_room
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoomRequest'
+        required: true
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowCreated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: You already have a room with that name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/v1/rooms/{id}:
+    delete:
+      tags:
+      - Chains
+      summary: Delete a room of your own.
+      description: |-
+        Session-only. Its chains leave the room and are otherwise untouched:
+        deleting a room never deletes a chain. Built-in rooms cannot be deleted.
+      operationId: delete_room
+      parameters:
+      - name: id
+        in: path
+        description: The room.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '204':
+          description: Deleted.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags:
+      - Chains
+      summary: Rename a room, change its icon, or move it in the order.
+      description: |-
+        Session-only. A built-in room can be reordered and given an icon, never
+        renamed.
+      operationId: update_room
+      parameters:
+      - name: id
+        in: path
+        description: The room.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRoomRequest'
+        required: true
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowUpdated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: You already have a room with that name.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+  /api/v1/chains/{id}/rooms:
+    put:
+      tags:
+      - Chains
+      summary: Put a chain in exactly these rooms.
+      description: |-
+        Session-only. Replaces the chain's rooms; `[]` takes it out of all of them.
+        Refused whole if the chain or any room is not yours.
+      operationId: set_chain_rooms
+      parameters:
+      - name: id
+        in: path
+        description: The chain.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetChainRoomsRequest'
+        required: true
+      responses:
+        '200':
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RowUpdated'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/chains/{id}/whats-on:
+    get:
+      tags:
+      - Chains
+      summary: What is on at each slot of a chain, and what the picker offers.
+      description: |-
+        Scope: `read`. Each option carries its purchase date and first play ("in
+        use since"), and the outputs that pick it by themselves. `last_play_end`
+        is when the chain's last play ended, for "right after the last play here".
+      operationId: whats_on
+      parameters:
+      - name: id
+        in: path
+        description: The chain.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WhatsOn'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+      - sessionCookie: []
+      - apiToken:
+        - read
+  /api/v1/chains/{id}/fit:
+    post:
+      tags:
+      - Chains
+      summary: Switch what is on at a slot, now or since a moment.
+      description: |-
+        Session-only. Only plays filed with the pick in effect at their time
+        move, so a play an output picked by itself stays where it is. Other
+        slots' picks are never changed. `moved` counts plays, skips excluded.
+      operationId: fit_slot
+      parameters:
+      - name: id
+        in: path
+        description: The chain.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FitRequest'
+        required: true
+      responses:
+        '200':
+          description: Switched, or what a switch would move.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FitOutcome'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/chains/{id}/merge:
+    post:
+      tags:
+      - Chains
+      summary: Merge a chain that differs at one box into this one, as an option there.
+      description: |-
+        Session-only, and not reversible. The two must differ at exactly one
+        step past the player (a different player is a different chain). The
+        other chain's listens, outputs, defaults and rooms move here, filed with
+        that option, and the other chain is deleted.
+      operationId: merge_chain
+      parameters:
+      - name: id
+        in: path
+        description: The chain kept.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergeChainRequest'
+        required: true
+      responses:
+        '200':
+          description: Merged. The counts are what moved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FoldOutcome'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/chains/inbox/moods:
+    post:
+      tags:
+      - Chains
+      summary: Turn named setups that change no gear into session titles.
+      description: |-
+        Session-only. Each one's name becomes the title of the sittings its plays
+        are in, where a sitting has no title yet, and the setup is removed. The
+        plays keep their chain; the gear was the same, so no hour moves. Ids that
+        are not such a setup of yours are ignored.
+      operationId: retire_moods
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetireMoodsRequest'
+        required: true
+      responses:
+        '200':
+          description: What changed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MoodsRetired'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/chains/{id}/route:
+    put:
+      tags:
+      - Chains
+      summary: Save a chain's route from the route editor.
+      description: |-
+        Session-only. With `past: keep` the old route is kept as hidden history:
+        past plays stay on it, every other variant keeps naming the gear it did,
+        and a switch now starts the new route with whatever was on at its slots
+        (outputs that pick gear by themselves keep picking it). With `past:
+        rewrite` the steps are replaced and every past play is read through them.
+        Name, icon and the rest stay with `PATCH /api/v1/chains/{id}`.
+      operationId: save_route
+      parameters:
+      - name: id
+        in: path
+        description: The chain.
+        required: true
+        schema:
+          type: integer
+          format: int64
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SaveRouteRequest'
+        required: true
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteSaved'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  /api/v1/chains/inbox/spool:
+    post:
+      tags:
+      - Chains
+      summary: File accepted Shared Spool plays that landed on no chain.
+      description: |-
+        Session-only. Every such play goes to the chain given, or to At a
+        friend's. They were accepted before At a friend's existed; new ones land
+        there on their own.
+      operationId: file_spool
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FileSpoolRequest'
+        required: true
+      responses:
+        '200':
+          description: Filed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpoolFiled'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /api/v1/notes:
     get:
       tags:
@@ -10368,9 +10847,10 @@ paths:
         every listen they play, whatever chain it ran through or whether it ran
         through one at all. **`shared_chains`** is how many chains they publish,
         which is what decides visibility when that switch is off — and, either
-        way, whether the chain is *named* on a row. Zero chains **and** closed is
-        the empty patch that needs saying on screen rather than looking broken;
-        zero chains and open is a deck publishing everything it plays, unnamed.
+        way, whether a row carries its format. A chain is never named. Zero chains
+        **and** closed is the empty patch that needs saying on screen rather than
+        looking broken; zero chains and open is a deck publishing everything it
+        plays, without formats.
       operationId: decks
       responses:
         '200':
@@ -10391,20 +10871,17 @@ paths:
       description: |-
         **The one read in this application that returns another user's
         listens**, and every narrowing is in the query rather than the handler:
-        the patch must be `accepted`, the listen's chain must be `shared`, the
-        listen must have a chain at all, and skips are excluded.
-
-        A listen with no chain is never shared — nobody switched anything on for
-        it, so the default is exclusion.
+        the patch must be `accepted`, the deck must have opened up or the
+        listen's chain must be `shared`, and skips are excluded.
 
         Paged by keyset on `before`, not by offset: the Reel grows from the top
         while it is being read, and an offset would repeat or skip rows as it
         shifted underneath. `next` is null when the page was short.
 
-        Rows carry the chain — its name, icon and components — because that is
-        what makes a Tapedeck listen a Tapedeck listen rather than a sentence.
-        They deliberately do not carry the source id, the delivery state or the
-        session, which are nobody else's business.
+        Rows carry the listen's **format and transcode details when its chain is
+        shared**, and nothing about the chain itself: no name, gear or hours. They
+        deliberately do not carry the source id, the delivery state or the
+        session either, which are nobody else's business.
       operationId: reel
       parameters:
       - name: limit
@@ -10426,7 +10903,9 @@ paths:
           format: int64
       - name: q
         in: query
-        description: Narrows on track, artist, album, chain or deck, server-side.
+        description: |-
+          Narrows on track, artist, album or deck, server-side. Not on chain: a
+          chain is never named to anybody else, so it cannot be searched for.
         required: false
         schema:
           type: string
@@ -10559,12 +11038,15 @@ paths:
     put:
       tags:
       - Patch
-      summary: Publish a signal chain to the people patched into you, or stop.
+      summary: Share what a signal chain played, and in what format, or stop.
       description: |-
-        **The sharing unit is the chain, and this is the only switch there is.**
-        A listen reaches the Reel because the chain it ran through was switched
-        on by its owner — there is no per-listen override and there should not
-        be one. It makes "what am I publishing?" answerable by looking at a list
+        **A chain is private by design, shared or not.** Sharing one never names
+        it, its gear or its hours to anybody. It lets the listens through it reach
+        the people patched into you (when you have not opened up everything), and
+        it hands over each listen's format and transcode details: codec, bitrate,
+        sample rate, bit depth, DSD rate, and what it was delivered as.
+
+        There is no per-listen override and there should not be one. It makes "what am I publishing?" answerable by looking at a list
         of chains you already understand, and it makes the decision a standing
         one about *how you listen* rather than a choice to make per play.
 
@@ -10618,8 +11100,8 @@ paths:
       - Patch
       summary: One deck, through an accepted patch.
       description: |-
-        Session-only. The deck's profile, how much it has played, its shared
-        chains with their hours, and the artists you both play. A deck that does
+        Session-only. The deck's profile, how much it has played, and the artists
+        you both play. Never their chains: a chain is private by design. A deck that does
         not exist and one you are not patched into are the same 404.
       operationId: deck
       parameters:
@@ -10779,7 +11261,7 @@ paths:
           format: int64
       responses:
         '200':
-          description: Decks, listens, hours, top artists, chains and daily hours.
+          description: Decks, listens, hours, top artists and daily hours.
           content:
             application/json:
               schema:
@@ -11632,9 +12114,9 @@ paths:
       summary: Decks you're patched into that are playing something right now.
       description: |-
         **Gated by exactly the rule the Reel uses** — an accepted patch, and the
-        listen running through a chain its owner switched to **shared**. A live
-        entry that could not be checked never appears, which is why `chain_name`
-        is always present on a row here.
+        listen running through a chain its owner switched to **shared**, or an
+        owner who opened up. A live entry that could not be checked never appears.
+        The chain is never named; a shared one hands over the listen's format.
 
         That gate is what `NowPlaying.chain_id` exists for. A name could not do
         it — a name is not a key, and a polled source sets no chain name at all,
@@ -12667,6 +13149,78 @@ components:
           oneOf:
           - type: 'null'
           - $ref: '#/components/schemas/AnnotationTarget'
+    AnswerBoxRequest:
+      type: object
+      required:
+      - equipment_id
+      properties:
+        equipment_id:
+          type: integer
+          format: int64
+          description: The box they are. One of your gear.
+        device_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+        token_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+        alias:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Remember this as another name the box reports as (a model number), so
+            the next reporter carrying it is suggested. Optional.
+    AnswerWhereRequest:
+      type: object
+      required:
+      - source_name
+      - since
+      - chain_id
+      - backfill
+      properties:
+        device_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Echo the question's `device`, `token`, `output` and `source_name`: they
+            identify the plays and decide which rule is written.
+        token_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        output:
+          type:
+          - string
+          - 'null'
+        source_name:
+          type: string
+        since:
+          type: integer
+          format: int64
+          description: |-
+            The question's `since`, so "also file them" moves exactly the plays it
+            counted.
+        chain_id:
+          type: integer
+          format: int64
+          description: Where they should have gone. One of your chains.
+        chain_variant_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: A setup of that chain; only remembered on an output rule.
+        backfill:
+          type: boolean
+          description: Also file the counted plays. **Required**, because it changes history.
     ApplyDurations:
       type: object
       description: The proposals exactly as the preview showed them.
@@ -13083,11 +13637,18 @@ components:
       type: object
       required:
       - bindings
+      - device_bindings
       properties:
         bindings:
           type: array
           items:
             $ref: '#/components/schemas/Binding'
+          description: 'Outputs by name, from anything not tied to a box: rung 3.'
+        device_bindings:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceBindingRow'
+          description: 'Outputs learned per box, from devices and tokens tied to one: rung 2.'
     Bio:
       type: object
       description: |-
@@ -13411,15 +13972,69 @@ components:
             added to a chain that already has history is credited with all of it.
             Stamped automatically on gear a chain did not name before; send one to
             correct the date, or `null` to say it was always there.
+        options:
+          type:
+          - array
+          - 'null'
+          items:
+            type: integer
+            format: int64
+          description: |-
+            The gear that can be on at this step, as equipment ids, the gear the
+            step is wired with first. **Two or more makes the step a slot**: "what's
+            on now" picks one, and every listen from then on is filed with that
+            pick. Omitted when the step is not a slot.
+
+            On save, **omitted keeps the options the step already had**; send `[]`
+            to stop it being a slot. Ids that are not your gear are dropped.
+        slot_name:
+          type:
+          - string
+          - 'null'
+          description: What the slot is called on screen ("On the go"), when it has a name.
     ChainList:
       type: object
       required:
       - chains
+      - last_used
+      - on_now
       properties:
         chains:
           type: array
           items:
             $ref: '#/components/schemas/Chain'
+        last_used:
+          type: object
+          description: |-
+            When each chain last carried a listen, unix seconds, keyed by chain id.
+            A chain nothing has played through is absent. Skips do not count.
+          additionalProperties:
+            type: integer
+            format: int64
+          propertyNames:
+            type: integer
+            format: int64
+        on_now:
+          type: object
+          description: |-
+            What is on now at each slot, for chains with slots: chain id →
+            (step position → equipment id). See `GET /api/v1/chains/{id}/whats-on`.
+        friend_chain_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The built-in At a friend's chain, where Shared Spool plays land, once
+            it exists. It has no steps.
+        spool_chain_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The chain Shared Spool plays land on instead, when one was named the
+            old way (`PUT /api/v1/profile/spool-chain`).
     ChainShareSwitch:
       type: object
       required:
@@ -13882,6 +14497,19 @@ components:
             when Tapedeck first saw it — gear is usually owned for a while before
             anyone gets round to cataloguing it, and burn-in hours are counted from
             the purchase.
+    CreateRoomRequest:
+      type: object
+      required:
+      - name
+      properties:
+        name:
+          type: string
+          description: Up to 60 characters; whitespace is collapsed.
+        icon:
+          type:
+          - string
+          - 'null'
+          description: A glyph name from the UI's set. Not validated, like a chain's icon.
     CreateTokenRequest:
       type: object
       required:
@@ -14118,25 +14746,6 @@ components:
           type: integer
           format: int64
           description: Every listen that day — the population `plays` is a share of.
-    DeckChain:
-      type: object
-      description: One chain a deck publishes.
-      required:
-      - name
-      - components
-      - hours
-      properties:
-        name:
-          type: string
-        icon:
-          type:
-          - string
-          - 'null'
-        components:
-          type: string
-        hours:
-          type: number
-          format: double
     DeckReported:
       type: object
       required:
@@ -14180,7 +14789,6 @@ components:
       - username
       - created_at
       - listens
-      - chains
       - both_play
       properties:
         user_id:
@@ -14210,10 +14818,6 @@ components:
             Listens a patch into this deck can see — everything they play when they
             have opened up, and otherwise only what ran through a chain they
             publish. Not, either way, their whole history: skips never appear.
-        chains:
-          type: array
-          items:
-            $ref: '#/components/schemas/DeckChain'
         both_play:
           type: array
           items:
@@ -14275,6 +14879,56 @@ components:
           type: integer
           format: int64
         total_listens:
+          type: integer
+          format: int64
+        equipment_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: The box this device is, when it has been tied to one (the inbox asks).
+    DeviceBindingRow:
+      type: object
+      description: An output seen from one box, and the chain it is mapped to.
+      required:
+      - id
+      - equipment_id
+      - equipment_name
+      - identifier
+      - last_seen
+      - hits
+      properties:
+        id:
+          type: integer
+          format: int64
+        equipment_id:
+          type: integer
+          format: int64
+          description: The box it was seen from.
+        equipment_name:
+          type: string
+        identifier:
+          type: string
+        interface:
+          type:
+          - string
+          - 'null'
+        chain_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Null when seen but not mapped yet.
+        chain_variant_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Which setup of that chain it carries; null is the chain as wired.
+        last_seen:
+          type: integer
+          format: int64
+        hits:
           type: integer
           format: int64
     DeviceList:
@@ -14468,6 +15122,14 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DiscoverDeck'
+    DismissRequest:
+      type: object
+      required:
+      - key
+      properties:
+        key:
+          type: string
+          description: The question's `key`.
     Dossier:
       type: object
       required:
@@ -14623,8 +15285,8 @@ components:
           format: int64
           description: |-
             The setup (variant) of that chain the listen would be saved with. Set
-            only when `chain_source` is `output_binding` and that output was mapped
-            to a setup.
+            only when `chain_source` is `device_output` or `output_binding` and that
+            output was mapped to a setup.
         chain_name:
           type:
           - string
@@ -14632,12 +15294,14 @@ components:
         chain_source:
           type: string
           description: |-
-            **Which rung of the ladder won:** `explicit`, `output_binding`,
-            `token_default`, `device_default` or `none`. The single most useful
+            **Which rung of the ladder won:** `explicit`, `device_output` (an
+            output of the box this device or token is tied to), `output_binding`
+            (an output by name, from anything), `token_default`, `device_default`
+            or `none`. The single most useful
             field here: a chain arriving from the wrong rung looks identical to one
             arriving from the right one, so without this a misconfiguration is
             invisible until someone reads their history months later.
-          pattern: ^(explicit|output_binding|token_default|device_default|none)$
+          pattern: ^(explicit|device_output|output_binding|token_default|device_default|none)$
         device_id:
           type:
           - integer
@@ -15000,6 +15664,8 @@ components:
       - equipment_type
       - total_hours
       - sources
+      - aliases
+      - reporters
       properties:
         id:
           type: integer
@@ -15070,6 +15736,21 @@ components:
             Why this piece is not in a chain — `new`, `spare` or `lent`. Null is the
             usual state and means nothing has been said. Free text: the UI owns the
             vocabulary.
+        aliases:
+          type: array
+          items:
+            type: string
+          description: |-
+            Other names this box reports as (a phone's model number), remembered
+            from inbox answers or typed in. A reporter matching one is suggested as
+            this box, never tied to it without asking.
+        reporters:
+          type: array
+          items:
+            type: string
+          description: |-
+            The devices and tokens tied to this box, by name: the apps and players
+            that report plays from it.
     EquipmentList:
       type: object
       required:
@@ -15261,6 +15942,17 @@ components:
               description: The words were already held, so nothing was fetched.
         description: The document, as the reader should now show it.
       description: 'A lookup''s outcome: the whole lyric document, or why nobody could be asked.'
+    FileSpoolRequest:
+      type: object
+      properties:
+        chain_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The chain to file them under; absent or null is At a friend's (made
+            if it does not exist yet).
     FileUpload:
       type: object
       description: |-
@@ -15313,6 +16005,62 @@ components:
             comparing a month against itself draws two identical shapes and means
             nothing by it, so decline to draw the baseline below two.
           minimum: 0
+    FitOutcome:
+      type: object
+      description: What a switch did, or would do.
+      required:
+      - moved
+      - since
+      - now_on
+      properties:
+        moved:
+          type: integer
+          format: int64
+          description: Plays (skips excluded) that are, or would be, filed with the new pick.
+        since:
+          type: integer
+          format: int64
+          description: From when the pick counts.
+        until:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Where the change stops: the next recorded switch of the same step.
+            Null when there is none, so the new pick is what's on now.
+        now_on:
+          type: boolean
+          description: The new pick is what's on now.
+    FitRequest:
+      type: object
+      required:
+      - position
+      - equipment_id
+      - dry_run
+      properties:
+        position:
+          type: integer
+          format: int64
+          description: 'The slot: the step''s position in the chain.'
+        equipment_id:
+          type: integer
+          format: int64
+          description: The gear to put on, one of the slot's options.
+        since:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            From when, unix seconds. Absent is now. Earlier is a backdate: the
+            plays from then up to the next recorded switch of this step move to
+            the new pick, and later switches stay as they are.
+        dry_run:
+          type: boolean
+          description: |-
+            `true` counts what would move and writes nothing. Required, so a
+            preview can never be sent as the real thing by leaving it out.
     FixLyricsRequest:
       type: object
       required:
@@ -15814,48 +16562,47 @@ components:
             `recommendation` — they were not there. They get a document of what you
             played, and nothing enters their history.
     HandedListen:
-      type: object
+      allOf:
+      - $ref: '#/components/schemas/SharedFormat'
+        description: Format and transcode details, **only when the chain is shared**.
+      - type: object
+        required:
+        - title
+        - artist
+        - timestamp
+        properties:
+          title:
+            type: string
+          artist:
+            type: string
+          album:
+            type:
+            - string
+            - 'null'
+          timestamp:
+            type: integer
+            format: int64
+          duration:
+            type:
+            - integer
+            - 'null'
+            format: int64
+          artwork_url:
+            type:
+            - string
+            - 'null'
+          caa_id:
+            type:
+            - integer
+            - 'null'
+            format: int64
+          caa_release_mbid:
+            type:
+            - string
+            - 'null'
       description: |-
         One listen inside a handed-over sitting. **Not a listen of the reader's** —
         this enters no history, count or chart.
-      required:
-      - title
-      - artist
-      - timestamp
-      properties:
-        title:
-          type: string
-        artist:
-          type: string
-        album:
-          type:
-          - string
-          - 'null'
-        timestamp:
-          type: integer
-          format: int64
-        duration:
-          type:
-          - integer
-          - 'null'
-          format: int64
-        artwork_url:
-          type:
-          - string
-          - 'null'
-        caa_id:
-          type:
-          - integer
-          - 'null'
-          format: int64
-        caa_release_mbid:
-          type:
-          - string
-          - 'null'
-        chain_name:
-          type:
-          - string
-          - 'null'
     HandedOver:
       type: object
       required:
@@ -16147,6 +16894,235 @@ components:
           type: integer
           format: int64
           description: Zero, rather than an error, when it cannot be read.
+    InboxList:
+      type: object
+      required:
+      - questions
+      - window_days
+      properties:
+        questions:
+          type: array
+          items:
+            $ref: '#/components/schemas/InboxQuestion'
+        window_days:
+          type: integer
+          format: int64
+          description: How far back the questions look, in days.
+    InboxMerge:
+      type: object
+      description: Two chains that differ only at one swappable step.
+      required:
+      - chain_id
+      - chain_name
+      - chain_hours
+      - other_chain_id
+      - other_chain_name
+      - other_hours
+      - position
+      - gear
+      - other_gear
+      properties:
+        chain_id:
+          type: integer
+          format: int64
+          description: 'The chain kept: the one with more hours.'
+        chain_name:
+          type: string
+        chain_hours:
+          type: number
+          format: double
+        other_chain_id:
+          type: integer
+          format: int64
+          description: The chain that becomes an option on it.
+        other_chain_name:
+          type: string
+        other_hours:
+          type: number
+          format: double
+        position:
+          type: integer
+          format: int64
+        gear:
+          type: string
+          description: The gear at that step on each.
+        other_gear:
+          type: string
+    InboxQuestion:
+      type: object
+      description: One question in the inbox.
+      required:
+      - key
+      - kind
+      properties:
+        key:
+          type: string
+          description: Stable for as long as the question stands; what "not now" stores.
+        kind:
+          type: string
+          description: |-
+            `same_box` — are these reporters this box? `which_box` — which box is
+            this reporter? `where` — plays landed nowhere; where were you?
+            `merge` — two chains differ at one box; make it an option? `moods` —
+            named setups that change no gear; make them session titles? `spool` —
+            Shared Spool plays on no chain; file them At a friend's?
+        equipment_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: '`same_box`: the box suggested, by a name or model it matches.'
+        equipment_name:
+          type:
+          - string
+          - 'null'
+        reporters:
+          type: array
+          items:
+            $ref: '#/components/schemas/InboxReporter'
+          description: |-
+            `same_box`: every reporter not yet tied to a box that matches it.
+            `which_box`: the one reporter asked about.
+        plays:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: '`where`: how many unfiled plays, and over what span.'
+        first:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        last:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        since:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            `where`: the start of the window counted. Send it back with the answer
+            so "also file them" moves exactly the plays that were counted.
+        device:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/InboxReporter'
+            description: '`where`: what the plays came through.'
+        token:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/InboxReporter'
+        output:
+          type:
+          - string
+          - 'null'
+        source_name:
+          type:
+          - string
+          - 'null'
+        rule:
+          type:
+          - string
+          - 'null'
+          description: |-
+            `where`: what an answer will set so future plays find the chain:
+            `device_output` (an output of a box), `output` (an output name from
+            anything), `token`, `device`, or `none` when nothing identifies the
+            source and only the counted plays can be filed.
+        merge:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/InboxMerge'
+            description: '`merge`: the two chains and the step they differ at.'
+        setups:
+          type: array
+          items:
+            $ref: '#/components/schemas/InboxSetup'
+          description: '`moods`: every setup that changes no gear.'
+        spool:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/InboxSpool'
+            description: '`spool`: accepted Shared Spool plays on no chain.'
+    InboxReporter:
+      type: object
+      description: One device or token, as the inbox names it.
+      required:
+      - kind
+      - id
+      - name
+      - sub
+      properties:
+        kind:
+          type: string
+          description: '`device` or `token`.'
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        sub:
+          type: string
+          description: 'What it is: the platform for a device, "a token" for a token.'
+        equipment_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: The box it is already tied to, if any.
+    InboxSetup:
+      type: object
+      description: The `mood` setups the inbox offers to turn into session titles.
+      required:
+      - id
+      - name
+      - chain_id
+      - chain_name
+      - plays
+      - sessions
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        chain_id:
+          type: integer
+          format: int64
+        chain_name:
+          type: string
+        plays:
+          type: integer
+          format: int64
+          description: Plays filed with it, skips excluded.
+        sessions:
+          type: integer
+          format: int64
+          description: Sittings those plays are in that have no title yet.
+    InboxSpool:
+      type: object
+      description: Shared Spool plays that landed on no chain.
+      required:
+      - plays
+      properties:
+        plays:
+          type: integer
+          format: int64
+          description: Plays, skips excluded.
+        first:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        last:
+          type:
+          - integer
+          - 'null'
+          format: int64
     InstancePulse:
       type: object
       description: What the instance has been playing, over shared chains only.
@@ -16158,7 +17134,6 @@ components:
       - hours
       - artists_heard
       - artists
-      - chains
       - daily
       properties:
         decks:
@@ -16187,10 +17162,6 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PatchArtist'
-        chains:
-          type: array
-          items:
-            $ref: '#/components/schemas/ChainTally'
         daily:
           type: array
           items:
@@ -17297,92 +18268,65 @@ components:
       - background
       - unknown
     LiveDeck:
-      type: object
+      allOf:
+      - $ref: '#/components/schemas/SharedFormat'
+        description: |-
+          Format and transcode details, **only when the chain is shared**. The
+          chain itself is never named.
+      - type: object
+        required:
+        - user_id
+        - username
+        - title
+        - artist
+        - position
+        - position_known
+        - paused
+        properties:
+          user_id:
+            type: integer
+            format: int64
+          username:
+            type: string
+          display_name:
+            type:
+            - string
+            - 'null'
+          avatar_url:
+            type:
+            - string
+            - 'null'
+          title:
+            type: string
+          artist:
+            type: string
+          album:
+            type:
+            - string
+            - 'null'
+          duration:
+            type:
+            - integer
+            - 'null'
+            format: int64
+            minimum: 0
+          position:
+            type: integer
+            format: int64
+            description: Seconds into the track.
+            minimum: 0
+          position_known:
+            type: boolean
+            description: The position was measured rather than extrapolated.
+          paused:
+            type: boolean
+          artwork_url:
+            type:
+            - string
+            - 'null'
       description: |-
         A deck you are patched into that is playing now, through a chain you may
         see.
-      required:
-      - user_id
-      - username
-      - title
-      - artist
-      - position
-      - position_known
-      - paused
-      - has_chain
-      properties:
-        user_id:
-          type: integer
-          format: int64
-        username:
-          type: string
-        display_name:
-          type:
-          - string
-          - 'null'
-        avatar_url:
-          type:
-          - string
-          - 'null'
-        title:
-          type: string
-        artist:
-          type: string
-        album:
-          type:
-          - string
-          - 'null'
-        duration:
-          type:
-          - integer
-          - 'null'
-          format: int64
-          minimum: 0
-        position:
-          type: integer
-          format: int64
-          description: Seconds into the track.
-          minimum: 0
-        position_known:
-          type: boolean
-          description: The position was measured rather than extrapolated.
-        paused:
-          type: boolean
-        chain_name:
-          type:
-          - string
-          - 'null'
-          description: |-
-            Null with `has_chain` true is a private chain; null with it false is a
-            listen through nothing anybody recorded.
-        has_chain:
-          type: boolean
-        artwork_url:
-          type:
-          - string
-          - 'null'
-        format_type:
-          type:
-          - string
-          - 'null'
-        codec:
-          type:
-          - string
-          - 'null'
-        bit_depth:
-          type:
-          - integer
-          - 'null'
-          format: int32
-        sample_rate:
-          type:
-          - integer
-          - 'null'
-          format: int32
-        is_lossless:
-          type:
-          - boolean
-          - 'null'
     LiveDecks:
       type: object
       required:
@@ -18142,6 +19086,15 @@ components:
         added:
           type: integer
           format: int64
+    MergeChainRequest:
+      type: object
+      required:
+      - from_chain_id
+      properties:
+        from_chain_id:
+          type: integer
+          format: int64
+          description: The chain that becomes an option on this one, and is then deleted.
     MergeRequest:
       type: object
       required:
@@ -18298,6 +19251,21 @@ components:
         all:
           type: integer
           format: int64
+    MoodsRetired:
+      type: object
+      description: What retiring mood setups did.
+      required:
+      - sessions_titled
+      - removed
+      properties:
+        sessions_titled:
+          type: integer
+          format: int64
+          description: Sittings that gained a title.
+        removed:
+          type: integer
+          format: int64
+          description: Setups removed.
     MostSkipped:
       type: object
       required:
@@ -21689,111 +22657,70 @@ components:
           - string
           - 'null'
     ReelListen:
-      type: object
+      allOf:
+      - $ref: '#/components/schemas/SharedFormat'
+        description: Format and transcode details, **only when the chain is shared**.
+      - type: object
+        required:
+        - id
+        - timestamp
+        - title
+        - artist
+        - user_id
+        - username
+        properties:
+          id:
+            type: integer
+            format: int64
+          timestamp:
+            type: integer
+            format: int64
+          title:
+            type: string
+          artist:
+            type: string
+          album:
+            type:
+            - string
+            - 'null'
+          artwork_url:
+            type:
+            - string
+            - 'null'
+          caa_id:
+            type:
+            - integer
+            - 'null'
+            format: int64
+          caa_release_mbid:
+            type:
+            - string
+            - 'null'
+          submission_client:
+            type:
+            - string
+            - 'null'
+          user_id:
+            type: integer
+            format: int64
+          username:
+            type: string
+          display_name:
+            type:
+            - string
+            - 'null'
+          avatar_url:
+            type:
+            - string
+            - 'null'
+          actor_uri:
+            type:
+            - string
+            - 'null'
+            description: |-
+              This deck's actor URI, or null when they have not switched federation
+              on.
       description: A listen on somebody else's deck, reaching this user through a patch.
-      required:
-      - id
-      - timestamp
-      - title
-      - artist
-      - user_id
-      - username
-      - has_chain
-      properties:
-        id:
-          type: integer
-          format: int64
-        timestamp:
-          type: integer
-          format: int64
-        title:
-          type: string
-        artist:
-          type: string
-        album:
-          type:
-          - string
-          - 'null'
-        artwork_url:
-          type:
-          - string
-          - 'null'
-        caa_id:
-          type:
-          - integer
-          - 'null'
-          format: int64
-        caa_release_mbid:
-          type:
-          - string
-          - 'null'
-        format_type:
-          type:
-          - string
-          - 'null'
-        codec:
-          type:
-          - string
-          - 'null'
-        bitrate:
-          type:
-          - integer
-          - 'null'
-          format: int64
-        sample_rate:
-          type:
-          - integer
-          - 'null'
-          format: int64
-        bit_depth:
-          type:
-          - integer
-          - 'null'
-          format: int64
-        is_lossless:
-          type:
-          - boolean
-          - 'null'
-        submission_client:
-          type:
-          - string
-          - 'null'
-        user_id:
-          type: integer
-          format: int64
-        username:
-          type: string
-        display_name:
-          type:
-          - string
-          - 'null'
-        avatar_url:
-          type:
-          - string
-          - 'null'
-        actor_uri:
-          type:
-          - string
-          - 'null'
-          description: |-
-            This deck's actor URI, or null when they have not switched federation
-            on.
-        chain_name:
-          type:
-          - string
-          - 'null'
-          description: The chain, **when its owner shares it**.
-        chain_icon:
-          type:
-          - string
-          - 'null'
-        chain_components:
-          type:
-          - string
-          - 'null'
-        has_chain:
-          type: boolean
-          description: Whether there was a chain, whatever its owner shares.
     ReelPage:
       type: object
       description: A page of the Reel, newest first.
@@ -22013,6 +22940,17 @@ components:
           description: '`restarting`.'
         note:
           type: string
+    RetireMoodsRequest:
+      type: object
+      required:
+      - variant_ids
+      properties:
+        variant_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: The setups to retire, from the `moods` question.
     RetriedLookup:
       type: object
       required:
@@ -22108,6 +23046,53 @@ components:
           description: |-
             Whether this build reads kanji and hanzi. Without it (a build with no
             default features) kana is romanized and ideographs are left as written.
+    Room:
+      type: object
+      description: One room and the chains in it.
+      required:
+      - id
+      - name
+      - kind
+      - sort
+      - created_at
+      - chain_ids
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        icon:
+          type:
+          - string
+          - 'null'
+          description: A glyph name from the UI's set, or null.
+        kind:
+          type: string
+          description: |-
+            `room` for your own, `portable` (On the go) or `elsewhere` for the
+            built-ins, which cannot be renamed or deleted.
+        sort:
+          type: integer
+          format: int64
+        created_at:
+          type: integer
+          format: int64
+        chain_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: The chains in this room, by id. A chain may be in several rooms.
+    RoomList:
+      type: object
+      required:
+      - rooms
+      properties:
+        rooms:
+          type: array
+          items:
+            $ref: '#/components/schemas/Room'
     RotatedToken:
       type: object
       description: A re-issued token.
@@ -22120,6 +23105,24 @@ components:
           description: The new secret, returned once. The old one stops working now.
         message:
           type: string
+    RouteSaved:
+      type: object
+      description: What a route save did.
+      required:
+      - past
+      - kept
+      - unchanged
+      properties:
+        past:
+          type: string
+          description: '`keep` (past plays keep the old route) or `rewrite`.'
+        kept:
+          type: integer
+          format: int64
+          description: Plays (skips excluded) now filed with the old route. 0 for `rewrite`.
+        unchanged:
+          type: boolean
+          description: The route did not change; only slot options or names were saved.
     RowCreated:
       type: object
       description: A row that was just created.
@@ -22322,6 +23325,26 @@ components:
             - 'null'
             description: '`private` by default.'
       description: A note's target, flattened alongside its body.
+    SaveRouteRequest:
+      type: object
+      required:
+      - components
+      - past
+      properties:
+        components:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChainComponent'
+          description: |-
+            The steps in order, as the editor wired them. Slot `options` travel
+            on the steps; leaving them out keeps the ones a step had.
+        past:
+          type: string
+          description: |-
+            `keep`: plays already logged keep the route they had (from now on).
+            `rewrite`: every play ever logged here is read through the new route.
+            Required: on an endpoint that can move every hour of a chain, "which
+            one" must never be a default.
     SavedPlaylist:
       type: object
       required:
@@ -22985,6 +24008,28 @@ components:
           description: |-
             Which setup (variant) of that chain this output carries. Absent or
             `null` is the chain as wired. Must be a variant of `chain_id`.
+        equipment_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The box this output belongs to, for an output learned per box (see
+            `device_bindings` in the list). Absent maps the output by name, from
+            anything — the rung below.
+    SetChainRoomsRequest:
+      type: object
+      required:
+      - room_ids
+      properties:
+        room_ids:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: |-
+            Every room the chain is in. **Required:** `[]` takes it out of every
+            room; an absent field is a 400, because this replaces what was there.
     SetDeviceChainRequest:
       type: object
       required:
@@ -23074,6 +24119,81 @@ components:
       properties:
         enabled:
           type: boolean
+    SharedFormat:
+      type: object
+      description: |-
+        A listen's format and transcode details, as a shared chain hands them to
+        somebody else. Every field is null when the chain is not shared, when the
+        listen ran through no chain, or when the source never reported it.
+      properties:
+        format_type:
+          type:
+          - string
+          - 'null'
+        codec:
+          type:
+          - string
+          - 'null'
+        bitrate:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        sample_rate:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        bit_depth:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        is_lossless:
+          type:
+          - boolean
+          - 'null'
+        dsd_rate:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        dsd_multiplier:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        dsd_to_pcm_converted:
+          type:
+          - boolean
+          - 'null'
+        delivery_codec:
+          type:
+          - string
+          - 'null'
+        delivery_bitrate:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        delivery_sample_rate:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        delivery_bit_depth:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        is_transcoded:
+          type:
+          - boolean
+          - 'null'
+        transcode_reason:
+          type:
+          - string
+          - 'null'
     SharingSwitch:
       type: object
       required:
@@ -23848,6 +24968,87 @@ components:
           items:
             $ref: '#/components/schemas/MostSkipped'
           description: The ten tracks skipped most often, over the whole history.
+    Slot:
+      type: object
+      description: One slot of a chain, as the "what's on now" picker shows it.
+      required:
+      - position
+      - wired
+      - on
+      - options
+      properties:
+        position:
+          type: integer
+          format: int64
+          description: The step's index in the chain's components.
+        slot_name:
+          type:
+          - string
+          - 'null'
+        wired:
+          type: integer
+          format: int64
+          description: |-
+            The gear the step is wired with, which is what "as wired" and every
+            listen before the first switch mean.
+        on:
+          type: integer
+          format: int64
+          description: The gear on now.
+        on_since:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            When the gear on now went on, if a switch says so. Null when it has
+            been on since the chain began (no switch of this step recorded).
+        options:
+          type: array
+          items:
+            $ref: '#/components/schemas/SlotOption'
+    SlotOption:
+      type: object
+      description: One piece of gear that can be on at a slot.
+      required:
+      - equipment_id
+      - name
+      - picked_by
+      properties:
+        equipment_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        brand:
+          type:
+          - string
+          - 'null'
+        equipment_type:
+          type:
+          - string
+          - 'null'
+        purchased_at:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: When you bought it, if the gear record says.
+        first_play:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Its first play through any chain, skips excluded. "In use since" is
+            the purchase date when there is one, else this.
+        picked_by:
+          type: array
+          items:
+            type: string
+          description: |-
+            Outputs that pick this option by themselves (a Bluetooth name that
+            says which earbuds), by their reported name.
     Source:
       type: object
       description: A configured source, without its credentials.
@@ -24816,6 +26017,21 @@ components:
           description: |-
             Whose deck played what, biggest first. A sitting is several people's
             listening in one sequence, and this is the only figure that says so.
+    SpoolFiled:
+      type: object
+      description: What filing Shared Spool plays did.
+      required:
+      - moved
+      - chain_id
+      properties:
+        moved:
+          type: integer
+          format: int64
+          description: Plays filed, skips excluded.
+        chain_id:
+          type: integer
+          format: int64
+          description: The chain they went to.
     SpoolForwarding:
       type: object
       description: Whether plays accepted out of a Shared Spool are forwarded.
@@ -25957,6 +27173,12 @@ components:
           - string
           - 'null'
           description: The default chain's name.
+        equipment_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: The box this token's app runs on, when it has been tied to one.
     TokenValidation:
       type: object
       description: ListenBrainz's answer, plus what this token may do when it is valid.
@@ -26498,6 +27720,16 @@ components:
           - string
           - 'null'
           description: 'Why it is not in a chain: `new`, `spare`, `lent`. Absent clears it.'
+        aliases:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: |-
+            Other names this box reports as. **The one field absent leaves alone**
+            rather than clearing: gear editors that predate it send the record
+            without it, and must not wipe what the inbox remembered.
     UpdateProfileRequest:
       type: object
       description: |-
@@ -26524,6 +27756,25 @@ components:
           description: |-
             Must be an `http(s)` URL. A relative value is refused with 400 — only
             the upload endpoint may write a path this server serves.
+    UpdateRoomRequest:
+      type: object
+      properties:
+        name:
+          type:
+          - string
+          - 'null'
+          description: A new name. Absent leaves it; a built-in room cannot be renamed.
+        icon:
+          type:
+          - string
+          - 'null'
+          description: A new icon, or `null` to clear it. Absent leaves it alone.
+        sort:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Position in the order; lower comes first.
     UpdateScrobble:
       type: object
       description: Every field optional; only the fields sent change.
@@ -26723,6 +27974,7 @@ components:
       - overrides
       - created_at
       - total_hours
+      - auto
       properties:
         id:
           type: integer
@@ -26752,6 +28004,11 @@ components:
             The listening that went through *this variant*, which is a different
             question from a chain's total — a chain's hours include every variant
             of it, since they all ran through the same chain.
+        auto:
+          type: boolean
+          description: |-
+            Kept by Tapedeck for a set of slot picks ("what's on now"); its name
+            is internal and never shown. False for a setup someone named.
     VariantArtist:
       type: object
       description: An artist name with other spellings of itself in the same history.
@@ -26867,6 +28124,43 @@ components:
           type: string
         frozen:
           type: boolean
+    WhatsOn:
+      type: object
+      description: A chain's slots, and what a "since when?" needs to offer.
+      required:
+      - chain_id
+      - slots
+      properties:
+        chain_id:
+          type: integer
+          format: int64
+        slots:
+          type: array
+          items:
+            $ref: '#/components/schemas/Slot'
+        last_play_end:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            When the last play through this chain ended: "right after the last
+            play here". Null when it has none.
+    WhereAnswered:
+      type: object
+      description: What a `where` answer did.
+      required:
+      - rule
+      - moved
+      properties:
+        rule:
+          type: string
+          description: The rule written, as in `InboxQuestion.rule`.
+        moved:
+          type: integer
+          format: int64
+          description: How many counted plays were filed. Zero unless asked.
+          minimum: 0
     Word:
       type: object
       description: 'A word: parts written together, words separated by a space.'
