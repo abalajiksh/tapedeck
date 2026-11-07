@@ -14,6 +14,8 @@
 	export let equipment: Equipment[] = [];
 	/** chain id → (step position → gear on now), for chains with slots. */
 	export let onNow: Record<string, Record<string, number>> = {};
+	/** The built-in At a friend's chain, which has no steps to list. */
+	export let friendChainId: number | null = null;
 	export let lastUsed: Record<string, number> = {};
 	export let selectedId: number | null = null;
 	export let rooms: Room[] = [];
@@ -69,7 +71,7 @@
 								>{equipment.find((e) => e.id === onNow[String(c.id)]?.[String(at)])?.name ?? s.name} ▾</span
 							>{:else}{s.name}{/if}
 					{:else}
-						<span class="none">No steps yet</span>
+						<span class="none">{c.id === friendChainId ? 'Someone else’s system · Shared Spool plays' : 'No steps yet'}</span>
 					{/each}
 				</span>
 				<span class="pwhen">{lastUsedLabel(lastUsed[String(c.id)])}</span>

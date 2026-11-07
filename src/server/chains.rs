@@ -59,6 +59,12 @@ pub struct ChainList {
     /// (step position → equipment id). See `GET /api/v1/chains/{id}/whats-on`.
     #[schema(value_type = Object)]
     pub on_now: std::collections::BTreeMap<i64, crate::db::Picks>,
+    /// The built-in At a friend's chain, where Shared Spool plays land, once
+    /// it exists. It has no steps.
+    pub friend_chain_id: Option<i64>,
+    /// The chain Shared Spool plays land on instead, when one was named the
+    /// old way (`PUT /api/v1/profile/spool-chain`).
+    pub spool_chain_id: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -637,6 +643,13 @@ pub async fn list_chains(
         Ok(m) => m.into_iter().collect(),
         Err(e) => return internal(e),
     };
+    let (friend_chain_id, spool_chain_id) = match (
+        state.db.friend_chain(user.user_id).await,
+        state.db.spool_chain_id(user.user_id).await,
+    ) {
+        (Ok(f), Ok(s)) => (f, s),
+        (Err(e), _) | (_, Err(e)) => return internal(e),
+    };
     let last_used = match state.db.chain_last_used(user.user_id).await {
         Ok(m) => m,
         Err(e) => {
@@ -648,9 +661,11 @@ pub async fn list_chains(
         }
     };
     match state.db.get_chains(user.user_id).await {
-        Ok(chains) => {
-            (StatusCode::OK, Json(ChainList { chains, last_used, on_now })).into_response()
-        }
+        Ok(chains) => (
+            StatusCode::OK,
+            Json(ChainList { chains, last_used, on_now, friend_chain_id, spool_chain_id }),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse { code: 500, error: e.to_string() }),
@@ -1324,8 +1339,56 @@ async fn delete_binding(
     merge_chain,
     retire_moods,
     save_route,
+    file_spool,
 ))]
 pub struct Api;
+
+#[derive(Deserialize, ToSchema)]
+pub struct FileSpoolRequest {
+    /// The chain to file them under; absent or null is At a friend's (made
+    /// if it does not exist yet).
+    #[serde(default)]
+    pub chain_id: Option<i64>,
+}
+
+/// What filing Shared Spool plays did.
+#[derive(Serialize, ToSchema)]
+pub struct SpoolFiled {
+    /// Plays filed, skips excluded.
+    pub moved: i64,
+    /// The chain they went to.
+    pub chain_id: i64,
+}
+
+/// File accepted Shared Spool plays that landed on no chain.
+///
+/// Session-only. Every such play goes to the chain given, or to At a
+/// friend's. They were accepted before At a friend's existed; new ones land
+/// there on their own.
+#[utoipa::path(
+    post,
+    path = "/api/v1/chains/inbox/spool",
+    tag = "Chains",
+    request_body = FileSpoolRequest,
+    responses(
+        (status = 200, description = "Filed.", body = SpoolFiled),
+        (status = 400, response = BadRequest),
+        (status = 401, response = Unauthorized),
+    )
+)]
+async fn file_spool(
+    State(state): State<Arc<AppState>>,
+    user: AuthUser,
+    Json(body): Json<FileSpoolRequest>,
+) -> impl IntoResponse {
+    match state.db.file_spool_plays(user.user_id, body.chain_id).await {
+        Ok(Ok((moved, chain_id))) => {
+            (StatusCode::OK, Json(SpoolFiled { moved, chain_id })).into_response()
+        }
+        Ok(Err(why)) => bad(&why),
+        Err(e) => internal(e),
+    }
+}
 
 // ── The route editor ──
 
@@ -2032,6 +2095,7 @@ pub fn create_gear_router() -> Router<Arc<AppState>> {
         .route("/api/v1/chains/inbox/box", post(answer_inbox_box))
         .route("/api/v1/chains/inbox/dismiss", post(dismiss_inbox))
         .route("/api/v1/chains/inbox/moods", post(retire_moods))
+        .route("/api/v1/chains/inbox/spool", post(file_spool))
         .route("/api/v1/chains/:id/whats-on", get(whats_on))
         .route("/api/v1/chains/:id/fit", post(fit_slot))
         .route("/api/v1/chains/:id/merge", post(merge_chain))

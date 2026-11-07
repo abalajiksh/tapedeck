@@ -294,6 +294,9 @@ impl Database {
                 is_active BOOLEAN DEFAULT TRUE,
                 total_hours REAL DEFAULT 0,
                 created_at INTEGER NOT NULL,
+                -- own, or friend: the built-in At a friend's, where Shared
+                -- Spool plays land. `migrate()` adds it too.
+                kind TEXT NOT NULL DEFAULT 'own',
                 -- Phase 6: the sharing unit is the chain, not the listen.
                 --
                 -- Off by default, and it is what decides whether a listen ever

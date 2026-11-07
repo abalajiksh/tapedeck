@@ -107,6 +107,13 @@
 			const out = await api.mergeChain(m.chain_id, m.other_chain_id);
 			return `${m.other_gear} is an option on ${m.chain_name} now${out.listens ? `, with ${out.listens} ${out.listens === 1 ? 'play' : 'plays'}` : ''}.`;
 		});
+	let spoolChain = '';
+	const saveSpool = () =>
+		run(async () => {
+			const out = await api.fileSpool(spoolChain ? Number(spoolChain) : null);
+			const where = spoolChain ? `on ${chains.find((c) => c.id === out.chain_id)?.name ?? 'that chain'}` : 'At a friend’s';
+			return `${out.moved} Shared Spool ${out.moved === 1 ? 'play is' : 'plays are'} filed ${where}.`;
+		});
 	const saveMoods = () =>
 		run(async () => {
 			const out = await api.retireMoods((q.setups ?? []).map((s) => s.id));
@@ -191,6 +198,26 @@
 			<span class="grow"></span>
 			<button class="btn btn-secondary" disabled={busy} on:click={notNow}>Keep them apart</button>
 			<button class="btn btn-primary" disabled={busy} on:click={saveMerge}>Make it an option</button>
+		</div>
+	{:else if q.kind === 'spool' && q.spool}
+		<h3>{q.spool.plays} {q.spool.plays === 1 ? 'play' : 'plays'} from Shared Spools landed nowhere</h3>
+		<p class="muted">
+			{when(q.spool.first ?? undefined)}{q.spool.last && q.spool.last !== q.spool.first ? ` to ${when(q.spool.last)}` : ''}.
+			You accepted {q.spool.plays === 1 ? 'it' : 'them'} before Tapedeck had somewhere for someone else’s system.
+			At a friend’s is that place: no gear of yours, just the hours. Plays you accept from now on go there by
+			themselves.
+		</p>
+		<div class="acts">
+			<label class="alias" style="max-width:280px;">
+				<span>File them</span>
+				<select class="input" bind:value={spoolChain}>
+					<option value="">At a friend’s</option>
+					{#each sortedChains as c (c.id)}<option value={String(c.id)}>on {c.name}</option>{/each}
+				</select>
+			</label>
+			<span class="grow"></span>
+			<button class="btn btn-secondary" disabled={busy} on:click={notNow}>Leave them unfiled</button>
+			<button class="btn btn-primary" disabled={busy} on:click={saveSpool}>File them</button>
 		</div>
 	{:else if q.kind === 'moods'}
 		{@const n = (q.setups ?? []).length}

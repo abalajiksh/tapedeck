@@ -1027,6 +1027,13 @@ impl Database {
         .into_iter()
         .collect();
         let mut out = Vec::new();
+        if let Some(spool) = self.unfiled_spool(user_id).await? {
+            if !dismissed.contains("spool") {
+                let mut q = InboxQuestion::new("spool".into(), "spool");
+                q.spool = Some(spool);
+                out.push(q);
+            }
+        }
         for m in self.merge_candidates(user_id).await? {
             let key = format!("merge:{}:{}", m.chain_id, m.other_chain_id);
             if dismissed.contains(&key) {

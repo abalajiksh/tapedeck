@@ -75,7 +75,8 @@ pub struct InboxQuestion {
     /// `same_box` — are these reporters this box? `which_box` — which box is
     /// this reporter? `where` — plays landed nowhere; where were you?
     /// `merge` — two chains differ at one box; make it an option? `moods` —
-    /// named setups that change no gear; make them session titles?
+    /// named setups that change no gear; make them session titles? `spool` —
+    /// Shared Spool plays on no chain; file them At a friend's?
     pub kind: &'static str,
     /// `same_box`: the box suggested, by a name or model it matches.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,6 +119,9 @@ pub struct InboxQuestion {
     /// `moods`: every setup that changes no gear.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub setups: Vec<super::InboxSetup>,
+    /// `spool`: accepted Shared Spool plays on no chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spool: Option<super::InboxSpool>,
 }
 
 impl InboxQuestion {
@@ -139,6 +143,7 @@ impl InboxQuestion {
             rule: None,
             merge: None,
             setups: Vec::new(),
+            spool: None,
         }
     }
 }

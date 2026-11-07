@@ -1146,7 +1146,7 @@ export interface InboxReporter {
 /** One question in the Signal Chains inbox. */
 export interface InboxQuestion {
 	key: string;
-	kind: 'same_box' | 'which_box' | 'where' | 'merge' | 'moods';
+	kind: 'same_box' | 'which_box' | 'where' | 'merge' | 'moods' | 'spool';
 	equipment_id?: number;
 	equipment_name?: string;
 	reporters?: InboxReporter[];
@@ -1163,6 +1163,8 @@ export interface InboxQuestion {
 	rule?: 'device_output' | 'output' | 'token' | 'device' | 'none';
 	merge?: InboxMerge;
 	setups?: InboxSetup[];
+	/** `spool`: accepted Shared Spool plays on no chain. */
+	spool?: { plays: number; first: number | null; last: number | null };
 }
 
 export interface Binding {
@@ -3299,6 +3301,10 @@ class TapedeckAPI {
 		last_used: Record<string, number>;
 		/** chain id → (step position → equipment id on now), for chains with slots. */
 		on_now: Record<string, Record<string, number>>;
+		/** The built-in At a friend's chain, once it exists. */
+		friend_chain_id: number | null;
+		/** A chain Shared Spool plays land on instead, named the old way. */
+		spool_chain_id: number | null;
 	}> {
 		return this.get('/api/v1/chains');
 	}
@@ -3324,6 +3330,11 @@ class TapedeckAPI {
 	/** Merge a chain that differs at one box into this one, as an option. Not reversible. */
 	async mergeChain(chainId: number, fromChainId: number): Promise<FoldOutcome> {
 		return this.post(`/api/v1/chains/${chainId}/merge`, { from_chain_id: fromChainId });
+	}
+	/** File accepted Shared Spool plays on no chain, At a friend's when
+	 *  `chainId` is null. */
+	async fileSpool(chainId: number | null): Promise<{ moved: number; chain_id: number }> {
+		return this.post('/api/v1/chains/inbox/spool', { chain_id: chainId });
 	}
 	/** Named setups that change no gear become titles on their sittings. */
 	async retireMoods(variantIds: number[]): Promise<{ sessions_titled: number; removed: number }> {

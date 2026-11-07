@@ -96,6 +96,7 @@ impl Database {
             ("tokens", "equipment_id", "BIGINT"),
             ("equipment", "aliases", "TEXT"),
             ("chain_variants", "auto", "BOOLEAN NOT NULL DEFAULT FALSE"),
+            ("signal_chains", "kind", "TEXT NOT NULL DEFAULT 'own'"),
         ] {
             if !has_column(&self.pool, table, column).await? {
                 info!("⚙️ Migrating: {table}.{column}...");
@@ -1317,6 +1318,7 @@ impl Database {
             ("tokens", "equipment_id", "INTEGER"),
             ("equipment", "aliases", "TEXT"),
             ("chain_variants", "auto", "BOOLEAN NOT NULL DEFAULT FALSE"),
+            ("signal_chains", "kind", "TEXT NOT NULL DEFAULT 'own'"),
         ] {
             if !has_column(&self.pool, table, column).await {
                 info!("⚙️ Migrating: adding {table}.{column}...");

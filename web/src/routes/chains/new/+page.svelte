@@ -37,12 +37,32 @@
 	let find: 'ask' | 'device' = 'ask';
 	let creating = false;
 
+	// Where the first-run screen sent us from: a kind of start, which only
+	// changes what is offered first, or a box something already reports as.
+	type Start = 'desk' | 'go' | 'records' | 'blank';
+	let start: Start | null = null;
+	const PREFER: Record<Start, string[]> = {
+		desk: ['computer', 'speakers', 'headphones', 'dac', 'dac-amp', 'amp'],
+		go: ['phone', 'dap', 'headphones', 'iem', 'earbuds'],
+		records: ['turntable', 'phono', 'speakers', 'amp'],
+		blank: []
+	};
+	$: prefer = (t: string) => (start ? PREFER[start].indexOf(t) : -1);
+
 	onMount(async () => {
 		try {
 			const [g, d, r] = await Promise.all([api.getEquipment(), api.getDevices(), api.getRooms()]);
 			equipment = g.equipment;
 			devices = d.devices;
 			rooms = r.rooms;
+			const q = new URLSearchParams(window.location.search);
+			const s = q.get('start');
+			if (s === 'desk' || s === 'go' || s === 'records' || s === 'blank') start = s;
+			const from = Number(q.get('src'));
+			if (from && equipment.some((e) => e.id === from)) {
+				src = from;
+				find = 'device';
+			}
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Could not load your gear';
 		}
@@ -51,8 +71,15 @@
 
 	const gear = (id: number | null) => equipment.find((e) => e.id === id);
 	const sub = (g: Equipment) => [g.brand, g.model].filter(Boolean).join(' ') || g.equipment_type;
+	// What the start suggests first, then by name.
 	$: byGroup = (g: GearGroup) =>
-		equipment.filter((e) => groupOf(e.equipment_type) === g).sort((a, b) => a.name.localeCompare(b.name));
+		equipment
+			.filter((e) => groupOf(e.equipment_type) === g)
+			.sort((a, b) => {
+				const pa = prefer(a.equipment_type);
+				const pb = prefer(b.equipment_type);
+				return (pa < 0 ? 99 : pa) - (pb < 0 ? 99 : pb) || a.name.localeCompare(b.name);
+			});
 	const toggle = (list: number[], id: number) => (list.includes(id) ? list.filter((x) => x !== id) : [...list, id]);
 
 	$: srcGear = gear(src);
@@ -64,8 +91,11 @@
 	$: if (!named) name = suggested;
 	// A phone or a music player goes with you.
 	$: portable = rooms.find((r) => r.kind === 'portable');
-	$: if (!roomsTouched && portable) roomIds = srcGear && ['phone', 'dap'].includes(srcGear.equipment_type) ? [portable.id] : [];
+	$: if (!roomsTouched && portable)
+		roomIds = (srcGear && ['phone', 'dap'].includes(srcGear.equipment_type)) || (!srcGear && start === 'go') ? [portable.id] : [];
 	$: reporters = devices.filter((d) => d.equipment_id != null && d.equipment_id === src);
+	// A start from a box with no devices tied to it falls back to asking.
+	$: if (find === 'device' && !reporters.length && devices.length) find = 'ask';
 
 	$: canNext = step === 1 ? ears.length > 0 : step === 2 ? src != null : name.trim().length > 0;
 

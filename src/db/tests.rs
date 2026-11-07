@@ -12988,3 +12988,107 @@ async fn a_rewritten_route_moves_the_hours_and_swaps_follow_their_gear() {
     bad[1].equipment_id = Some(theirs);
     assert!(db.save_route(uid, chain, &bad, true).await.unwrap().is_err());
 }
+
+// ── At a friend's (phase 5) ──
+
+/// An accepted Shared Spool play lands At a friend's, made on first use in
+/// the Elsewhere room with no steps and shared with nobody; a chain named
+/// the old way still wins.
+#[tokio::test]
+async fn an_accepted_spool_play_lands_at_a_friends_unless_a_chain_was_named() {
+    let db = testdb().await;
+    let (me, them, chain) = patched_pair(&db).await;
+    let spool = db.start_spool(them, Some("Sunday"), &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+    listen(&db, them, Some(chain), "One", "Massive Attack", 1_760_000_100).await;
+    listen(&db, them, Some(chain), "Two", "Massive Attack", 1_760_000_400).await;
+    assert_eq!(db.friend_chain(me).await.unwrap(), None, "made only when needed");
+
+    let caps = db.spool_captures(me).await.unwrap();
+    let one = caps.iter().find(|c| c.title == "One").unwrap().id;
+    let two = caps.iter().find(|c| c.title == "Two").unwrap().id;
+    db.settle_captures(me, &[one], true).await.unwrap();
+    let friend = db.friend_chain(me).await.unwrap().expect("made on the first accept");
+    let c = db.get_chain(me, friend).await.unwrap().unwrap();
+    assert!(c.components.is_empty() && !c.shared, "no gear, and Only me");
+    let rooms = db.list_rooms(me).await.unwrap();
+    let elsewhere = rooms.iter().find(|r| r.kind == "elsewhere").expect("the Elsewhere room");
+    assert_eq!(elsewhere.chain_ids, vec![friend]);
+    let landed: Option<i64> =
+        sqlx::query_scalar("SELECT chain_id FROM scrobbles WHERE user_id = ? AND title = 'One'")
+            .bind(me)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(landed, Some(friend));
+
+    // A chain named the old way is honoured.
+    let mine = chain_of(&db, me, "Living room", &[]).await;
+    assert!(db.set_spool_chain(me, Some(mine)).await.unwrap());
+    db.settle_captures(me, &[two], true).await.unwrap();
+    let landed: Option<i64> =
+        sqlx::query_scalar("SELECT chain_id FROM scrobbles WHERE user_id = ? AND title = 'Two'")
+            .bind(me)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(landed, Some(mine));
+
+    // The friend chain has no route to edit.
+    assert!(db.save_route(me, friend, &[], true).await.unwrap().is_err());
+    // Made once.
+    assert_eq!(db.ensure_friend_chain(me).await.unwrap(), friend);
+}
+
+/// Spool plays accepted before At a friend's existed are asked about once
+/// and filed together.
+#[tokio::test]
+async fn spool_plays_on_no_chain_are_asked_about_and_filed_at_a_friends() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    for (i, skipped) in [(0, false), (1, false), (2, true)] {
+        let p = Play::new(
+            format!("S{i}"),
+            "A".into(),
+            1_760_000_000 + i * 300,
+            format!("spool-x-{i}"),
+            super::friend::SPOOL_SOURCE.into(),
+        );
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(super::friend::SPOOL_SOURCE),
+            None,
+            ListenDisposition { imported: true, skipped },
+        )
+        .await
+        .unwrap();
+    }
+    let q = db.slot_questions(uid).await.unwrap();
+    let spool = q.iter().find(|q| q.kind == "spool").expect("asked");
+    assert_eq!(spool.spool.as_ref().unwrap().plays, 2, "skips are not counted");
+    assert!(db
+        .chain_inbox(uid)
+        .await
+        .unwrap()
+        .iter()
+        .all(|q| q.source_name.as_deref() != Some(super::friend::SPOOL_SOURCE)));
+
+    let (moved, chain) = db.file_spool_plays(uid, None).await.unwrap().unwrap();
+    assert_eq!(moved, 2);
+    assert_eq!(Some(chain), db.friend_chain(uid).await.unwrap());
+    let left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND chain_id IS NULL")
+            .bind(uid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(left, 0, "the skip goes with them, as stored");
+    assert!(db.slot_questions(uid).await.unwrap().iter().all(|q| q.kind != "spool"));
+    assert!(db.file_spool_plays(uid, Some(99_999)).await.unwrap().is_err());
+}

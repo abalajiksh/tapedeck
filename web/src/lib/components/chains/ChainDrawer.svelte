@@ -54,6 +54,10 @@
 	export let whatsOn: WhatsOn | null = null;
 	/** What the last change said, shown under the route. */
 	export let notice = '';
+	/** The built-in At a friend's chain's id, once it exists. */
+	export let friendChainId: number | null = null;
+	/** A chain Shared Spool plays land on instead, named the old way. */
+	export let spoolChainId: number | null = null;
 
 	const dispatch = createEventDispatcher<{
 		close: void;
@@ -66,6 +70,7 @@
 		rename: void;
 		rooms: number[];
 		rule: RuleChange;
+		spoolChain: number | null;
 		changed: string;
 	}>();
 
@@ -75,6 +80,8 @@
 	}
 
 	$: steps = chain.components ?? [];
+	$: isFriend = chain.id === friendChainId;
+	$: spoolElsewhere = spoolChainId != null && spoolChainId !== friendChainId ? (chains.find((c) => c.id === spoolChainId) ?? null) : null;
 	$: mine = variants.filter((v) => v.chain_id === chain.id);
 	// Named setups slots could not take in (they add or remove a box). Those
 	// that change no gear are offered as session titles in the inbox.
@@ -182,6 +189,29 @@
 	</header>
 
 	<div class="dbody">
+		{#if isFriend}
+		<section aria-label="Someone else's system">
+			<div class="kicker">Someone else’s system</div>
+			<p class="muted">
+				Plays you accept from a Shared Spool land here. It has no route: it was not your gear, so it credits
+				none, and only the hours and the format of what you heard are kept.
+			</p>
+			{#if spoolElsewhere}
+				<p class="muted warn">
+					Right now they go to <b>{spoolElsewhere.name}</b> instead, the chain you picked before this one existed.
+				</p>
+			{/if}
+			<label class="spool">
+				<span>Spool plays land</span>
+				<select class="input" value={spoolElsewhere ? String(spoolElsewhere.id) : ''}
+					on:change={(e) => dispatch('spoolChain', e.currentTarget.value ? Number(e.currentTarget.value) : null)}>
+					<option value="">here, at a friend’s</option>
+					{#each chains.filter((c) => c.id !== chain.id) as c (c.id)}<option value={String(c.id)}>on {c.name} instead</option>{/each}
+				</select>
+			</label>
+			{#if notice}<p class="notice">✓ {notice}</p>{/if}
+		</section>
+		{:else}
 		<section aria-label="The route">
 			<div class="kicker">The route</div>
 			{#each steps as s, i}
@@ -227,6 +257,8 @@
 			{/if}
 		</section>
 
+		{/if}
+
 		<section aria-label="Where it lives">
 			<div class="kicker">Where it lives</div>
 			<div class="rchips" role="group" aria-label="Rooms {chain.name} is in">
@@ -269,6 +301,7 @@
 			</section>
 		{/if}
 
+		{#if !isFriend}
 		<section aria-label="How plays find this chain">
 			<div class="kicker">How plays find this chain</div>
 			{#each routing as r (r.key)}
@@ -290,6 +323,7 @@
 				</p>
 			{/each}
 		</section>
+		{/if}
 
 		{#if gearHours.length}
 			<section aria-label="Gear hours on this chain">
@@ -326,9 +360,13 @@
 	<footer class="dfoot">
 		<button class="btn btn-ghost del" on:click={() => dispatch('delete')}>Delete chain</button>
 		<span style="flex:1"></span>
-		<button class="btn btn-secondary" on:click={() => dispatch('duplicate')}>Duplicate</button>
-		<button class="btn btn-secondary" on:click={() => dispatch('rename')}>Rename</button>
-		<button class="btn btn-primary" on:click={() => dispatch('edit')}>Edit the route</button>
+		{#if isFriend}
+			<button class="btn btn-secondary" on:click={() => dispatch('rename')}>Rename</button>
+		{:else}
+			<button class="btn btn-secondary" on:click={() => dispatch('duplicate')}>Duplicate</button>
+			<button class="btn btn-secondary" on:click={() => dispatch('rename')}>Rename</button>
+			<button class="btn btn-primary" on:click={() => dispatch('edit')}>Edit the route</button>
+		{/if}
 	</footer>
 </aside>
 
@@ -646,6 +684,22 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 		max-width: 180px;
+	}
+	.spool {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		margin-top: 10px;
+		max-width: 320px;
+	}
+	.spool span {
+		font-size: 12px;
+		font-weight: 600;
+		color: var(--td-muted);
+	}
+	.warn {
+		margin-top: 8px;
+		color: var(--td-text);
 	}
 	.rmove {
 		width: auto;

@@ -5654,6 +5654,33 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+  /api/v1/chains/inbox/spool:
+    post:
+      tags:
+      - Chains
+      summary: File accepted Shared Spool plays that landed on no chain.
+      description: |-
+        Session-only. Every such play goes to the chain given, or to At a
+        friend's. They were accepted before At a friend's existed; new ones land
+        there on their own.
+      operationId: file_spool
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FileSpoolRequest'
+        required: true
+      responses:
+        '200':
+          description: Filed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpoolFiled'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
   /api/v1/notes:
     get:
       tags:
@@ -13992,6 +14019,22 @@ components:
           description: |-
             What is on now at each slot, for chains with slots: chain id →
             (step position → equipment id). See `GET /api/v1/chains/{id}/whats-on`.
+        friend_chain_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The built-in At a friend's chain, where Shared Spool plays land, once
+            it exists. It has no steps.
+        spool_chain_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The chain Shared Spool plays land on instead, when one was named the
+            old way (`PUT /api/v1/profile/spool-chain`).
     ChainShareSwitch:
       type: object
       required:
@@ -15899,6 +15942,17 @@ components:
               description: The words were already held, so nothing was fetched.
         description: The document, as the reader should now show it.
       description: 'A lookup''s outcome: the whole lyric document, or why nobody could be asked.'
+    FileSpoolRequest:
+      type: object
+      properties:
+        chain_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            The chain to file them under; absent or null is At a friend's (made
+            if it does not exist yet).
     FileUpload:
       type: object
       description: |-
@@ -16910,7 +16964,8 @@ components:
             `same_box` — are these reporters this box? `which_box` — which box is
             this reporter? `where` — plays landed nowhere; where were you?
             `merge` — two chains differ at one box; make it an option? `moods` —
-            named setups that change no gear; make them session titles?
+            named setups that change no gear; make them session titles? `spool` —
+            Shared Spool plays on no chain; file them At a friend's?
         equipment_id:
           type:
           - integer
@@ -16988,6 +17043,11 @@ components:
           items:
             $ref: '#/components/schemas/InboxSetup'
           description: '`moods`: every setup that changes no gear.'
+        spool:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/InboxSpool'
+            description: '`spool`: accepted Shared Spool plays on no chain.'
     InboxReporter:
       type: object
       description: One device or token, as the inbox names it.
@@ -17043,6 +17103,26 @@ components:
           type: integer
           format: int64
           description: Sittings those plays are in that have no title yet.
+    InboxSpool:
+      type: object
+      description: Shared Spool plays that landed on no chain.
+      required:
+      - plays
+      properties:
+        plays:
+          type: integer
+          format: int64
+          description: Plays, skips excluded.
+        first:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        last:
+          type:
+          - integer
+          - 'null'
+          format: int64
     InstancePulse:
       type: object
       description: What the instance has been playing, over shared chains only.
@@ -25937,6 +26017,21 @@ components:
           description: |-
             Whose deck played what, biggest first. A sitting is several people's
             listening in one sequence, and this is the only figure that says so.
+    SpoolFiled:
+      type: object
+      description: What filing Shared Spool plays did.
+      required:
+      - moved
+      - chain_id
+      properties:
+        moved:
+          type: integer
+          format: int64
+          description: Plays filed, skips excluded.
+        chain_id:
+          type: integer
+          format: int64
+          description: The chain they went to.
     SpoolForwarding:
       type: object
       description: Whether plays accepted out of a Shared Spool are forwarded.

@@ -3221,16 +3221,6 @@ impl Database {
         // Read once for the batch rather than per capture: it is one person's
         // standing answer, and it cannot change halfway through a click.
         let forwarding = accept && self.forward_spool_listens(user_id).await?;
-        // The chain this account files a room it sat in under, if it has named
-        // one. Read once for the batch like the forwarding switch above: it is
-        // a standing answer, not a per-play one.
-        //
-        // Unset is the default and reproduces exactly what these listens used
-        // to be — no chain, therefore no gear hours, no place in the Reel and
-        // nothing in any chain total. That was defensible and it was not the
-        // whole truth: you were in the room hearing real speakers, and if you
-        // have built a chain that says so it should get the hours.
-        let chain_id = if accept { self.spool_chain_id(user_id).await? } else { None };
         let placeholders = std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");
 
         let sql = format!(
@@ -3251,6 +3241,15 @@ impl Database {
             q = q.bind(id);
         }
         let rows = q.fetch_all(&self.pool).await?;
+
+        // Where an accepted play lands, read once for the batch: the chain this
+        // account named the old way ("Rooms you sit in"), else At a friend's,
+        // made the first time it is needed. Before phase 5 an unnamed chain
+        // meant no chain at all, so the plays earned no hours and could never
+        // reach the Reel; you were in the room hearing real speakers, and they
+        // were not yours, which is exactly what a chain with no steps says.
+        let chain_id =
+            if accept && !rows.is_empty() { Some(self.spool_target(user_id).await?) } else { None };
 
         let mut settled = 0;
         let mut forwarded = 0;

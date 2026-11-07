@@ -67,6 +67,9 @@ impl Database {
         let Some(chain) = self.get_chain(user_id, chain_id).await? else {
             return Ok(Err("No such chain".into()));
         };
+        if self.friend_chain(user_id).await? == Some(chain_id) {
+            return Ok(Err("At a friend's has no route: it is someone else's system".into()));
+        }
         if components.iter().all(|c| c.name.trim().is_empty()) {
             return Ok(Err("A route needs at least one box".into()));
         }
