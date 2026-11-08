@@ -235,8 +235,8 @@ impl Database {
         rows.reverse();
         let since = rows.first().map(|r| r.0).unwrap_or(0);
 
-        let credits: Vec<(i64, String)> = sqlx::query_as(&crate::sql!(
-            "SELECT s.timestamp, sa.artist_key
+        let credits: Vec<(i64, String, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT s.timestamp, sa.artist_key, sa.name
                FROM scrobbles s JOIN scrobble_artists sa ON sa.scrobble_id = s.id
               WHERE s.user_id = ? AND s.skipped = FALSE AND s.timestamp >= ?"
         ))
@@ -256,7 +256,7 @@ impl Database {
                 .collect(),
             credits
                 .into_iter()
-                .map(|(ts, artist_key)| crate::dossier::Credit { ts, artist_key })
+                .map(|(ts, artist_key, name)| crate::dossier::Credit { ts, artist_key, name })
                 .collect(),
             capped,
         ))

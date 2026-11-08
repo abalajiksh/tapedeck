@@ -21,6 +21,7 @@
 	import MonthChapter from '$lib/components/reports/MonthChapter.svelte';
 	import YearChapter from '$lib/components/reports/YearChapter.svelte';
 	import PeriodNote from '$lib/components/reports/PeriodNote.svelte';
+	import ReportGraphs from '$lib/components/reports/ReportGraphs.svelte';
 	import ShareChapter from '$lib/components/reports/ShareChapter.svelte';
 
 	const UNITS: { k: 'week' | 'month' | 'year'; label: string }[] = [
@@ -224,6 +225,13 @@
 		     same thing whichever unit is on screen, and putting it in each layout
 		     would be three copies free to drift. Keyed on the period so stepping
 		     to another one cannot leave the previous note's editor open over it. -->
+		<!-- The graphs, sized to the period. Below the chapter for the reason
+		     the note is: one component for all three units, keyed so a stepped-
+		     away period's graphs can never sit under the next one's chapter. -->
+		{#key `${unit}:${period.key}`}
+			<ReportGraphs {unit} periodKey={period.key} />
+		{/key}
+
 		{#key `${unit}:${period.key}`}
 			<PeriodNote {unit} periodKey={period.key} label={period.label} />
 		{/key}

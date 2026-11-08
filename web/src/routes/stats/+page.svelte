@@ -6,6 +6,15 @@
 	import ArtistLinks from '$lib/components/ArtistLinks.svelte';
 	import { openAlbum, openArtist } from '$lib/entities';
 	import { fidelity, fidelityLabel } from '$lib/fidelity';
+	import type { StatsGraphs } from '$lib/api';
+	import VolumeChart from '$lib/components/charts/VolumeChart.svelte';
+	import WavesChart from '$lib/components/charts/WavesChart.svelte';
+	import LongTailChart from '$lib/components/charts/LongTailChart.svelte';
+	import SessionsChart from '$lib/components/charts/SessionsChart.svelte';
+	import FirstListensChart from '$lib/components/charts/FirstListensChart.svelte';
+	import HabitsScatter from '$lib/components/charts/HabitsScatter.svelte';
+	import AlbumSpread from '$lib/components/charts/AlbumSpread.svelte';
+	import AnchorSongs from '$lib/components/charts/AnchorSongs.svelte';
 
 	const ranges: { v: StatsRange; label: string }[] = [
 		{ v: 'week', label: 'Week' },
@@ -91,8 +100,26 @@
 			Lossy: 'linear-gradient(90deg,#8a8172,#b3a487)'
 		})[tier] ?? 'linear-gradient(90deg,#645c50,#9a8f7d)';
 
+	/** The eight graphs. Fetched beside the stats, not with them: they are a
+	 *  whole-history fold on the server and can take longer, and the top lists
+	 *  should not wait for them. */
+	let graphs: StatsGraphs | null = null;
+	let graphsFor: StatsRange | null = null;
+	let graphsError = false;
+	function loadGraphs(r: StatsRange) {
+		graphsError = false;
+		api.getStatsGraphs(r)
+			.then((g) => {
+				// A slower answer for a range the user has already left is dropped.
+				if (r === range) { graphs = g; graphsFor = r; }
+			})
+			.catch((e) => { if (r === range) graphsError = true; console.warn('graphs', e); });
+	}
+	$: graphsStale = graphsFor !== range;
+
 	async function load() {
 		loading = true;
+		if (graphsFor !== range) loadGraphs(range);
 		try {
 			[stats, persona] = await Promise.all([
 				api.getRangedStats(range, metric),
@@ -460,6 +487,78 @@
 				<span style="background:rgba(198,113,57,.92);"></span>More</div>
 		</div>
 	</div>
+	<!-- The graphs (v0.130): the shape of the listening over time. -->
+	<section class="graphs" class:stale={graphsStale}>
+		{#if graphsError && !graphs}
+			<p class="g-note">The graphs could not be loaded.</p>
+		{:else if !graphs}
+			<div class="panel g-panel g-wait">Drawing the graphs…</div>
+		{:else if !graphs.volume.plays}
+			<p class="g-note">No listens in this range to draw.</p>
+		{:else}
+			{@const g = graphs}
+			<h3 class="h-display g-h">Listening volume</h3>
+			<div class="panel g-panel">
+				<p class="g-lede">
+					<strong>{g.volume.plays.toLocaleString()}</strong> listens over
+					<strong>{g.volume.active_days.toLocaleString()}</strong> days you listened, of
+					{g.daily.length.toLocaleString()} in this range.
+				</p>
+				{#if g.start_day}
+					<VolumeChart start={g.start_day} daily={g.daily} median={g.volume.median_active_day} peak={g.volume.peak} />
+				{/if}
+			</div>
+
+			{#if g.waves.length && g.start_day}
+				<h3 class="h-display g-h">Obsession waves</h3>
+				<div class="panel g-panel"><WavesChart start={g.start_day} waves={g.waves} /></div>
+			{/if}
+
+			<div class="g-two">
+				<div>
+					<h3 class="h-display g-h">The long tail</h3>
+					<div class="panel g-panel">
+						<p class="g-lede">
+							<strong>{g.long_tail.once.toLocaleString()}</strong> of {g.long_tail.counts.length.toLocaleString()}
+							artists heard once{#if g.long_tail.hundred_plus} · <strong>{g.long_tail.hundred_plus.toLocaleString()}</strong>
+							heard 100 times or more{/if}.
+						</p>
+						<LongTailChart counts={g.long_tail.counts} credits={g.long_tail.credits} half={g.long_tail.half} eighty={g.long_tail.eighty} />
+					</div>
+				</div>
+				<div>
+					<h3 class="h-display g-h">Anchor songs</h3>
+					<div class="panel g-panel"><AnchorSongs anchors={g.anchors} /></div>
+				</div>
+			</div>
+
+			<h3 class="h-display g-h">Sessions</h3>
+			<div class="panel g-panel">
+				<SessionsChart total={g.sessions.total} gapMinutes={g.sessions.gap_minutes} lengths={g.sessions.lengths} devotion={g.sessions.devotion} />
+			</div>
+
+			<!-- Not over a week: there is no "coming back" to measure in seven days. -->
+			{#if g.habits.length && g.daily.length > 14}
+				<h3 class="h-display g-h">Habit or burst</h3>
+				<div class="panel g-panel"><HabitsScatter habits={g.habits} /></div>
+			{/if}
+
+			{#if g.first_listens.length}
+				<h3 class="h-display g-h">When they arrived</h3>
+				<div class="panel g-panel"><FirstListensChart artists={g.first_listens} /></div>
+			{/if}
+
+			{#if g.albums.length}
+				<h3 class="h-display g-h">Album spread</h3>
+				<div class="panel g-panel"><AlbumSpread artists={g.albums} /></div>
+			{/if}
+
+			{#if g.capped}
+				<p class="g-note">This history is longer than the server reads in one pass, so its oldest listens are left out of these graphs.</p>
+			{/if}
+		{/if}
+	</section>
+
 	<!-- Breadth -->
 	{#if stats.breadth && stats.breadth.genres_played > 1}
 		<h3 class="h-display" style="font-size:19px;margin:24px 0 12px;">Breadth</h3>
@@ -592,6 +691,20 @@
 		font-size: 11px; line-height: 1.35; color: var(--td-muted-3);
 		margin-top: 6px;
 	}
+	/* The graphs. A range change keeps the old ones up, dimmed, until the new
+	   fold arrives — a blank page between two ranges reads as "nothing here". */
+	.graphs { margin-top: 8px; transition: opacity 0.2s; }
+	.graphs.stale { opacity: 0.5; }
+	.g-h { font-size: 19px; margin: 24px 0 12px; }
+	.g-panel { border-radius: 22px; padding: 22px; }
+	.g-wait { color: var(--td-muted-3); font-size: 13px; }
+	.g-lede { margin: 0 0 14px; font-size: 13.5px; color: var(--td-muted); }
+	.g-lede strong { color: var(--td-text); }
+	.g-note { color: var(--td-muted-3); font-size: 12.5px; margin: 16px 0 0; }
+	.g-two { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 16px; }
+	.g-two > div { display: flex; flex-direction: column; min-width: 0; }
+	@media (max-width: 900px) { .g-two { grid-template-columns: 1fr; } }
+
 	.breakdowns {
 		display: grid;
 		grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));

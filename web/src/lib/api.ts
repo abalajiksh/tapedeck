@@ -534,6 +534,68 @@ export interface Personality {
 	total_plays: number;
 }
 
+/** `GET /api/v1/stats/graphs` — see `src/graphs.rs`. Artist figures are
+ *  shares of artist **credits**, not listens; `volume` and `sessions` count
+ *  listens. Every `daily` array starts at `start_day`, one entry per day. */
+export interface StatsGraphs {
+	range: StatsRange;
+	timezone: string;
+	capped: boolean;
+	start_day: string | null;
+	daily: number[];
+	volume: {
+		plays: number;
+		active_days: number;
+		median_active_day: number;
+		peak?: { day: string; plays: number };
+	};
+	waves: { name: string; plays: number; daily: number[] }[];
+	long_tail: {
+		counts: number[];
+		credits: number;
+		once: number;
+		hundred_plus: number;
+		half: number;
+		eighty: number;
+	};
+	sessions: {
+		total: number;
+		gap_minutes: number;
+		lengths: { label: string; sessions: number }[];
+		devotion: { min_listens: number; devoted: number; mixed: number; scattered: number };
+	};
+	first_listens: { name: string; plays: number; first: number; last: number; loyalty: number }[];
+	habits: {
+		name: string;
+		plays: number;
+		active_days: number;
+		span_days: number;
+		return_rate: number;
+		top_day_share: number;
+		top_day: string;
+		loyalty: number;
+	}[];
+	albums: {
+		name: string;
+		plays: number;
+		album_count: number;
+		albums: { name: string; album_artist: string; plays: number }[];
+		rest_plays: number;
+		no_album: number;
+	}[];
+	anchors: { name: string; plays: number; title: string; title_plays: number; share: number; tracks: number }[];
+}
+
+/** `GET /api/v1/reports/graphs` — the graphs under one report chapter. */
+export interface ReportGraphs {
+	unit: 'week' | 'month' | 'year';
+	key: string;
+	timezone: string;
+	graphs: StatsGraphs;
+	/** Who topped each week of a month or month of a year; empty for a week. */
+	throne: { start: string; label: string; artist?: string; plays: number; listens: number }[];
+}
+
 export interface ImportJob {
 	job_id: string; source: string; state: 'running' | 'done' | 'error';
 	fetched: number; imported: number; total: number | null; status: string; date: number;
@@ -1894,8 +1956,16 @@ export interface ArtistDossier {
 	all_days: number;
 	first: number | null;
 	last: number | null;
-	/** Local `YYYY-MM-DD` their two-week average climbed fastest. */
+	/** Local `YYYY-MM-DD` your listening to them stepped up — `step.date`. */
 	took_off: string | null;
+	/** The one clear step up in your rate of listening to them, if any. */
+	step?: { date: string; before_per_week: number; after_per_week: number };
+	/** Every week of the history (your first day of the week), empty ones too. */
+	weeks: { week: string; plays: number; all: number }[];
+	/** Your five most-played other artists, weekly, aligned with `weeks`. */
+	rivals: { name: string; plays: number; weekly: number[] }[];
+	/** Who you go on to within a quarter hour; `plays` are of `total`. */
+	next: { total: number; artists: { name: string; plays: number }[] };
 	habit: { return_rate: number; span_coverage: number; top_day_share: number; score: number } | null;
 	daily: DossierDay[];
 	months: { month: string; plays: number; all: number }[];
@@ -2665,6 +2735,17 @@ class TapedeckAPI {
 
 	async getPersonality(range: StatsRange = 'all'): Promise<Personality> {
 		return this.get(`/api/v1/personality?range=${range}`);
+	}
+
+	/** The eight Statistics graphs for one range. A whole-history fold on the
+	 *  server, so it is fetched apart from the stats and may arrive later. */
+	async getStatsGraphs(range: StatsRange = 'all'): Promise<StatsGraphs> {
+		return this.get(`/api/v1/stats/graphs?range=${range}`);
+	}
+
+	/** The graphs for one report period, by the period's `key`. */
+	async getReportGraphs(unit: 'week' | 'month' | 'year', key: string): Promise<ReportGraphs> {
+		return this.get(`/api/v1/reports/graphs?unit=${unit}&key=${encodeURIComponent(key)}`);
 	}
 
 	/** How much of the history MusicBrainz has identified at recording level.

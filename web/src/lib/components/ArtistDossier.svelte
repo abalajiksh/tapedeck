@@ -10,6 +10,10 @@
 	import type { ArtistDossier, StatCard } from '$lib/api';
 	import { formatDateTime } from '$lib/utils';
 	import StatStrip from './StatStrip.svelte';
+	import ArtistCumulative from './charts/ArtistCumulative.svelte';
+	import ArtistWeeks from './charts/ArtistWeeks.svelte';
+	import ArtistNext from './charts/ArtistNext.svelte';
+	import WavesChart from './charts/WavesChart.svelte';
 
 	export let d: ArtistDossier;
 	export let name: string;
@@ -70,7 +74,9 @@
 			out.push({
 				k: 'Took off',
 				v: `${MONTHS[m - 1]} ${y}`,
-				sub: `fastest two-week climb, ${longDate(d.took_off)}`,
+				sub: d.step
+					? `${d.step.before_per_week} → ${d.step.after_per_week} listens a week from ${longDate(d.took_off)}`
+					: longDate(d.took_off),
 				tone: 'dark'
 			});
 		}
@@ -144,6 +150,22 @@
 		return { update: go };
 	}
 
+	/** Their share over every month shown, from the same pairs as the bars:
+	 *  the line each month is read against. */
+	$: avgShare = (() => {
+		const all = d.months.reduce((n, m) => n + m.all, 0);
+		return all ? d.months.reduce((n, m) => n + m.plays, 0) / all : 0;
+	})();
+
+	// ── Weeks: the end of the history, and the series to set them against ──
+	$: lastDay = (() => {
+		if (!d.weeks.length) return null;
+		const w = iso(d.weeks[d.weeks.length - 1].week);
+		const end = new Date(Math.min(Date.UTC(w.y, w.m - 1, w.day + 6), Date.now()));
+		return end.toISOString().slice(0, 10);
+	})();
+	$: against = [{ name, plays: d.plays, daily: d.weeks.map((w) => w.plays) }, ...(d.rivals ?? []).map((r) => ({ name: r.name, plays: r.plays, daily: r.weekly }))];
+
 	// ── Clock ──
 	$: maxClock = Math.max(1, ...d.clock.flat());
 </script>
@@ -170,11 +192,39 @@
 		</div>
 	{/if}
 
+	{#if d.plays >= 2 && d.daily.length > 1}
+		<div class="panel card">
+			<h4 class="h-display">How it grew</h4>
+			<p class="muted" style="margin:0 0 12px;">Every listen of theirs, added up.</p>
+			<ArtistCumulative daily={d.daily} end={lastDay} step={d.step} />
+		</div>
+	{/if}
+
+	{#if d.weeks.length > 1}
+		<div class="panel card">
+			<h4 class="h-display">Week by week</h4>
+			<p class="muted" style="margin:0 0 12px;">Their listens under everyone else's, every week of your history.</p>
+			<ArtistWeeks weeks={d.weeks} {name} />
+		</div>
+	{/if}
+
+	{#if d.weeks.length > 3 && d.rivals?.length}
+		<div class="panel card">
+			<h4 class="h-display">Against your favourites</h4>
+			<p class="muted" style="margin:0 0 12px;">{name} beside the five artists you have played most.</p>
+			<WavesChart start={d.weeks[0].week} waves={against} stepDays={7} smoothWindow={3} emphasise={0} height={240}>
+				<svelte:fragment slot="caption">
+					Listens a week, averaged over three weeks. Click a name to open them.
+				</svelte:fragment>
+			</WavesChart>
+		</div>
+	{/if}
+
 	{#if calendar.length}
 		<div class="panel card">
 			<h4 class="h-display">Every day you played them</h4>
 			<p class="muted" style="margin:0 0 12px;">
-				Darker is more listens.{#if d.playthroughs.length} Outlined days are album playthroughs.{/if}
+				Darker is more listens.{#if d.playthroughs.length}{' '}Outlined days are album playthroughs.{/if}
 			</p>
 			<div class="scroll" use:atEnd={calendarWeeks}>
 				<div class="cal" style="--weeks:{calendarWeeks};">
@@ -204,9 +254,15 @@
 	{#if monthShares.length > 1}
 		<div class="panel card">
 			<h4 class="h-display">Their share of each month</h4>
-			<p class="muted" style="margin:0 0 12px;">Of everything you played that month.</p>
+			<p class="muted" style="margin:0 0 12px;">
+				Of everything you played that month. The dashed line is their share across all of these
+				months: {(avgShare * 100).toFixed(1)}%.
+			</p>
 			<div class="scroll" use:atEnd={monthShares.length}>
 				<div class="months" style="min-width:{monthShares.length * 14}px;">
+					{#if avgShare > 0}
+						<div class="mavg" style="bottom:calc(18px + {(avgShare / maxShare) * 112}px);" aria-hidden="true"></div>
+					{/if}
 					{#each monthShares as m (m.month)}
 						{@const at = iso(`${m.month}-01`)}
 						<div class="mcol" title={`${MONTHS[at.m - 1]} ${at.y}: ${m.plays} of ${m.all} listens (${pct(m.plays, m.all)})`}>
@@ -238,6 +294,14 @@
 					{/each}
 				</div>
 			</div>
+		</div>
+	{/if}
+
+	{#if d.next}
+		<div class="panel card">
+			<h4 class="h-display">Who you play next</h4>
+			<p class="muted" style="margin:0 0 12px;">The artist you go on to straight after them.</p>
+			<ArtistNext total={d.next.total} artists={d.next.artists} />
 		</div>
 	{/if}
 
@@ -324,7 +388,10 @@
 	.cal-cell { border-radius: 2.5px; }
 	.cal-cell.through { box-shadow: inset 0 0 0 1.5px var(--td-text); }
 
-	.months { display: flex; align-items: flex-end; gap: 3px; height: 130px; }
+	.months { position: relative; display: flex; align-items: flex-end; gap: 3px; height: 130px; }
+	/* 18px is the label row under each bar (14px + its 4px margin), 112px the
+	   bar track above it: the line sits on the same scale as the bars. */
+	.mavg { position: absolute; left: 0; right: 0; border-top: 1px dashed var(--td-text); opacity: 0.55; pointer-events: none; }
 	.mcol { flex: 1; min-width: 8px; display: flex; flex-direction: column; height: 100%; }
 	.mtrack { flex: 1; display: flex; align-items: flex-end; }
 	.mfill { width: 100%; min-height: 1px; border-radius: 3px 3px 0 0; background: var(--td-accent); }

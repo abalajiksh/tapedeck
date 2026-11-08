@@ -3836,7 +3836,7 @@ mod schema;
 mod sources;
 mod stats;
 pub use physical::{DashboardStats, PressingDetails};
-pub use stats::RangedStats;
+pub use stats::{GraphRow, RangedStats};
 mod users;
 
 // These build a temp SQLite file and drive it through the real `Database`.

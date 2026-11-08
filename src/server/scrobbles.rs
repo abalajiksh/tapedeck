@@ -1245,6 +1245,74 @@ async fn personality(
     }
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct GraphsQuery {
+    /// The window, rolling back from now: `week`, `month` (or `last30`),
+    /// `year`, or `all`, the default. Anything else is all time.
+    #[param(pattern = "^(week|month|last30|year|all)$", default = "all")]
+    pub range: Option<String>,
+}
+
+// GET /api/v1/stats/graphs?range=… — the eight Statistics graphs.
+//
+// Its own endpoint rather than more fields on `/api/v1/stats`: those are SQL
+// aggregates, these are one fold over the whole history in Rust (days have to
+// be the user's days, and first listens are all-time facts), and the page can
+// draw the top lists while this is still folding.
+/// Statistics graphs.
+///
+/// Scope: `read` *(since v0.130)*. Daily volume, obsession waves, the long
+/// tail, sessions, first listens, habit-vs-burst, album spread and anchor
+/// songs, for one range. Days are bucketed in your own timezone.
+///
+/// Artists are **everyone credited**, so the artist figures are shares of
+/// artist credits, not of listens — a listen with two artists counts once for
+/// each. `volume` and `sessions` count listens.
+#[utoipa::path(
+    get,
+    path = "/api/v1/stats/graphs",
+    tag = "Statistics",
+    security(("apiToken" = ["read"]), ("sessionCookie" = [])),
+    params(GraphsQuery),
+    responses(
+        (status = 200, description = "OK.", body = crate::graphs::StatsGraphs),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
+pub async fn stats_graphs(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+    Query(q): Query<GraphsQuery>,
+) -> impl IntoResponse {
+    let range = match q.range.as_deref() {
+        Some(r @ ("week" | "month" | "last30" | "year")) => r.to_string(),
+        _ => "all".to_string(),
+    };
+    let after = range_after(Some(&range));
+    let rows = match state.db.graph_rows(user.user_id, state.analytics_row_cap).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Graph rows failed: {}", e);
+            return server_error("Could not read your listening".into());
+        }
+    };
+    let capped = rows.len() as i64 >= state.analytics_row_cap;
+    let tz = user_tz(&state, user.user_id).await;
+    let now = chrono::Utc::now().timestamp();
+    // Synchronous work over the whole history: off the async workers, for the
+    // reason `reports` gives — four of them on a Pi.
+    match tokio::task::spawn_blocking(move || {
+        crate::graphs::compute(&rows, &range, after, None, now, tz, capped)
+    })
+    .await
+    {
+        Ok(g) => (StatusCode::OK, Json(g)).into_response(),
+        Err(e) => server_error(e.to_string()),
+    }
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct BulkChain {
     /// The listens to change. Anything not yours is skipped.
@@ -3552,6 +3620,7 @@ fn server_error(msg: String) -> axum::response::Response {
     list_skips,
     dashboard_stats,
     ranged_stats,
+    stats_graphs,
     personality,
     lyrics_for_track,
     fix_lyrics,
@@ -3594,6 +3663,7 @@ pub fn create_scrobbles_router() -> Router<Arc<AppState>> {
         )
         .route("/api/v1/stats/dashboard", get(dashboard_stats))
         .route("/api/v1/stats", get(ranged_stats))
+        .route("/api/v1/stats/graphs", get(stats_graphs))
         .route("/api/v1/personality", get(personality))
         .route("/api/v1/languages/status", get(language_status))
         .route("/api/v1/languages/backfill", axum::routing::post(backfill_languages_now))

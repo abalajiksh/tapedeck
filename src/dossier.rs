@@ -28,8 +28,22 @@ const PLAYTHROUGH_MIN_TRACKS: usize = 4;
 /// Below this, "when did they take off" has no curve to find a turn in.
 const TOOK_OFF_MIN_PLAYS: i64 = 20;
 
-/// The smoothing and the look-back of the take-off curve, in days.
-const TOOK_OFF_WINDOW_DAYS: i64 = 14;
+/// Neither side of a step may be shorter than this, in days: a rate measured
+/// over a weekend is a weekend, not a rate.
+const STEP_MIN_DAYS: i64 = 14;
+
+/// How much better two rates must explain the listening than one before a
+/// step is called — a log-likelihood ratio. With a long history almost any
+/// split beats one rate a little; this asks for a clear step.
+const STEP_MIN_EVIDENCE: f64 = 10.0;
+
+/// "What plays next" only counts the next listen when it came this soon:
+/// the script's quarter hour, so it is the same sitting and not tomorrow.
+const NEXT_GAP_SECS: i64 = 15 * 60;
+
+/// Rivals drawn against this artist, and names listed under "what plays next".
+const RIVALS: usize = 5;
+const NEXT_ARTISTS: usize = 8;
 
 /// One skip-free listen of the history, in time order.
 pub struct Listen {
@@ -44,6 +58,8 @@ pub struct Listen {
 pub struct Credit {
     pub ts: i64,
     pub artist_key: String,
+    /// The name as credited, for showing. `artist_key` is what groups.
+    pub name: String,
 }
 
 /// A day, as the local midnight it began at (Unix seconds).
@@ -103,6 +119,61 @@ pub struct Habit {
     pub score: f64,
 }
 
+/// A week, by the local date it began on (your first day of the week).
+#[derive(Debug, Serialize, ToSchema, PartialEq)]
+pub struct WeekShare {
+    /// `YYYY-MM-DD`, local: the week's first day.
+    pub week: String,
+    /// Their listens that week.
+    pub plays: i64,
+    /// Every listen that week — the population `plays` is part of.
+    pub all: i64,
+}
+
+/// One of your other most-played artists, week by week, to set this one
+/// against.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct Rival {
+    pub name: String,
+    /// Credited listens over the whole window.
+    pub plays: i64,
+    /// Credited listens per week, aligned with `Dossier::weeks`.
+    pub weekly: Vec<i64>,
+}
+
+/// Who you go on to after them.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct Next {
+    /// Times one of their listens was followed, within a quarter of an hour,
+    /// by somebody else's — the population each `plays` below is part of.
+    pub total: i64,
+    /// Most often first. A listen crediting two artists counts for both, so
+    /// these can add up to more than `total`.
+    pub artists: Vec<NextArtist>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NextArtist {
+    pub name: String,
+    pub plays: i64,
+}
+
+/// The day your rate of listening to them stepped up most.
+///
+/// One change point, fitted to every day from their first listen to the end
+/// of the history: the split where "one rate before, a higher one after"
+/// explains the days best. Absent when there is no clear step up — a steady
+/// favourite, or one that has faded, has nothing to mark.
+#[derive(Debug, Serialize, ToSchema, PartialEq)]
+pub struct Step {
+    /// `YYYY-MM-DD`, local: the first day at the new rate.
+    pub date: String,
+    /// Their listens a week before that day.
+    pub before_per_week: f64,
+    /// And from that day on.
+    pub after_per_week: f64,
+}
+
 /// Is somebody your number one, and how often.
 #[derive(Debug, Serialize, ToSchema, PartialEq)]
 pub struct AtTop {
@@ -124,9 +195,13 @@ pub struct Dossier {
     pub all_days: i64,
     pub first: Option<i64>,
     pub last: Option<i64>,
-    /// The local day (`YYYY-MM-DD`) their two-week average climbed fastest.
-    /// Absent under twenty listens, or if it never climbed.
+    /// The local day (`YYYY-MM-DD`) your listening to them stepped up —
+    /// `step.date`, kept as its own field for the clients that read it.
+    /// Absent under twenty listens, or without a clear step up.
     pub took_off: Option<String>,
+    /// The step itself, with the rates either side. Absent like `took_off`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step: Option<Step>,
     /// Absent under five listens, where there is no pattern to score.
     pub habit: Option<Habit>,
     /// Every day they were played, oldest first.
@@ -134,6 +209,13 @@ pub struct Dossier {
     /// Every month from their first to the last of the history, oldest first,
     /// including months they were not played in.
     pub months: Vec<MonthShare>,
+    /// Every week of the history, oldest first, including weeks they were
+    /// not played in.
+    pub weeks: Vec<WeekShare>,
+    /// Your five most-played other artists across the same weeks.
+    pub rivals: Vec<Rival>,
+    /// Who you play next after them.
+    pub next: Next,
     /// 7 × 24, rows Sunday first like the Statistics heatmap; the page
     /// rotates them by `week_start`.
     pub clock: Vec<Vec<i64>>,
@@ -320,33 +402,113 @@ pub fn compute(
     });
 
     // ── When they took off ──
-    // The day the two-week average rose most against the two weeks before:
-    // the audit's "awakening", over every day from their first listen to their
-    // last, including the silent ones.
-    let took_off = (plays >= TOOK_OFF_MIN_PLAYS)
+    let step = (plays >= TOOK_OFF_MIN_PLAYS)
         .then(|| {
-            let (start, end) = (*mine_by_day.keys().next()?, *mine_by_day.keys().last()?);
+            let (start, end) = (*mine_by_day.keys().next()?, *all_by_day.keys().last()?);
             let n = (end - start).num_days() + 1;
-            let series: Vec<f64> = (0..n)
+            let series: Vec<i64> = (0..n)
                 .map(|i| {
                     mine_by_day.get(&(start + chrono::Duration::days(i))).copied().unwrap_or(0)
-                        as f64
                 })
                 .collect();
-            let w = TOOK_OFF_WINDOW_DAYS as usize;
-            let smooth: Vec<f64> = (0..series.len())
-                .map(|i| {
-                    let from = (i + 1).saturating_sub(w);
-                    series[from..=i].iter().sum::<f64>() / (i + 1 - from) as f64
-                })
-                .collect();
-            (w..smooth.len())
-                .map(|i| (smooth[i] - smooth[i - w], i))
-                .filter(|(rise, _)| *rise > 0.0)
-                .max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)))
-                .map(|(_, i)| (start + chrono::Duration::days(i as i64)).to_string())
+            step_up(&series).map(|(k, before, after)| Step {
+                date: (start + chrono::Duration::days(k as i64)).to_string(),
+                before_per_week: (before * 7.0 * 10.0).round() / 10.0,
+                after_per_week: (after * 7.0 * 10.0).round() / 10.0,
+            })
         })
         .flatten();
+    let took_off = step.as_ref().map(|s| s.date.clone());
+
+    // ── Weeks: theirs against everything, and against your other favourites ──
+    let mut weeks: Vec<WeekShare> = Vec::new();
+    let mut rivals: Vec<Rival> = Vec::new();
+    if let (Some(first_day), Some(last_day)) = (all_by_day.keys().next(), all_by_day.keys().last())
+    {
+        let (w0, w1) = (week_key(*first_day, week_start), week_key(*last_day, week_start));
+        let n = ((w1 - w0).num_days() / 7 + 1) as usize;
+        let at = |d: NaiveDate| ((week_key(d, week_start) - w0).num_days() / 7) as usize;
+        let (mut all_w, mut mine_w) = (vec![0i64; n], vec![0i64; n]);
+        for (d, c) in &all_by_day {
+            all_w[at(*d)] += c;
+        }
+        for (d, c) in &mine_by_day {
+            mine_w[at(*d)] += c;
+        }
+        weeks = (0..n)
+            .map(|i| WeekShare {
+                week: (w0 + chrono::Duration::days(7 * i as i64)).to_string(),
+                plays: mine_w[i],
+                all: all_w[i],
+            })
+            .collect();
+
+        // Your other most-credited artists over the same window.
+        let mut tally: HashMap<&str, (i64, &str)> = HashMap::new();
+        for c in credits {
+            if c.artist_key == artist_key || crate::db::is_various_artists(&c.artist_key) {
+                continue;
+            }
+            let e = tally.entry(c.artist_key.as_str()).or_insert((0, c.name.as_str()));
+            e.0 += 1;
+            e.1 = c.name.as_str();
+        }
+        let mut top: Vec<(&str, i64, &str)> =
+            tally.into_iter().map(|(k, (n, name))| (k, n, name)).collect();
+        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        top.truncate(RIVALS);
+        let mut series: HashMap<&str, Vec<i64>> =
+            top.iter().map(|(k, _, _)| (*k, vec![0i64; n])).collect();
+        for c in credits {
+            if let Some(v) = series.get_mut(c.artist_key.as_str()) {
+                let d = date(c.ts, tz);
+                if d >= *first_day && d <= *last_day {
+                    v[at(d)] += 1;
+                }
+            }
+        }
+        rivals = top
+            .into_iter()
+            .map(|(k, plays, name)| Rival {
+                name: name.to_string(),
+                plays,
+                weekly: series.remove(k).unwrap_or_default(),
+            })
+            .collect();
+    }
+
+    // ── What plays next ──
+    let mut by_ts: HashMap<i64, Vec<&Credit>> = HashMap::new();
+    for c in credits {
+        by_ts.entry(c.ts).or_default().push(c);
+    }
+    let mut next_total = 0i64;
+    let mut next_tally: HashMap<&str, (i64, &str)> = HashMap::new();
+    for pair in listens.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        if !a.mine || b.mine || b.ts - a.ts > NEXT_GAP_SECS {
+            continue;
+        }
+        let names: Vec<&&Credit> = by_ts
+            .get(&b.ts)
+            .map(|v| v.iter().filter(|c| !crate::db::is_various_artists(&c.artist_key)).collect())
+            .unwrap_or_default();
+        if names.is_empty() {
+            continue;
+        }
+        next_total += 1;
+        for c in names {
+            let e = next_tally.entry(c.artist_key.as_str()).or_insert((0, c.name.as_str()));
+            e.0 += 1;
+        }
+    }
+    let mut next_artists: Vec<NextArtist> = next_tally
+        .into_values()
+        .map(|(plays, name)| NextArtist { name: name.to_string(), plays })
+        .collect();
+    next_artists.sort_by(|a, b| b.plays.cmp(&a.plays).then(a.name.cmp(&b.name)));
+    next_artists.truncate(NEXT_ARTISTS);
+    let next = Next { total: next_total, artists: next_artists };
 
     // ── Number one ──
     let at_top = |key_of: &dyn Fn(NaiveDate) -> String| {
@@ -378,9 +540,13 @@ pub fn compute(
         first,
         last,
         took_off,
+        step,
         habit,
         daily,
         months,
+        weeks,
+        rivals,
+        next,
         clock,
         week_start,
         top_days,
@@ -390,6 +556,45 @@ pub fn compute(
         weeks_at_top,
         capped,
     }
+}
+
+/// The one split of `days` (listens per day) where a higher rate after it
+/// best explains the listening, as `(first day after, rate before, rate after)`
+/// in listens a day.
+///
+/// The textbook single change point for counts: for each split, the Poisson
+/// log-likelihood of "two rates" over "one rate"; the largest wins, if it
+/// steps *up* and clears `STEP_MIN_EVIDENCE`. Closed form, one pass of
+/// prefix sums — no smoothing window to choose, which is what made the old
+/// two-week climb jump to the sharpest fortnight rather than the real turn.
+fn step_up(days: &[i64]) -> Option<(usize, f64, f64)> {
+    let n = days.len() as i64;
+    if n < 2 * STEP_MIN_DAYS {
+        return None;
+    }
+    let xlogx = |x: f64| if x > 0.0 { x * x.ln() } else { 0.0 };
+    let total: i64 = days.iter().sum();
+    let one = xlogx(total as f64) - total as f64 * (n as f64).ln();
+    let mut best: Option<(f64, usize, f64, f64)> = None;
+    let mut before = 0i64;
+    for k in 1..n {
+        before += days[k as usize - 1];
+        if k < STEP_MIN_DAYS || n - k < STEP_MIN_DAYS {
+            continue;
+        }
+        let after = total - before;
+        let (r1, r2) = (before as f64 / k as f64, after as f64 / (n - k) as f64);
+        if r2 <= r1 {
+            continue;
+        }
+        let two = xlogx(before as f64) - before as f64 * (k as f64).ln() + xlogx(after as f64)
+            - after as f64 * ((n - k) as f64).ln();
+        let gain = two - one;
+        if best.is_none_or(|b| gain > b.0) {
+            best = Some((gain, k as usize, r1, r2));
+        }
+    }
+    best.filter(|b| b.0 >= STEP_MIN_EVIDENCE).map(|(_, k, r1, r2)| (k, r1, r2))
 }
 
 #[cfg(test)]
@@ -471,7 +676,7 @@ mod tests {
     /// in `of`.
     #[test]
     fn months_at_top_count_ties_and_every_month() {
-        let c = |ts: i64, a: &str| Credit { ts, artist_key: a.into() };
+        let c = |ts: i64, a: &str| Credit { ts, artist_key: a.into(), name: a.into() };
         let march = DAY;
         let april = DAY + 10 * 86400;
         let credits = vec![
@@ -485,23 +690,90 @@ mod tests {
         assert_eq!(d.months_at_top, AtTop { periods: 1, of: 2 });
     }
 
-    /// A steady trickle and then a jump: the take-off is the jump.
+    /// A trickle and then a jump: the step is the day of the jump, with the
+    /// rates either side.
     #[test]
-    fn took_off_finds_the_climb() {
+    fn took_off_is_the_step_up() {
         let mut l: Vec<Listen> =
             (0..60).step_by(10).map(|i| mine(DAY + i * 86400 + 3600, "A", 1)).collect();
         let jump = DAY + 60 * 86400;
-        for day in 0..10 {
+        for day in 0..20 {
             l.extend((0..5).map(|k| mine(jump + day * 86400 + 3600 + k * 300, "A", 1)));
         }
         l.sort_by_key(|x| x.ts);
         let d = compute(&l, &[], "x", BERLIN, 1, false);
-        let took = NaiveDate::parse_from_str(&d.took_off.expect("a climb"), "%Y-%m-%d").unwrap();
-        let jumped = date(jump, BERLIN);
-        assert!(
-            took >= jumped && took <= jumped + chrono::Duration::days(14),
-            "{took} vs {jumped}"
+        let step = d.step.expect("a clear step up");
+        assert_eq!(step.date, date(jump, BERLIN).to_string());
+        assert_eq!(d.took_off.as_deref(), Some(step.date.as_str()));
+        assert_eq!((step.before_per_week, step.after_per_week), (0.7, 35.0));
+    }
+
+    /// A steady favourite and a faded one have no step up to mark.
+    #[test]
+    fn steady_or_fading_listening_has_no_step() {
+        let steady: Vec<Listen> = (0..90).map(|i| mine(DAY + i * 86400 + 3600, "A", 1)).collect();
+        assert!(compute(&steady, &[], "x", BERLIN, 1, false).step.is_none());
+        let mut fading: Vec<Listen> = Vec::new();
+        for day in 0..20 {
+            fading.extend((0..5).map(|k| mine(DAY + day * 86400 + 3600 + k * 300, "A", 1)));
+        }
+        fading.extend((0..6).map(|i| mine(DAY + (30 + i * 10) * 86400, "A", 1)));
+        assert!(compute(&fading, &[], "x", BERLIN, 1, false).step.is_none());
+    }
+
+    /// Weeks run from the history's first to its last, empty ones included,
+    /// and rivals line up with them; this artist is never their own rival.
+    #[test]
+    fn weeks_and_rivals_share_one_axis() {
+        let c = |ts: i64, a: &str| Credit { ts, artist_key: a.to_lowercase(), name: a.into() };
+        // Friday 27 March, then Monday 13 April: three Monday-start weeks.
+        let later = DAY + 17 * 86400;
+        let l = vec![mine(DAY + 3600, "A", 1), other(DAY + 7200), other(later + 3600)];
+        let credits = vec![c(DAY + 3600, "X"), c(DAY + 7200, "Rival"), c(later + 3600, "Rival")];
+        let d = compute(&l, &credits, "x", BERLIN, 1, false);
+        let weeks: Vec<(&str, i64, i64)> =
+            d.weeks.iter().map(|w| (w.week.as_str(), w.plays, w.all)).collect();
+        assert_eq!(
+            weeks,
+            vec![
+                ("2026-03-23", 1, 2),
+                ("2026-03-30", 0, 0),
+                ("2026-04-06", 0, 0),
+                ("2026-04-13", 0, 1)
+            ]
         );
+        assert_eq!(d.rivals.len(), 1);
+        assert_eq!(
+            (d.rivals[0].name.as_str(), d.rivals[0].weekly.clone()),
+            ("Rival", vec![1, 0, 0, 1])
+        );
+    }
+
+    /// Only the next listen in the same quarter hour counts, only when it is
+    /// somebody else, and each artist it credits counts once.
+    #[test]
+    fn next_counts_who_follows_within_a_quarter_hour() {
+        let c = |ts: i64, a: &str| Credit { ts, artist_key: a.to_lowercase(), name: a.into() };
+        let l = vec![
+            mine(DAY, "A", 1),
+            other(DAY + 200), // follows: counts
+            mine(DAY + 400, "A", 2),
+            mine(DAY + 600, "A", 3), // followed by themselves: not a transition
+            other(DAY + 800),        // follows: counts, a duet
+            mine(DAY + 900, "A", 4),
+            other(DAY + 900 + NEXT_GAP_SECS + 1), // too late
+        ];
+        let credits = vec![
+            c(DAY + 200, "Madonna"),
+            c(DAY + 800, "Madonna"),
+            c(DAY + 800, "Clara Luciani"),
+            c(DAY + 900 + NEXT_GAP_SECS + 1, "Late"),
+        ];
+        let d = compute(&l, &credits, "x", BERLIN, 1, false);
+        assert_eq!(d.next.total, 2);
+        let got: Vec<(&str, i64)> =
+            d.next.artists.iter().map(|a| (a.name.as_str(), a.plays)).collect();
+        assert_eq!(got, vec![("Madonna", 2), ("Clara Luciani", 1)]);
     }
 
     /// Under twenty listens there is no curve to find a turn in.

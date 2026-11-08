@@ -23,6 +23,12 @@
      named so new components stop repeating the hex. Theme-independent, like
      the accent under it. */
   --td-on-accent:#fbf5ea;
+  /* Categorical series for charts with several artists on one plot — rust,
+     slate, ochre, plum, moss, iris, always assigned in this order and never
+     cycled. Checked for colour-blind separation and contrast against
+     --td-surface in both themes; the dark set is its own steps, not a flip. */
+  --td-series-1:#c67139; --td-series-2:#2f7bb0; --td-series-3:#9a8208;
+  --td-series-4:#a04f8a; --td-series-5:#4f9a3a; --td-series-6:#5b5fc7;
 }
 :root[data-theme="dark"] {
   --td-bg:#17120e; --td-surface:#221b15; --td-sidebar:#1c1611; --td-surface2:#2b2219;
@@ -32,6 +38,8 @@
   --td-good-bg:rgba(122,138,94,.22); --td-good-fg:#aebf92;
   --td-bad-bg:rgba(235,111,146,.16); --td-bad-fg:#eb6f92;
   --td-border:rgba(244,231,207,.12); --td-topbar:rgba(23,18,14,.92);
+  --td-series-1:#d27b45; --td-series-2:#4a8ec4; --td-series-3:#a8900e;
+  --td-series-4:#b862a0; --td-series-5:#62a84c; --td-series-6:#7478dc;
 }
 
 @keyframes td-spin { to { transform: rotate(360deg); } }

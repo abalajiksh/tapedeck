@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.129.0
+  version: 0.130.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -1778,6 +1778,46 @@ paths:
       - apiToken:
         - read
       - sessionCookie: []
+  /api/v1/stats/graphs:
+    get:
+      tags:
+      - Statistics
+      summary: Statistics graphs.
+      description: |-
+        Scope: `read` *(since v0.130)*. Daily volume, obsession waves, the long
+        tail, sessions, first listens, habit-vs-burst, album spread and anchor
+        songs, for one range. Days are bucketed in your own timezone.
+
+        Artists are **everyone credited**, so the artist figures are shares of
+        artist credits, not of listens — a listen with two artists counts once for
+        each. `volume` and `sessions` count listens.
+      operationId: stats_graphs
+      parameters:
+      - name: range
+        in: query
+        description: |-
+          The window, rolling back from now: `week`, `month` (or `last30`),
+          `year`, or `all`, the default. Anything else is all time.
+        required: false
+        schema:
+          type: string
+          default: all
+          pattern: ^(week|month|last30|year|all)$
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatsGraphs'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
   /api/v1/personality:
     get:
       tags:
@@ -3314,6 +3354,54 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Reports'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      security:
+      - sessionCookie: []
+      - apiToken:
+        - read
+  /api/v1/reports/graphs:
+    get:
+      tags:
+      - Statistics
+      summary: The graphs for one report period.
+      description: |-
+        Scope: `read` *(since v0.130)*. The Statistics graphs (see
+        `GET /api/v1/stats/graphs`) over one week, month or year, plus who topped
+        each part of it. Artists are everyone credited.
+      operationId: report_graphs
+      parameters:
+      - name: unit
+        in: query
+        description: '`week`, `month` or `year` — the bucket the key is from.'
+        required: true
+        schema:
+          type: string
+          pattern: ^(week|month|year)$
+      - name: key
+        in: query
+        description: |-
+          The period, as a report's `key` names it: `2026-W31`, `2026-08` or
+          `2026`.
+        required: true
+        schema:
+          type: string
+        example: 2026-08
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportGraphs'
+        '400':
+          description: Not a unit, or not a period key of that unit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -12861,6 +12949,54 @@ components:
           items:
             $ref: '#/components/schemas/AlbumAggregate'
           description: Up to four more records by the artist.
+    AlbumSlice:
+      type: object
+      required:
+      - name
+      - album_artist
+      - plays
+      properties:
+        name:
+          type: string
+        album_artist:
+          type: string
+          description: Who the record is filed under, which is what opens it.
+        plays:
+          type: integer
+          format: int64
+    AlbumSpread:
+      type: object
+      required:
+      - name
+      - plays
+      - album_count
+      - albums
+      - rest_plays
+      - no_album
+      properties:
+        name:
+          type: string
+        plays:
+          type: integer
+          format: int64
+          description: Credited plays in the range.
+        album_count:
+          type: integer
+          format: int64
+          description: Distinct records those plays were on.
+        albums:
+          type: array
+          items:
+            $ref: '#/components/schemas/AlbumSlice'
+          description: The most-played records, largest first, at most five.
+        rest_plays:
+          type: integer
+          format: int64
+          description: Plays on every other record.
+        no_album:
+          type: integer
+          format: int64
+          description: Plays whose source named no record at all.
     AlbumTracklist:
       type: object
       description: |-
@@ -13101,6 +13237,36 @@ components:
             Which of amai's media servers our provider ids belong to — its display
             name or its internal id. Empty means their default server, which is the
             whole answer on a single-server install.
+    Anchor:
+      type: object
+      required:
+      - name
+      - plays
+      - title
+      - title_plays
+      - share
+      - tracks
+      properties:
+        name:
+          type: string
+        plays:
+          type: integer
+          format: int64
+          description: Credited plays in the range.
+        title:
+          type: string
+          description: The one song most of them are.
+        title_plays:
+          type: integer
+          format: int64
+        share:
+          type: number
+          format: double
+          description: '`title_plays / plays`.'
+        tracks:
+          type: integer
+          format: int64
+          description: How many different songs of theirs were played at all.
     AnnotationTarget:
       type: object
       description: |-
@@ -13338,6 +13504,47 @@ components:
           description: |-
             Whether you already have an accepted patch with them, either direction.
             Decides whether their deck can be opened or has to be asked for.
+    ArtistHabit:
+      type: object
+      required:
+      - name
+      - plays
+      - active_days
+      - span_days
+      - return_rate
+      - top_day_share
+      - top_day
+      - loyalty
+      properties:
+        name:
+          type: string
+        plays:
+          type: integer
+          format: int64
+          description: Credited plays in the range.
+        active_days:
+          type: integer
+          format: int64
+          description: Days in the range this artist was played.
+        span_days:
+          type: integer
+          format: int64
+          description: Days from their first to their last listen in the range, inclusive.
+        return_rate:
+          type: number
+          format: double
+          description: '`active_days / span_days`: how often they come back. 1 = every day.'
+        top_day_share:
+          type: number
+          format: double
+          description: Share of their plays on their single biggest day. 1 = all on one day.
+        top_day:
+          type: string
+          description: That biggest day, `YYYY-MM-DD`.
+        loyalty:
+          type: number
+          format: double
+          description: 0–100. High is steady, recurring listening; low is bursts.
     ArtistImageUpdate:
       type: object
       required:
@@ -14940,6 +15147,35 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Device'
+    Devotion:
+      type: object
+      description: |-
+        How much of each session went to its most-played artist.
+
+        Measured over sessions of at least `min_listens`, and over the *primary*
+        artist of each listen — fanning credits out here would let one session's
+        shares add up to more than everything played in it.
+      required:
+      - min_listens
+      - devoted
+      - mixed
+      - scattered
+      properties:
+        min_listens:
+          type: integer
+          format: int64
+        devoted:
+          type: integer
+          format: int64
+          description: One artist took 80% or more of the session.
+        mixed:
+          type: integer
+          format: int64
+          description: The top artist took 40–80%.
+        scattered:
+          type: integer
+          format: int64
+          description: No artist took as much as 40%.
     DirectoryStation:
       type: object
       description: One pickable station.
@@ -15139,6 +15375,9 @@ components:
       - all_days
       - daily
       - months
+      - weeks
+      - rivals
+      - next
       - clock
       - week_start
       - top_days
@@ -15179,8 +15418,14 @@ components:
           - string
           - 'null'
           description: |-
-            The local day (`YYYY-MM-DD`) their two-week average climbed fastest.
-            Absent under twenty listens, or if it never climbed.
+            The local day (`YYYY-MM-DD`) your listening to them stepped up —
+            `step.date`, kept as its own field for the clients that read it.
+            Absent under twenty listens, or without a clear step up.
+        step:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Step'
+            description: The step itself, with the rates either side. Absent like `took_off`.
         habit:
           oneOf:
           - type: 'null'
@@ -15198,6 +15443,21 @@ components:
           description: |-
             Every month from their first to the last of the history, oldest first,
             including months they were not played in.
+        weeks:
+          type: array
+          items:
+            $ref: '#/components/schemas/WeekShare'
+          description: |-
+            Every week of the history, oldest first, including weeks they were
+            not played in.
+        rivals:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rival'
+          description: Your five most-played other artists across the same weeks.
+        next:
+          $ref: '#/components/schemas/Next'
+          description: Who you play next after them.
         clock:
           type: array
           items:
@@ -16005,6 +16265,33 @@ components:
             comparing a month against itself draws two identical shapes and means
             nothing by it, so decline to draw the baseline below two.
           minimum: 0
+    FirstListen:
+      type: object
+      required:
+      - name
+      - plays
+      - first
+      - last
+      - loyalty
+      properties:
+        name:
+          type: string
+        plays:
+          type: integer
+          format: int64
+          description: Credited plays in the range.
+        first:
+          type: integer
+          format: int64
+          description: First listen ever, unix seconds — not ranged.
+        last:
+          type: integer
+          format: int64
+          description: Most recent listen, unix seconds — not ranged.
+        loyalty:
+          type: number
+          format: double
+          description: 0–100. High is steady, recurring listening; low is bursts.
     FitOutcome:
       type: object
       description: What a switch did, or would do.
@@ -17682,6 +17969,18 @@ components:
           - 'null'
         additional_info:
           $ref: '#/components/schemas/LbAdditionalInfo'
+    LengthBucket:
+      type: object
+      required:
+      - label
+      - sessions
+      properties:
+        label:
+          type: string
+          description: '`1`, `2`, `3–4`, `5–9`, `10–19`, `20–49`, `50–99` or `100+`.'
+        sessions:
+          type: integer
+          format: int64
     LibraryArtStored:
       oneOf:
       - type: object
@@ -18468,6 +18767,46 @@ components:
           type: string
         password:
           type: string
+    LongTail:
+      type: object
+      required:
+      - counts
+      - credits
+      - once
+      - hundred_plus
+      - half
+      - eighty
+      properties:
+        counts:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: |-
+            Credited plays per artist, largest first. The curve is their running
+            sum over `credits`.
+        credits:
+          type: integer
+          format: int64
+          description: |-
+            The sum of `counts`: artist credits, **not** listens — a listen with
+            two artists credited counts once for each.
+        once:
+          type: integer
+          format: int64
+          description: Artists heard exactly once in the range.
+        hundred_plus:
+          type: integer
+          format: int64
+          description: Artists heard 100 times or more in the range.
+        half:
+          type: integer
+          format: int64
+          description: How many of the top artists it takes to reach half of `credits`.
+        eighty:
+          type: integer
+          format: int64
+          description: How many of the top artists it takes to reach 80% of `credits`.
     LoveKeys:
       type: object
       description: Every loved entity as its identity key.
@@ -19624,6 +19963,37 @@ components:
           items:
             type: string
           description: Names of people in the room with no account on this instance.
+    Next:
+      type: object
+      description: Who you go on to after them.
+      required:
+      - total
+      - artists
+      properties:
+        total:
+          type: integer
+          format: int64
+          description: |-
+            Times one of their listens was followed, within a quarter of an hour,
+            by somebody else's — the population each `plays` below is part of.
+        artists:
+          type: array
+          items:
+            $ref: '#/components/schemas/NextArtist'
+          description: |-
+            Most often first. A listen crediting two artists counts for both, so
+            these can add up to more than `total`.
+    NextArtist:
+      type: object
+      required:
+      - name
+      - plays
+      properties:
+        name:
+          type: string
+        plays:
+          type: integer
+          format: int64
     Note:
       type: object
       description: |-
@@ -20495,6 +20865,18 @@ components:
         state:
           type: string
           description: '`accepted` or `rejected`.'
+    PeakDay:
+      type: object
+      required:
+      - day
+      - plays
+      properties:
+        day:
+          type: string
+          description: '`YYYY-MM-DD`, local.'
+        plays:
+          type: integer
+          format: int64
     Period:
       type: object
       description: One week, month or year.
@@ -22875,6 +23257,37 @@ components:
             `copies` from the preview. **Required** — this deletes listens, so
             an empty body is refused rather than read as "all of them".
           minimum: 0
+    ReportGraphs:
+      type: object
+      description: The graphs drawn under one report chapter.
+      required:
+      - unit
+      - key
+      - timezone
+      - graphs
+      - throne
+      properties:
+        unit:
+          type: string
+          description: '`week`, `month` or `year`.'
+        key:
+          type: string
+        timezone:
+          type: string
+          description: The IANA zone the period and its days are bucketed in.
+        graphs:
+          $ref: '#/components/schemas/StatsGraphs'
+          description: |-
+            The Statistics graphs over this period's calendar window — up to today
+            while it is still running. The page draws the ones that suit the
+            period's size; all of them are here.
+        throne:
+          type: array
+          items:
+            $ref: '#/components/schemas/Throne'
+          description: |-
+            Who topped each week of a month, or each month of a year. Empty for a
+            week.
     Reports:
       type: object
       description: A feed of period cards, newest first.
@@ -23000,6 +23413,28 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Revision'
+    Rival:
+      type: object
+      description: |-
+        One of your other most-played artists, week by week, to set this one
+        against.
+      required:
+      - name
+      - plays
+      - weekly
+      properties:
+        name:
+          type: string
+        plays:
+          type: integer
+          format: int64
+          description: Credited listens over the whole window.
+        weekly:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: Credited listens per week, aligned with `Dossier::weeks`.
     RomanLine:
       type: object
       description: One lyric line in Latin letters.
@@ -23981,6 +24416,28 @@ components:
           type:
           - string
           - 'null'
+    Sessions:
+      type: object
+      required:
+      - total
+      - gap_minutes
+      - lengths
+      - devotion
+      properties:
+        total:
+          type: integer
+          format: int64
+          description: Sessions in the range. A gap longer than `gap_minutes` starts a new one.
+        gap_minutes:
+          type: integer
+          format: int64
+        lengths:
+          type: array
+          items:
+            $ref: '#/components/schemas/LengthBucket'
+          description: Sessions by how many listens they held, in fixed buckets.
+        devotion:
+          $ref: '#/components/schemas/Devotion'
     SetBindingRequest:
       type: object
       required:
@@ -26471,6 +26928,110 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SpiProgramme'
+    StatsGraphs:
+      type: object
+      required:
+      - range
+      - timezone
+      - capped
+      - daily
+      - volume
+      - waves
+      - long_tail
+      - sessions
+      - first_listens
+      - habits
+      - albums
+      - anchors
+      properties:
+        range:
+          type: string
+          description: 'The range asked for: `week`, `month`, `last30`, `year` or `all`.'
+        timezone:
+          type: string
+          description: The IANA zone every day below is bucketed in.
+        capped:
+          type: boolean
+          description: |-
+            True when the history was longer than this server reads in one pass
+            (scaled to its memory). The oldest listens are the ones left out.
+        start_day:
+          type:
+          - string
+          - 'null'
+          description: |-
+            First local day of the axis, `YYYY-MM-DD`. Absent when the range is
+            empty. Every `daily` array below starts here, one entry per day.
+        daily:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: |-
+            Listens per local day, from `start_day` to today, including days with
+            none.
+        volume:
+          $ref: '#/components/schemas/Volume'
+        waves:
+          type: array
+          items:
+            $ref: '#/components/schemas/Wave'
+          description: |-
+            The most-credited artists in the range, with their own daily counts on
+            the same axis as `daily`.
+        long_tail:
+          $ref: '#/components/schemas/LongTail'
+        sessions:
+          $ref: '#/components/schemas/Sessions'
+        first_listens:
+          type: array
+          items:
+            $ref: '#/components/schemas/FirstListen'
+          description: |-
+            The range's most-credited artists, ordered by when you **first** heard
+            them — across the whole history, not the range.
+        habits:
+          type: array
+          items:
+            $ref: '#/components/schemas/ArtistHabit'
+          description: |-
+            Daily habit or burst: how each artist's listening is spread over time.
+            Only artists with five or more plays on at least two different days.
+        albums:
+          type: array
+          items:
+            $ref: '#/components/schemas/AlbumSpread'
+          description: How each top artist's plays split across their records.
+        anchors:
+          type: array
+          items:
+            $ref: '#/components/schemas/Anchor'
+          description: Artists you mostly play one song from, most anchored first.
+    Step:
+      type: object
+      description: |-
+        The day your rate of listening to them stepped up most.
+
+        One change point, fitted to every day from their first listen to the end
+        of the history: the split where "one rate before, a higher one after"
+        explains the days best. Absent when there is no clear step up — a steady
+        favourite, or one that has faded, has nothing to mark.
+      required:
+      - date
+      - before_per_week
+      - after_per_week
+      properties:
+        date:
+          type: string
+          description: '`YYYY-MM-DD`, local: the first day at the new rate.'
+        before_per_week:
+          type: number
+          format: double
+          description: Their listens a week before that day.
+        after_per_week:
+          type: number
+          format: double
+          description: And from that day on.
     StreamChoice:
       type: object
       description: |-
@@ -26926,6 +27487,38 @@ components:
           line:
             $ref: '#/components/schemas/LinePos'
       description: What a target resolved to. One key, named for its kind.
+    Throne:
+      type: object
+      description: |-
+        Who had the most listens in one part of a report's period: a week of a
+        month, or a month of a year.
+      required:
+      - start
+      - label
+      - plays
+      - listens
+      properties:
+        start:
+          type: string
+          description: The part's first day, `YYYY-MM-DD`, local.
+        label:
+          type: string
+          description: |-
+            `Jan`, or `1–7 Aug` — clipped to the period, so a month's first week
+            starts on the 1st.
+        artist:
+          type:
+          - string
+          - 'null'
+          description: Whoever was credited on the most listens. Absent for a part with none.
+        plays:
+          type: integer
+          format: int64
+          description: Their credited listens in that part.
+        listens:
+          type: integer
+          format: int64
+          description: Every listen in that part — the population `plays` is part of.
     TickView:
       type: object
       description: The engine's tick.
@@ -28124,6 +28717,70 @@ components:
           type: string
         frozen:
           type: boolean
+    Volume:
+      type: object
+      required:
+      - plays
+      - active_days
+      - median_active_day
+      properties:
+        plays:
+          type: integer
+          format: int64
+          description: Listens in the range.
+        active_days:
+          type: integer
+          format: int64
+          description: Days in the range with at least one listen.
+        median_active_day:
+          type: number
+          format: double
+          description: |-
+            Median listens on a day you listened at all. Zero-listen days are left
+            out on purpose: they would drag the median of a sparse history to 0.
+        peak:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/PeakDay'
+            description: The busiest day in the range.
+    Wave:
+      type: object
+      required:
+      - name
+      - plays
+      - daily
+      properties:
+        name:
+          type: string
+        plays:
+          type: integer
+          format: int64
+          description: Credited plays in the range.
+        daily:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: Credited plays per local day, aligned with `StatsGraphs::daily`.
+    WeekShare:
+      type: object
+      description: A week, by the local date it began on (your first day of the week).
+      required:
+      - week
+      - plays
+      - all
+      properties:
+        week:
+          type: string
+          description: '`YYYY-MM-DD`, local: the week''s first day.'
+        plays:
+          type: integer
+          format: int64
+          description: Their listens that week.
+        all:
+          type: integer
+          format: int64
+          description: Every listen that week — the population `plays` is part of.
     WhatsOn:
       type: object
       description: A chain's slots, and what a "since when?" needs to offer.

@@ -8,6 +8,7 @@ mod dvinyl;
 mod engine;
 mod enrich;
 mod everynoise;
+mod graphs;
 mod language;
 mod logging;
 mod lyrics;
