@@ -1304,7 +1304,7 @@ pub async fn stats_graphs(
     // Synchronous work over the whole history: off the async workers, for the
     // reason `reports` gives — four of them on a Pi.
     match tokio::task::spawn_blocking(move || {
-        crate::graphs::compute(&rows, &range, after, now, tz, capped)
+        crate::graphs::compute(&rows, &range, after, None, now, tz, capped)
     })
     .await
     {

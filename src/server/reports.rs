@@ -1254,12 +1254,116 @@ pub fn thousands(n: i64) -> String {
     out
 }
 
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ReportGraphsQuery {
+    /// `week`, `month` or `year` — the bucket the key is from.
+    #[param(pattern = "^(week|month|year)$")]
+    pub unit: String,
+    /// The period, as a report's `key` names it: `2026-W31`, `2026-08` or
+    /// `2026`.
+    #[param(example = "2026-08")]
+    pub key: String,
+}
+
+/// The graphs drawn under one report chapter.
+#[derive(Serialize, ToSchema)]
+pub struct ReportGraphs {
+    /// `week`, `month` or `year`.
+    pub unit: String,
+    pub key: String,
+    /// The IANA zone the period and its days are bucketed in.
+    pub timezone: String,
+    /// The Statistics graphs over this period's calendar window — up to today
+    /// while it is still running. The page draws the ones that suit the
+    /// period's size; all of them are here.
+    pub graphs: crate::graphs::StatsGraphs,
+    /// Who topped each week of a month, or each month of a year. Empty for a
+    /// week.
+    pub throne: Vec<crate::graphs::Throne>,
+}
+
+// GET /api/v1/reports/graphs?unit=…&key=… — the graphs under one chapter.
+//
+// Apart from `/api/v1/reports` rather than inside each period: a period card
+// carries a dozen aggregates and the page pages through them a period at a
+// time, while a year's daily series and long tail are thousands of numbers
+// nobody needs for the eleven chapters not on screen.
+/// The graphs for one report period.
+///
+/// Scope: `read` *(since v0.130)*. The Statistics graphs (see
+/// `GET /api/v1/stats/graphs`) over one week, month or year, plus who topped
+/// each part of it. Artists are everyone credited.
+#[utoipa::path(
+    get,
+    path = "/api/v1/reports/graphs",
+    tag = "Statistics",
+    security(("sessionCookie" = []), ("apiToken" = ["read"])),
+    params(ReportGraphsQuery),
+    responses(
+        (status = 200, description = "OK.", body = ReportGraphs),
+        (status = 400, description = "Not a unit, or not a period key of that unit.", body = ErrorResponse),
+        (status = 401, response = Unauthorized),
+        (status = 403, response = Forbidden),
+    )
+)]
+pub async fn report_graphs(
+    State(state): State<Arc<AppState>>,
+    ReadAuth { user }: ReadAuth,
+    Query(q): Query<ReportGraphsQuery>,
+) -> impl IntoResponse {
+    // The key's shape has to match the unit, or "2026" asked as a week would
+    // quietly answer for a year.
+    let shape_ok = match q.unit.as_str() {
+        "week" => q.key.contains("-W"),
+        "month" => q.key.len() == 7 && !q.key.contains("-W"),
+        "year" => q.key.len() == 4,
+        _ => return err(400, "unit must be week, month or year"),
+    };
+    let tz = crate::server::scrobbles::user_tz_for(&state, user.user_id).await;
+    let Some((start, before)) = crate::graphs::period_bounds(&q.key, tz).filter(|_| shape_ok)
+    else {
+        return err(400, format!("{} is not a {} key", q.key, q.unit));
+    };
+    let rows = match state.db.graph_rows(user.user_id, state.analytics_row_cap).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Report graph rows failed: {}", e);
+            return err(500, "Could not read your listening");
+        }
+    };
+    let capped = rows.len() as i64 >= state.analytics_row_cap;
+    let now = chrono::Utc::now().timestamp();
+    let ReportGraphsQuery { unit, key } = q;
+    // Off the async workers, for the reason `reports` gives.
+    let out = tokio::task::spawn_blocking(move || {
+        let parts = match unit.as_str() {
+            "month" => Some(crate::graphs::Parts::Weeks),
+            "year" => Some(crate::graphs::Parts::Months),
+            _ => None,
+        };
+        let throne = parts
+            .map(|p| crate::graphs::throne(&rows, start, before, now, tz, p))
+            .unwrap_or_default();
+        let graphs =
+            crate::graphs::compute(&rows, &unit, Some(start), Some(before), now, tz, capped);
+        ReportGraphs { unit, key, timezone: tz.name().to_string(), graphs, throne }
+    })
+    .await;
+    match out {
+        Ok(g) => (StatusCode::OK, Json(g)).into_response(),
+        Err(e) => err(500, e.to_string()),
+    }
+}
+
 #[derive(utoipa::OpenApi)]
-#[openapi(paths(reports))]
+#[openapi(paths(reports, report_graphs))]
 pub struct Api;
 
 pub fn create_reports_router() -> Router<Arc<AppState>> {
-    Router::new().route("/api/v1/reports", get(reports))
+    Router::new()
+        .route("/api/v1/reports", get(reports))
+        .route("/api/v1/reports/graphs", get(report_graphs))
 }
 
 #[cfg(test)]

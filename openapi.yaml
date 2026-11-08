@@ -3362,6 +3362,54 @@ paths:
       - sessionCookie: []
       - apiToken:
         - read
+  /api/v1/reports/graphs:
+    get:
+      tags:
+      - Statistics
+      summary: The graphs for one report period.
+      description: |-
+        Scope: `read` *(since v0.130)*. The Statistics graphs (see
+        `GET /api/v1/stats/graphs`) over one week, month or year, plus who topped
+        each part of it. Artists are everyone credited.
+      operationId: report_graphs
+      parameters:
+      - name: unit
+        in: query
+        description: '`week`, `month` or `year` — the bucket the key is from.'
+        required: true
+        schema:
+          type: string
+          pattern: ^(week|month|year)$
+      - name: key
+        in: query
+        description: |-
+          The period, as a report's `key` names it: `2026-W31`, `2026-08` or
+          `2026`.
+        required: true
+        schema:
+          type: string
+        example: 2026-08
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReportGraphs'
+        '400':
+          description: Not a unit, or not a period key of that unit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      security:
+      - sessionCookie: []
+      - apiToken:
+        - read
   /api/v1/reports/image:
     get:
       tags:
@@ -23209,6 +23257,37 @@ components:
             `copies` from the preview. **Required** — this deletes listens, so
             an empty body is refused rather than read as "all of them".
           minimum: 0
+    ReportGraphs:
+      type: object
+      description: The graphs drawn under one report chapter.
+      required:
+      - unit
+      - key
+      - timezone
+      - graphs
+      - throne
+      properties:
+        unit:
+          type: string
+          description: '`week`, `month` or `year`.'
+        key:
+          type: string
+        timezone:
+          type: string
+          description: The IANA zone the period and its days are bucketed in.
+        graphs:
+          $ref: '#/components/schemas/StatsGraphs'
+          description: |-
+            The Statistics graphs over this period's calendar window — up to today
+            while it is still running. The page draws the ones that suit the
+            period's size; all of them are here.
+        throne:
+          type: array
+          items:
+            $ref: '#/components/schemas/Throne'
+          description: |-
+            Who topped each week of a month, or each month of a year. Empty for a
+            week.
     Reports:
       type: object
       description: A feed of period cards, newest first.
@@ -27408,6 +27487,38 @@ components:
           line:
             $ref: '#/components/schemas/LinePos'
       description: What a target resolved to. One key, named for its kind.
+    Throne:
+      type: object
+      description: |-
+        Who had the most listens in one part of a report's period: a week of a
+        month, or a month of a year.
+      required:
+      - start
+      - label
+      - plays
+      - listens
+      properties:
+        start:
+          type: string
+          description: The part's first day, `YYYY-MM-DD`, local.
+        label:
+          type: string
+          description: |-
+            `Jan`, or `1–7 Aug` — clipped to the period, so a month's first week
+            starts on the 1st.
+        artist:
+          type:
+          - string
+          - 'null'
+          description: Whoever was credited on the most listens. Absent for a part with none.
+        plays:
+          type: integer
+          format: int64
+          description: Their credited listens in that part.
+        listens:
+          type: integer
+          format: int64
+          description: Every listen in that part — the population `plays` is part of.
     TickView:
       type: object
       description: The engine's tick.

@@ -586,6 +586,16 @@ export interface StatsGraphs {
 	anchors: { name: string; plays: number; title: string; title_plays: number; share: number; tracks: number }[];
 }
 
+/** `GET /api/v1/reports/graphs` — the graphs under one report chapter. */
+export interface ReportGraphs {
+	unit: 'week' | 'month' | 'year';
+	key: string;
+	timezone: string;
+	graphs: StatsGraphs;
+	/** Who topped each week of a month or month of a year; empty for a week. */
+	throne: { start: string; label: string; artist?: string; plays: number; listens: number }[];
+}
+
 export interface ImportJob {
 	job_id: string; source: string; state: 'running' | 'done' | 'error';
 	fetched: number; imported: number; total: number | null; status: string; date: number;
@@ -2731,6 +2741,11 @@ class TapedeckAPI {
 	 *  server, so it is fetched apart from the stats and may arrive later. */
 	async getStatsGraphs(range: StatsRange = 'all'): Promise<StatsGraphs> {
 		return this.get(`/api/v1/stats/graphs?range=${range}`);
+	}
+
+	/** The graphs for one report period, by the period's `key`. */
+	async getReportGraphs(unit: 'week' | 'month' | 'year', key: string): Promise<ReportGraphs> {
+		return this.get(`/api/v1/reports/graphs?unit=${unit}&key=${encodeURIComponent(key)}`);
 	}
 
 	/** How much of the history MusicBrainz has identified at recording level.

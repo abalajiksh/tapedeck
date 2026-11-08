@@ -310,12 +310,15 @@ struct Artist {
 
 /// Fold the graphs from `rows` (oldest first, the whole history).
 ///
-/// `after` is the range's lower bound (None = all time) and `now` is today,
-/// both unix seconds; `tz` buckets every day.
+/// `after` is the range's lower bound (None = all time), `before` its
+/// exclusive upper bound (None = up to now — a report's period has one), and
+/// `now` is today, all unix seconds; `tz` buckets every day.
+#[allow(clippy::too_many_arguments)]
 pub fn compute(
     rows: &[GraphRow],
     range: &str,
     after: Option<i64>,
+    before: Option<i64>,
     now: i64,
     tz: Tz,
     capped: bool,
@@ -331,11 +334,16 @@ pub fn compute(
         }
     }
 
-    let in_range: Vec<&GraphRow> =
-        rows.iter().filter(|r| after.is_none_or(|a| r.timestamp >= a)).collect();
+    let in_range: Vec<&GraphRow> = rows
+        .iter()
+        .filter(|r| {
+            after.is_none_or(|a| r.timestamp >= a) && before.is_none_or(|b| r.timestamp < b)
+        })
+        .collect();
 
-    // The axis: from the range's start (or the first listen) to today.
-    let today = day_of(now, tz);
+    // The axis: from the range's start (or the first listen) to today, or to
+    // the period's last day when that came first.
+    let today = before.map_or(day_of(now, tz), |b| day_of(b - 1, tz).min(day_of(now, tz)));
     let start = match (after, in_range.first()) {
         (Some(a), _) => Some(day_of(a, tz)),
         (None, Some(r)) => Some(day_of(r.timestamp, tz)),
@@ -630,6 +638,154 @@ pub fn compute(
     }
 }
 
+// ── Reports: one period's window, and who topped each part of it ────────────
+
+/// Who had the most listens in one part of a report's period: a week of a
+/// month, or a month of a year.
+#[derive(Debug, Serialize, utoipa::ToSchema, PartialEq)]
+pub struct Throne {
+    /// The part's first day, `YYYY-MM-DD`, local.
+    pub start: String,
+    /// `Jan`, or `1–7 Aug` — clipped to the period, so a month's first week
+    /// starts on the 1st.
+    pub label: String,
+    /// Whoever was credited on the most listens. Absent for a part with none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    /// Their credited listens in that part.
+    pub plays: i64,
+    /// Every listen in that part — the population `plays` is part of.
+    pub listens: i64,
+}
+
+/// How a period splits for its throne.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Parts {
+    /// Monday-start weeks, clipped to the period — for a month.
+    Weeks,
+    /// Calendar months — for a year.
+    Months,
+}
+
+const MONTHS: [&str; 12] =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/// Local midnight at the start of `d`, as unix seconds.
+pub fn day_start(d: NaiveDate, tz: Tz) -> i64 {
+    d.and_hms_opt(0, 0, 0)
+        .and_then(|n| tz.from_local_datetime(&n).earliest())
+        .map(|t| t.timestamp())
+        // A zone that skips midnight: the first instant of that day.
+        .unwrap_or_else(|| {
+            crate::analytics::local_day_start(day_start(d, chrono_tz::UTC) + 43_200, tz)
+        })
+}
+
+/// The local `[start, end)` of a report period from its key — `2026`,
+/// `2026-08` or `2026-W31`, the shapes `Period::key` takes. None for a key
+/// that names no such period.
+pub fn period_bounds(key: &str, tz: Tz) -> Option<(i64, i64)> {
+    let (first, next) = if let Some((y, w)) = key.split_once("-W") {
+        let monday =
+            NaiveDate::from_isoywd_opt(y.parse().ok()?, w.parse().ok()?, chrono::Weekday::Mon)?;
+        (monday, monday + chrono::Duration::days(7))
+    } else if let Some((y, m)) = key.split_once('-') {
+        let first = NaiveDate::from_ymd_opt(y.parse().ok()?, m.parse().ok()?, 1)?;
+        (first, first.checked_add_months(chrono::Months::new(1))?)
+    } else {
+        let y: i32 = key.parse().ok()?;
+        (NaiveDate::from_ymd_opt(y, 1, 1)?, NaiveDate::from_ymd_opt(y + 1, 1, 1)?)
+    };
+    Some((day_start(first, tz), day_start(next, tz)))
+}
+
+/// Who topped each part of `[start, before)`, oldest first, up to today —
+/// a running period has no throne for parts that haven't happened.
+///
+/// Counted over everyone credited, like every other artist figure; a part's
+/// `listens` counts each listen once, so `plays` can never exceed it.
+pub fn throne(
+    rows: &[GraphRow],
+    start: i64,
+    before: i64,
+    now: i64,
+    tz: Tz,
+    parts: Parts,
+) -> Vec<Throne> {
+    let first = NaiveDate::from_num_days_from_ce_opt(day_of(start, tz));
+    let last = NaiveDate::from_num_days_from_ce_opt(day_of(before - 1, tz).min(day_of(now, tz)));
+    let (Some(first), Some(last)) = (first, last) else { return Vec::new() };
+    if last < first {
+        return Vec::new();
+    }
+    let part_of = |d: NaiveDate| -> NaiveDate {
+        match parts {
+            Parts::Months => NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap_or(d),
+            Parts::Weeks => {
+                let monday = d - chrono::Duration::days(d.weekday().num_days_from_monday() as i64);
+                monday.max(first)
+            }
+        }
+    };
+
+    // Every part from the first to the last, empty ones included.
+    let mut order: Vec<NaiveDate> = Vec::new();
+    let mut d = first;
+    while d <= last {
+        let p = part_of(d);
+        if order.last() != Some(&p) {
+            order.push(p);
+        }
+        d += chrono::Duration::days(1);
+    }
+    // Per part: every listen, and credited plays per artist key → (plays, name).
+    type Tally = (i64, HashMap<String, (i64, String)>);
+    let mut tallies: HashMap<NaiveDate, Tally> = HashMap::new();
+    for r in rows.iter().filter(|r| r.timestamp >= start && r.timestamp < before) {
+        let Some(day) = NaiveDate::from_num_days_from_ce_opt(day_of(r.timestamp, tz)) else {
+            continue;
+        };
+        let t = tallies.entry(part_of(day)).or_default();
+        t.0 += 1;
+        let p = performer(&r.artist, r.artist_credit.as_deref());
+        for (key, name) in credited(p, r.artist_credit.as_deref()) {
+            let e = t.1.entry(key).or_insert_with(|| (0, name.to_string()));
+            e.0 += 1;
+            e.1 = name.to_string();
+        }
+    }
+
+    order
+        .into_iter()
+        .map(|p| {
+            let (listens, artists) = tallies.remove(&p).unwrap_or_default();
+            let top =
+                artists.into_values().max_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+            let label = match parts {
+                Parts::Months => MONTHS[p.month0() as usize].to_string(),
+                Parts::Weeks => {
+                    let sunday =
+                        p + chrono::Duration::days(6 - p.weekday().num_days_from_monday() as i64);
+                    // Clipped at the period's last day (or today, while it runs).
+                    let end = sunday.min(last);
+                    if end == p {
+                        format!("{} {}", p.day(), MONTHS[p.month0() as usize])
+                    } else {
+                        format!("{}–{} {}", p.day(), end.day(), MONTHS[p.month0() as usize])
+                    }
+                }
+            };
+            Throne {
+                start: p.to_string(),
+                label,
+                plays: top.as_ref().map_or(0, |t| t.0),
+                artist: top.map(|t| t.1),
+                listens,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,7 +811,7 @@ mod tests {
     }
 
     fn run(rows: &[GraphRow], after: Option<i64>, now: i64) -> StatsGraphs {
-        compute(rows, "all", after, now, chrono_tz::UTC, false)
+        compute(rows, "all", after, None, now, chrono_tz::UTC, false)
     }
 
     #[test]
@@ -682,8 +838,8 @@ mod tests {
         // 23:30 UTC on Monday is 00:30 Tuesday in Berlin.
         let late = T0 + 11 * 3600 + 1800;
         let rows = vec![row(T0, "A", "x", None), row(late, "A", "y", None)];
-        let utc = compute(&rows, "all", None, late, chrono_tz::UTC, false);
-        let berlin = compute(&rows, "all", None, late, chrono_tz::Europe::Berlin, false);
+        let utc = compute(&rows, "all", None, None, late, chrono_tz::UTC, false);
+        let berlin = compute(&rows, "all", None, None, late, chrono_tz::Europe::Berlin, false);
         assert_eq!(utc.daily, vec![2]);
         assert_eq!(berlin.daily, vec![1, 1]);
         assert_eq!(berlin.timezone, "Europe/Berlin");
@@ -810,5 +966,91 @@ mod tests {
         let g = run(&[], None, T0);
         assert!(g.start_day.is_none() && g.daily.is_empty() && g.volume.peak.is_none());
         assert_eq!(g.long_tail.half, 0);
+    }
+
+    #[test]
+    fn period_keys_are_local_calendar_windows() {
+        let berlin = chrono_tz::Europe::Berlin;
+        // 1 August 2026 00:00 CEST is 31 July 22:00 UTC.
+        let (a, b) = period_bounds("2026-08", berlin).unwrap();
+        assert_eq!((a, b), (1_785_535_200, 1_788_213_600));
+        let (w0, w1) = period_bounds("2026-W31", chrono_tz::UTC).unwrap();
+        assert_eq!(
+            (day_label(day_of(w0, chrono_tz::UTC)), w1 - w0),
+            ("2026-07-27".into(), 7 * DAY)
+        );
+        let (y0, _) = period_bounds("2026", chrono_tz::UTC).unwrap();
+        assert_eq!(day_label(day_of(y0, chrono_tz::UTC)), "2026-01-01");
+        for bad in ["2026-13", "2026-W60", "twenty", ""] {
+            assert!(period_bounds(bad, chrono_tz::UTC).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_report_window_stops_at_its_last_day() {
+        let (start, before) = period_bounds("2026-01", chrono_tz::UTC).unwrap();
+        let rows = vec![
+            row(start - DAY, "A", "x", None),
+            row(start, "A", "x", None),
+            row(before, "A", "x", None),
+        ];
+        let g = compute(
+            &rows,
+            "month",
+            Some(start),
+            Some(before),
+            before + 40 * DAY,
+            chrono_tz::UTC,
+            false,
+        );
+        assert_eq!((g.volume.plays, g.daily.len()), (1, 31));
+        // A running period stops at today instead.
+        let g = compute(
+            &rows,
+            "month",
+            Some(start),
+            Some(before),
+            start + 9 * DAY,
+            chrono_tz::UTC,
+            false,
+        );
+        assert_eq!(g.daily.len(), 10);
+    }
+
+    #[test]
+    fn a_years_throne_is_every_month_with_empty_ones_kept() {
+        let (start, before) = period_bounds("2026", chrono_tz::UTC).unwrap();
+        let mar = start + 70 * DAY;
+        let rows = vec![
+            row(start + DAY, "Dua Lipa", "x", None),
+            row(start + DAY + 60, "Dua Lipa", "y", None),
+            credit(row(start + DAY + 120, "Madonna", "z", None), "Madonna; Dua Lipa"),
+            row(mar, "Michael Jackson", "x", None),
+        ];
+        let t = throne(&rows, start, before, start + 80 * DAY, chrono_tz::UTC, Parts::Months);
+        let got: Vec<(&str, Option<&str>, i64, i64)> =
+            t.iter().map(|p| (p.label.as_str(), p.artist.as_deref(), p.plays, p.listens)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("Jan", Some("Dua Lipa"), 3, 3),
+                ("Feb", None, 0, 0),
+                ("Mar", Some("Michael Jackson"), 1, 1)
+            ],
+            "credits count, listens count once, months after today are not there"
+        );
+    }
+
+    #[test]
+    fn a_months_weeks_are_clipped_to_the_month() {
+        // August 2026 starts on a Saturday and ends on a Monday.
+        let (start, before) = period_bounds("2026-08", chrono_tz::UTC).unwrap();
+        let t = throne(&[], start, before, before + DAY, chrono_tz::UTC, Parts::Weeks);
+        let labels: Vec<&str> = t.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["1–2 Aug", "3–9 Aug", "10–16 Aug", "17–23 Aug", "24–30 Aug", "31 Aug"]
+        );
+        assert_eq!(t[0].start, "2026-08-01");
     }
 }
