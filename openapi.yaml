@@ -15327,6 +15327,9 @@ components:
       - all_days
       - daily
       - months
+      - weeks
+      - rivals
+      - next
       - clock
       - week_start
       - top_days
@@ -15367,8 +15370,14 @@ components:
           - string
           - 'null'
           description: |-
-            The local day (`YYYY-MM-DD`) their two-week average climbed fastest.
-            Absent under twenty listens, or if it never climbed.
+            The local day (`YYYY-MM-DD`) your listening to them stepped up —
+            `step.date`, kept as its own field for the clients that read it.
+            Absent under twenty listens, or without a clear step up.
+        step:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/Step'
+            description: The step itself, with the rates either side. Absent like `took_off`.
         habit:
           oneOf:
           - type: 'null'
@@ -15386,6 +15395,21 @@ components:
           description: |-
             Every month from their first to the last of the history, oldest first,
             including months they were not played in.
+        weeks:
+          type: array
+          items:
+            $ref: '#/components/schemas/WeekShare'
+          description: |-
+            Every week of the history, oldest first, including weeks they were
+            not played in.
+        rivals:
+          type: array
+          items:
+            $ref: '#/components/schemas/Rival'
+          description: Your five most-played other artists across the same weeks.
+        next:
+          $ref: '#/components/schemas/Next'
+          description: Who you play next after them.
         clock:
           type: array
           items:
@@ -19891,6 +19915,37 @@ components:
           items:
             type: string
           description: Names of people in the room with no account on this instance.
+    Next:
+      type: object
+      description: Who you go on to after them.
+      required:
+      - total
+      - artists
+      properties:
+        total:
+          type: integer
+          format: int64
+          description: |-
+            Times one of their listens was followed, within a quarter of an hour,
+            by somebody else's — the population each `plays` below is part of.
+        artists:
+          type: array
+          items:
+            $ref: '#/components/schemas/NextArtist'
+          description: |-
+            Most often first. A listen crediting two artists counts for both, so
+            these can add up to more than `total`.
+    NextArtist:
+      type: object
+      required:
+      - name
+      - plays
+      properties:
+        name:
+          type: string
+        plays:
+          type: integer
+          format: int64
     Note:
       type: object
       description: |-
@@ -23279,6 +23334,28 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Revision'
+    Rival:
+      type: object
+      description: |-
+        One of your other most-played artists, week by week, to set this one
+        against.
+      required:
+      - name
+      - plays
+      - weekly
+      properties:
+        name:
+          type: string
+        plays:
+          type: integer
+          format: int64
+          description: Credited listens over the whole window.
+        weekly:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: Credited listens per week, aligned with `Dossier::weeks`.
     RomanLine:
       type: object
       description: One lyric line in Latin letters.
@@ -26851,6 +26928,31 @@ components:
           items:
             $ref: '#/components/schemas/Anchor'
           description: Artists you mostly play one song from, most anchored first.
+    Step:
+      type: object
+      description: |-
+        The day your rate of listening to them stepped up most.
+
+        One change point, fitted to every day from their first listen to the end
+        of the history: the split where "one rate before, a higher one after"
+        explains the days best. Absent when there is no clear step up — a steady
+        favourite, or one that has faded, has nothing to mark.
+      required:
+      - date
+      - before_per_week
+      - after_per_week
+      properties:
+        date:
+          type: string
+          description: '`YYYY-MM-DD`, local: the first day at the new rate.'
+        before_per_week:
+          type: number
+          format: double
+          description: Their listens a week before that day.
+        after_per_week:
+          type: number
+          format: double
+          description: And from that day on.
     StreamChoice:
       type: object
       description: |-
@@ -28549,6 +28651,25 @@ components:
             type: integer
             format: int64
           description: Credited plays per local day, aligned with `StatsGraphs::daily`.
+    WeekShare:
+      type: object
+      description: A week, by the local date it began on (your first day of the week).
+      required:
+      - week
+      - plays
+      - all
+      properties:
+        week:
+          type: string
+          description: '`YYYY-MM-DD`, local: the week''s first day.'
+        plays:
+          type: integer
+          format: int64
+          description: Their listens that week.
+        all:
+          type: integer
+          format: int64
+          description: Every listen that week — the population `plays` is part of.
     WhatsOn:
       type: object
       description: A chain's slots, and what a "since when?" needs to offer.

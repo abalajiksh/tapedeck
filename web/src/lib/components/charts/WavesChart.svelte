@@ -8,6 +8,9 @@
 	 * that to mean something; a week is drawn day by day. Colour is assigned in
 	 * the fixed series order, ranked by plays, and the legend names every line —
 	 * colour is never the only way to tell them apart.
+	 *
+	 * The artist page reuses it week by week (`stepDays = 7`) to set one
+	 * artist against your favourites, with that artist drawn heavier.
 	 */
 	import { LayerCake, Svg } from 'layercake';
 	import { scaleLinear } from 'd3-scale';
@@ -19,14 +22,22 @@
 	export let start: string;
 	export let waves: { name: string; plays: number; daily: number[] }[] = [];
 	export let height = 260;
+	/** Days per point: 1 for daily series, 7 for weekly ones. */
+	export let stepDays = 1;
+	/** Points in the trailing mean. Left out, a long daily series gets a
+	 *  week and anything else none. */
+	export let smoothWindow: number | null = null;
+	/** A series drawn heavier than the rest — the artist a page is about. */
+	export let emphasise: number | null = null;
 
 	const pad = { top: 10, right: 8, bottom: 24, left: 36 };
 
 	$: n = waves[0]?.daily.length ?? 0;
-	$: smoothing = n > 60 ? 7 : 1;
+	$: smoothing = smoothWindow ?? (n > 60 ? 7 : 1);
 	$: smooth = waves.map((w, s) => ({ ...w, color: SERIES[s], values: rolling(w.daily, smoothing) }));
 	$: max = Math.max(1, ...smooth.flatMap((w) => w.values));
-	$: ticks = dayTicks(start, n);
+	$: drawOrder = smooth.map((_, i) => i).sort((a, b) => (a === emphasise ? 1 : b === emphasise ? -1 : 0));
+	$: ticks = dayTicks(start, (n - 1) * stepDays + 1).map((t) => ({ ...t, i: t.i / stepDays }));
 	$: yTicks = valueTicks(max);
 
 	/** One artist picked out from the legend; the others fade. */
@@ -68,10 +79,12 @@
 					<line x1="0" x2={width} y1={yScale(t)} y2={yScale(t)} class="grid" />
 					<text x="-6" y={yScale(t)} dy="0.32em" text-anchor="end" class="tick">{nf(t)}</text>
 				{/each}
-				{#each smooth as w, s}
+				<!-- The emphasised series is drawn last, so it sits on top. -->
+				{#each drawOrder as s}
+					{@const w = smooth[s]}
 					{@const faded = focus !== null && focus !== s}
 					<path d={ar(w.values)} fill={w.color} opacity={faded ? 0.03 : 0.14} />
-					<path d={ln(w.values)} fill="none" stroke={w.color} stroke-width="2"
+					<path d={ln(w.values)} fill="none" stroke={w.color} stroke-width={emphasise === s ? 3 : 2}
 						stroke-linejoin="round" opacity={faded ? 0.18 : 1} />
 				{/each}
 				{#each ticks as t}
@@ -91,8 +104,8 @@
 		<ChartTip x={tipX} y={8} width={wrapWidth} show={hover !== null}>
 			{#if hover !== null}
 				{@const h = hover}
-				<strong>{fmtDate(dayAt(start, h))}</strong>
-				{#if smoothing > 1}<span class="sub"> · 7-day average</span>{/if}
+				<strong>{stepDays === 7 ? 'Week of ' : ''}{fmtDate(dayAt(start, h * stepDays))}</strong>
+				{#if smoothing > 1}<span class="sub"> · {smoothing}-{stepDays === 7 ? 'week' : 'day'} average</span>{/if}
 				{#each [...smooth].sort((a, b) => b.values[h] - a.values[h]) as w}
 					<div class="row"><span class="dot" style="background:{w.color};"></span>
 						<span class="nm">{w.name}</span><span class="v">{fmt(w.values[h])}</span></div>
@@ -101,8 +114,10 @@
 		</ChartTip>
 	</div>
 	<p class="caption">
-		Listens a day{smoothing > 1 ? ', averaged over the previous seven days' : ''}, for the
-		{waves.length} artists you played most in this range. Click a name to open them.
+		<slot name="caption">
+			Listens a day{smoothing > 1 ? ', averaged over the previous seven days' : ''}, for the
+			{waves.length} artists you played most in this range. Click a name to open them.
+		</slot>
 	</p>
 {/if}
 

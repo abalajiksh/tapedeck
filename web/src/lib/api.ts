@@ -1946,8 +1946,16 @@ export interface ArtistDossier {
 	all_days: number;
 	first: number | null;
 	last: number | null;
-	/** Local `YYYY-MM-DD` their two-week average climbed fastest. */
+	/** Local `YYYY-MM-DD` your listening to them stepped up — `step.date`. */
 	took_off: string | null;
+	/** The one clear step up in your rate of listening to them, if any. */
+	step?: { date: string; before_per_week: number; after_per_week: number };
+	/** Every week of the history (your first day of the week), empty ones too. */
+	weeks: { week: string; plays: number; all: number }[];
+	/** Your five most-played other artists, weekly, aligned with `weeks`. */
+	rivals: { name: string; plays: number; weekly: number[] }[];
+	/** Who you go on to within a quarter hour; `plays` are of `total`. */
+	next: { total: number; artists: { name: string; plays: number }[] };
 	habit: { return_rate: number; span_coverage: number; top_day_share: number; score: number } | null;
 	daily: DossierDay[];
 	months: { month: string; plays: number; all: number }[];
