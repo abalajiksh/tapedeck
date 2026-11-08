@@ -494,3 +494,43 @@ impl Database {
         })
     }
 }
+
+/// One listen, as the Statistics graphs read it. Leaner than `ReportRow`: the
+/// graphs need who, what and when, and nothing about chains or genres.
+#[derive(Debug, sqlx::FromRow)]
+pub struct GraphRow {
+    pub timestamp: i64,
+    pub artist: String,
+    /// Everyone credited, `"; "`-joined and primary first.
+    pub artist_credit: Option<String>,
+    pub title: String,
+    pub album: Option<String>,
+    /// `COALESCE(album_filed_under, artist)` — who the album is filed under.
+    pub album_filed_under: Option<String>,
+}
+
+impl Database {
+    /// The whole history for the Statistics graphs, **oldest first**.
+    ///
+    /// Read newest-first and reversed rather than `ORDER BY timestamp ASC`:
+    /// under the analytics cap the rows that fall off must be the oldest ones.
+    /// An ascending `LIMIT` would drop this week instead, and every range but
+    /// All is about the recent end. The whole history rather than the range,
+    /// because two of the graphs need facts the range cannot answer — when an
+    /// artist was *first* heard is not a question about the last 30 days.
+    pub async fn graph_rows(&self, user_id: i64, limit: i64) -> Result<Vec<GraphRow>, sqlx::Error> {
+        let mut rows: Vec<GraphRow> = sqlx::query_as(&crate::sql!(
+            "SELECT timestamp, artist, artist_credit, title, album,
+                    COALESCE(album_filed_under, artist) AS album_filed_under
+               FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+              ORDER BY timestamp DESC LIMIT ?"
+        ))
+        .bind(user_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.reverse();
+        Ok(rows)
+    }
+}

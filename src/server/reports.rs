@@ -347,22 +347,9 @@ impl Unit {
 /// a filing convention, and letting it into the tally puts it back on top of
 /// every superlative it was removed from in v0.57.0.
 fn credited_names(primary: &str, credit: Option<&str>) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut push = |n: &str| {
-        let n = n.trim();
-        if n.is_empty() || crate::db::is_various_artists(n) {
-            return;
-        }
-        let key = n.to_lowercase();
-        if !out.contains(&key) {
-            out.push(key);
-        }
-    };
-    push(primary);
-    for name in credit.into_iter().flat_map(|c| c.split(';')) {
-        push(name);
-    }
-    out
+    // One implementation, shared with the Statistics graphs, so the two
+    // screens cannot disagree about who a listen credits.
+    crate::graphs::credited(primary, credit).into_iter().map(|(key, _)| key).collect()
 }
 
 /// The period a local datetime falls in, as a sortable key and a label.
@@ -1790,16 +1777,7 @@ fn fold_periods(rows: Vec<ReportRow>, tz: Tz, unit: Unit) -> Folded {
         // primary first — the shape `save_scrobble` and `fold_artist_credit`
         // both write. The primary is the one to count; the whole joined string
         // would be its own key and no more useful than the placeholder.
-        let performer = if crate::db::is_various_artists(&r.artist) {
-            r.artist_credit
-                .as_deref()
-                .and_then(|c| c.split(';').next())
-                .map(str::trim)
-                .filter(|c| !c.is_empty() && !crate::db::is_various_artists(c))
-                .unwrap_or(&r.artist)
-        } else {
-            &r.artist
-        };
+        let performer = crate::graphs::performer(&r.artist, r.artist_credit.as_deref());
         let akey = performer.trim().to_lowercase();
 
         // Everyone credited, not only the one whose name the row carries.
