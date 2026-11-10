@@ -3524,6 +3524,231 @@ paths:
       - sessionCookie: []
       - apiToken:
         - read
+  /api/v1/reports/story:
+    get:
+      tags:
+      - Statistics
+      summary: A report period as a short animated story.
+      description: |-
+        Scope: `read` *(since v0.131)*.
+
+        The same facts as the chapter and its share image, told one at a time:
+        a few scenes, each a stack of SVG layers that fade, rise and count into
+        place. The server draws every layer — text is already fitted, escaped and
+        set in the embedded fonts' metrics — and a client only **moves** them.
+
+        To play it: draw `background`, then for the current scene draw each
+        layer's `svg` inside a group whose transform and opacity come from its
+        `tracks` at the scene's elapsed milliseconds.
+
+        * A track is a list of `{t, v}` keys. Before the first key the value is
+          the first key's, after the last the last key's, and between two keys it
+          eases out: `a + (b - a) * (1 - (1 - p)^3)`. An absent track is at rest
+          (opacity 1, offsets 0, scales 1).
+        * The group's transform is
+          `translate(dx + ox, dy + oy) scale(scale * scale_x, scale * scale_y) translate(-ox, -oy)`
+          where `(ox, oy)` is the layer's `origin`.
+        * A layer with `count` carries the literal `{{n}}` in its `svg`; replace
+          it with the eased value between `start_ms` and `end_ms`, rounded and
+          written with thousands separators.
+        * In its last `fade_out_ms` a scene's layers fade out together. The last
+          scene has none and is held.
+
+        It **computes nothing**: every figure comes from `GET /api/v1/reports`
+        with the same `unit` and `offset`. A scene the period has nothing to say
+        in is absent rather than empty, so a thin period is a shorter story.
+      operationId: report_story
+      parameters:
+      - name: unit
+        in: query
+        description: '`week`, `month` (default) or `year`.'
+        required: false
+        schema:
+          type: string
+          default: month
+          pattern: ^(week|month|year)$
+      - name: offset
+        in: query
+        description: How many periods back from the newest, matching the Reports stepper.
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: theme
+        in: query
+        description: |-
+          `dark` (default) or `light`. Asked for, not inherited, for the same
+          reason the share image asks: the result lands on somebody else's feed.
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The story.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoryResponse'
+        '400':
+          description: An unsupported unit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No report for that period — an offset past the end of the history, or an instance with nothing in it yet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - sessionCookie: []
+      - apiToken:
+        - read
+  /api/v1/reports/story/video:
+    post:
+      tags:
+      - Statistics
+      summary: Start making a video of a story.
+      description: |-
+        Scope: `read` *(since v0.131)*. A `POST` that needs only `read`: nothing
+        of yours is written, the result is a temporary file.
+
+        Returns at once with a job to poll at
+        `GET /api/v1/reports/story/video/{id}`. The video is 1080×1920 H.264 at
+        30 frames a second with no sound, drawn from the same story the `GET`
+        returns, and is kept for an hour.
+
+        One video is made at a time on the whole server, so `queued` means
+        somebody else's is being drawn. Each user may have one export in flight.
+      operationId: report_story_video_start
+      parameters:
+      - name: unit
+        in: query
+        description: '`week`, `month` (default) or `year`.'
+        required: false
+        schema:
+          type: string
+          default: month
+          pattern: ^(week|month|year)$
+      - name: offset
+        in: query
+        description: How many periods back from the newest, matching the Reports stepper.
+        required: false
+        schema:
+          type: integer
+          minimum: 0
+      - name: theme
+        in: query
+        description: |-
+          `dark` (default) or `light`. Asked for, not inherited, for the same
+          reason the share image asks: the result lands on somebody else's feed.
+        required: false
+        schema:
+          type: string
+      responses:
+        '202':
+          description: The export was queued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoryVideo'
+        '400':
+          description: An unsupported unit.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: No report for that period.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: You already have a video being made.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '501':
+          description: This server has no video encoder (ffmpeg with libx264). The story still plays.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - sessionCookie: []
+      - apiToken:
+        - read
+  /api/v1/reports/story/video/{id}:
+    get:
+      tags:
+      - Statistics
+      summary: How a video export is getting on.
+      description: 'Scope: `read` *(since v0.131)*.'
+      operationId: report_story_video_status
+      parameters:
+      - name: id
+        in: path
+        description: The export, as `POST /api/v1/reports/story/video` named it.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The export's state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoryVideo'
+        '404':
+          description: No such export. They are kept for an hour, and only their owner can see them.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - sessionCookie: []
+      - apiToken:
+        - read
+  /api/v1/reports/story/video/{id}/file:
+    get:
+      tags:
+      - Statistics
+      summary: The finished video.
+      description: 'Scope: `read` *(since v0.131)*.'
+      operationId: report_story_video_file
+      parameters:
+      - name: id
+        in: path
+        description: The export.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The video. `Cache-Control` is `private`.
+          content:
+            video/mp4:
+              schema:
+                $ref: '#/components/schemas/Bytes'
+        '404':
+          description: No such export, or it has expired.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The export is not finished yet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - sessionCookie: []
+      - apiToken:
+        - read
   /api/v1/rediscovery:
     get:
       tags:
@@ -27032,6 +27257,238 @@ components:
           type: number
           format: double
           description: And from that day on.
+    Story:
+      type: object
+      description: 'A whole story: a ground that never moves and the scenes played over it.'
+      required:
+      - width
+      - height
+      - fps
+      - unit
+      - label
+      - theme
+      - background
+      - scenes
+      - fully_covered
+      properties:
+        width:
+          type: integer
+          format: int32
+          minimum: 0
+        height:
+          type: integer
+          format: int32
+          minimum: 0
+        fps:
+          type: integer
+          format: int32
+          description: The video's frame rate. A player may draw more often than this.
+          minimum: 0
+        unit:
+          type: string
+        label:
+          type: string
+          description: 'The period''s own name: "2026", "August 2026", "Week of 17 August".'
+        theme:
+          type: string
+        background:
+          type: string
+          description: SVG drawn under every scene and never animated.
+        scenes:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoryScene'
+        fully_covered:
+          type: boolean
+          description: |-
+            False when a string that is drawn contains a character the embedded
+            fonts cannot draw. The video may then show boxes for it; a browser,
+            which has its own fonts, usually will not.
+    StoryCount:
+      type: object
+      description: |-
+        A number that counts up while its layer is on screen.
+
+        The layer's `svg` carries the literal token `{{n}}` exactly once, and it is
+        replaced by the value at that moment, written with thousands separators.
+      required:
+      - from
+      - to
+      - start_ms
+      - end_ms
+      properties:
+        from:
+          type: integer
+          format: int64
+        to:
+          type: integer
+          format: int64
+        start_ms:
+          type: integer
+          format: int32
+          minimum: 0
+        end_ms:
+          type: integer
+          format: int32
+          minimum: 0
+    StoryKey:
+      type: object
+      description: 'One point on a track: at `t` milliseconds into the scene the value is `v`.'
+      required:
+      - t
+      - v
+      properties:
+        t:
+          type: integer
+          format: int32
+          minimum: 0
+        v:
+          type: number
+          format: float
+    StoryLayer:
+      type: object
+      description: 'One thing on screen: a piece of SVG and how it moves.'
+      required:
+      - svg
+      - origin
+      - tracks
+      properties:
+        svg:
+          type: string
+          description: |-
+            SVG elements in story coordinates (no `<svg>` root). Text is already
+            fitted and escaped; draw it as it is.
+        origin:
+          type: array
+          items:
+            type: number
+            format: float
+          description: The point scales are taken about, in story pixels.
+        tracks:
+          $ref: '#/components/schemas/StoryTracks'
+        count:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/StoryCount'
+            description: Present when `svg` carries the `{{n}}` token.
+    StoryResponse:
+      allOf:
+      - $ref: '#/components/schemas/Story'
+      - type: object
+        required:
+        - video_export
+        properties:
+          video_export:
+            type: boolean
+            description: |-
+              True when the server has an encoder and `POST
+              /api/v1/reports/story/video` will work. False is not an error: the
+              story still plays, there is just nothing to download.
+      description: A story, and whether this server can turn it into a video.
+    StoryScene:
+      type: object
+      description: A few seconds about one fact.
+      required:
+      - id
+      - duration_ms
+      - fade_out_ms
+      - layers
+      properties:
+        id:
+          type: string
+          description: |-
+            What the scene is about: `intro`, `volume`, `shape`, `artist`,
+            `record`, `discovery` or `outro`. A period with nothing to say about
+            one of these has no such scene.
+        duration_ms:
+          type: integer
+          format: int32
+          minimum: 0
+        fade_out_ms:
+          type: integer
+          format: int32
+          description: |-
+            How long the scene takes to fade into the next one, at its end. Zero
+            for the last scene, which is held.
+          minimum: 0
+        layers:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoryLayer'
+          description: Bottom first.
+    StoryTracks:
+      type: object
+      description: |-
+        How one layer moves. Every track is optional; an empty one means the
+        property stays at rest (opacity 1, no offset, scale 1).
+
+        Before a track's first key the value is the first key's, after its last
+        the last key's, and between two keys it eases out (cubic) from one to the
+        other.
+      properties:
+        opacity:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoryKey'
+        dx:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoryKey'
+          description: Horizontal offset in story pixels.
+        dy:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoryKey'
+          description: Vertical offset in story pixels; positive is down.
+        scale:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoryKey'
+          description: Uniform scale about the layer's `origin`.
+        scale_x:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoryKey'
+          description: Horizontal scale about the `origin`, multiplied with `scale`.
+        scale_y:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoryKey'
+          description: Vertical scale about the `origin`, multiplied with `scale`.
+    StoryVideo:
+      type: object
+      description: Where a video export has got to.
+      required:
+      - id
+      - state
+      - frames_done
+      - frames_total
+      - bytes
+      properties:
+        id:
+          type: string
+        state:
+          type: string
+          description: '`queued` (another render is running), `rendering`, `done` or `failed`.'
+          pattern: ^(queued|rendering|done|failed)$
+        frames_done:
+          type: integer
+          format: int32
+          minimum: 0
+        frames_total:
+          type: integer
+          format: int32
+          minimum: 0
+        bytes:
+          type: integer
+          format: int64
+          description: The file's size once `state` is `done`, otherwise 0.
+          minimum: 0
+        error:
+          type:
+          - string
+          - 'null'
+          description: Why it failed, when it did.
     StreamChoice:
       type: object
       description: |-

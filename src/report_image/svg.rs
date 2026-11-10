@@ -218,6 +218,20 @@ impl Doc {
     /// two answer different questions: the box is the coordinate system every
     /// position above was computed in, and the size is what a renderer with no
     /// opinion of its own falls back to.
+    /// The document's contents without the `<svg>` around them: `<defs>` (if
+    /// any) followed by the body.
+    ///
+    /// For the story, where one frame is several of these stacked inside one
+    /// root — each layer is drawn with the same writer the cards use, so the
+    /// escaping and the coverage accounting are not done a second way.
+    pub fn into_fragment(self) -> String {
+        if self.defs.is_empty() {
+            self.body
+        } else {
+            format!("<defs>{}</defs>{}", self.defs, self.body)
+        }
+    }
+
     pub fn finish(self) -> String {
         let defs = if self.defs.is_empty() {
             String::new()

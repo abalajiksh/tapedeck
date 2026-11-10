@@ -26,6 +26,7 @@ mod radiodns;
 mod ratings;
 mod replica;
 mod report_image;
+mod report_video;
 mod rockbox;
 mod romanize;
 mod server;
@@ -237,6 +238,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         everynoise,
         everynoise_jobs: Default::default(),
+        video_jobs: Default::default(),
         log_dir: if config.logging.file_enabled {
             config.logging.dir.clone()
         } else {

@@ -30,9 +30,56 @@ use crate::server::AppState;
 /// The largest report page we will read back out of the handler.
 const MAX_REPORT_BYTES: usize = 8 * 1024 * 1024;
 
-fn err(code: u16, msg: &str) -> axum::response::Response {
+pub(crate) fn err(code: u16, msg: &str) -> axum::response::Response {
     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, Json(ErrorResponse { code, error: msg.into() })).into_response()
+}
+
+/// One period of the caller's reports, from the handler that owns the
+/// arithmetic — shared by the image and the story so neither can come to
+/// disagree with the chapter it was made from.
+///
+/// `limit=1` is not an optimisation — the fold walks the whole history
+/// whatever is asked for — it is so the page cannot be misread for the period.
+pub(crate) async fn load_period(
+    state: &Arc<AppState>,
+    auth: ReadAuth,
+    unit: Unit,
+    offset: usize,
+) -> Result<serde_json::Value, axum::response::Response> {
+    let rq = crate::server::reports::ReportQuery {
+        unit: Some(unit.as_str().to_string()),
+        offset: Some(offset),
+        limit: Some(1),
+    };
+    let resp = crate::server::reports::reports(State(state.clone()), auth, Query(rq))
+        .await
+        .into_response();
+    let status = resp.status();
+    let bytes = match axum::body::to_bytes(resp.into_body(), MAX_REPORT_BYTES).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!("Report body for a share could not be read: {e}");
+            return Err(err(500, "Could not read your listening"));
+        }
+    };
+    if !status.is_success() {
+        // The report's own message, rather than one invented here.
+        return Err((status, bytes).into_response());
+    }
+    let page: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("Report body for a share did not parse: {e}");
+            return Err(err(500, "Could not read your listening"));
+        }
+    };
+    // A real answer, not a failure: an offset past the end of a history, or
+    // an instance with nothing in it yet.
+    page.get("periods")
+        .and_then(|p| p.get(0))
+        .cloned()
+        .ok_or_else(|| err(404, "There is no report for that period yet"))
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
@@ -131,42 +178,11 @@ pub async fn report_image(
     }
     let offset = q.offset.unwrap_or(0);
 
-    // One period, from the handler that owns the arithmetic. `limit=1` is not
-    // an optimisation — the fold walks the whole history whatever is asked for
-    // — it is so the page cannot be misread for the period.
-    let rq = crate::server::reports::ReportQuery {
-        unit: Some(unit.as_str().to_string()),
-        offset: Some(offset),
-        limit: Some(1),
+    let period = match load_period(&state, auth, unit, offset).await {
+        Ok(p) => p,
+        Err(resp) => return resp,
     };
-    let resp = crate::server::reports::reports(State(state.clone()), auth, Query(rq))
-        .await
-        .into_response();
-    let status = resp.status();
-    let bytes = match axum::body::to_bytes(resp.into_body(), MAX_REPORT_BYTES).await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::error!("Report body for the image could not be read: {e}");
-            return err(500, "Could not read your listening");
-        }
-    };
-    if !status.is_success() {
-        // The report's own message, rather than one invented here.
-        return (status, bytes).into_response();
-    }
-    let page: serde_json::Value = match serde_json::from_slice(&bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("Report body for the image did not parse: {e}");
-            return err(500, "Could not read your listening");
-        }
-    };
-
-    let Some(period) = page.get("periods").and_then(|p| p.get(0)) else {
-        // A real answer, not a failure: an offset past the end of a history, or
-        // an instance with nothing in it yet.
-        return err(404, "There is no report for that period yet");
-    };
+    let period = &period;
     let card = Card::from_period(period);
 
     // **Off the async worker.** A 1080×1920 pixmap is ~8 MB of RGBA and
@@ -228,7 +244,7 @@ pub async fn report_image(
 /// letter, a digit or a dash is dropped rather than escaped — a quote or a
 /// newline in there is header injection, and there is nothing in a period key
 /// worth keeping that this removes.
-fn slug(s: &str) -> String {
+pub(crate) fn slug(s: &str) -> String {
     let out: String = s
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
