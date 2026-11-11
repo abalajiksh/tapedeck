@@ -36,7 +36,7 @@ pub(crate) fn err(code: u16, msg: &str) -> axum::response::Response {
 }
 
 /// One period of the caller's reports, from the handler that owns the
-/// arithmetic — shared by the image and the story so neither can come to
+/// arithmetic — shared by the image and the mixdown so neither can come to
 /// disagree with the chapter it was made from.
 ///
 /// `limit=1` is not an optimisation — the fold walks the whole history

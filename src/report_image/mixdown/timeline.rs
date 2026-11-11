@@ -1,6 +1,6 @@
-//! The arithmetic of a story: where a layer is at a given millisecond.
+//! The arithmetic of a mixdown: where a layer is at a given millisecond.
 //!
-//! **This file has a twin**, `web/src/lib/story.ts`. The browser plays a story
+//! **This file has a twin**, `web/src/lib/mixdown.ts`. The browser plays a mixdown
 //! by evaluating the same tracks the encoder does, so the two must agree on
 //! every rule here: what a track is before its first key and after its last,
 //! the easing, the order the transform is composed in, how a count rounds.
@@ -11,7 +11,7 @@ use serde::Serialize;
 
 /// One point on a track: at `t` milliseconds into the scene the value is `v`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, utoipa::ToSchema)]
-#[schema(as = StoryKey)]
+#[schema(as = MixdownKey)]
 pub struct Key {
     pub t: u32,
     pub v: f32,
@@ -24,14 +24,14 @@ pub struct Key {
 /// the last key's, and between two keys it eases out (cubic) from one to the
 /// other.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, utoipa::ToSchema)]
-#[schema(as = StoryTracks)]
+#[schema(as = MixdownTracks)]
 pub struct Tracks {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub opacity: Vec<Key>,
-    /// Horizontal offset in story pixels.
+    /// Horizontal offset in mixdown pixels.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dx: Vec<Key>,
-    /// Vertical offset in story pixels; positive is down.
+    /// Vertical offset in mixdown pixels; positive is down.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dy: Vec<Key>,
     /// Uniform scale about the layer's `origin`.
@@ -50,7 +50,7 @@ pub struct Tracks {
 /// The layer's `svg` carries the literal token `{{n}}` exactly once, and it is
 /// replaced by the value at that moment, written with thousands separators.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, utoipa::ToSchema)]
-#[schema(as = StoryCount)]
+#[schema(as = MixdownCount)]
 pub struct Count {
     pub from: i64,
     pub to: i64,
@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(rest, State { opacity: 1.0, dx: 0.0, dy: 0.0, sx: 1.0, sy: 1.0 });
     }
 
-    /// The exact numbers `web/src/lib/story.ts` is written against. If these
+    /// The exact numbers `web/src/lib/mixdown.ts` is written against. If these
     /// change, the browser and the video stop showing the same thing.
     #[test]
     fn the_browser_twin_follows_the_same_rules() {

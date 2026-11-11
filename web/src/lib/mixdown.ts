@@ -1,15 +1,15 @@
 /**
- * Playing a report story: where a layer is at a given millisecond.
+ * Playing a report mixdown: where a layer is at a given millisecond.
  *
- * **This file has a twin**, `src/report_image/story/timeline.rs`. The server
+ * **This file has a twin**, `src/report_image/mixdown/timeline.rs`. The server
  * draws every layer and evaluates the same tracks for each frame of the
- * video; this is the same arithmetic for the browser, so the story on screen
+ * video; this is the same arithmetic for the browser, so the mixdown on screen
  * and the MP4 show the same thing. Change one, change the other — the Rust
  * test `the_browser_twin_follows_the_same_rules` holds the numbers both are
  * written against (ease(0.5) = 0.875, a 0→21,390 count at its midpoint =
  * 18,716).
  */
-import type { StoryCount, StoryKey, StoryLayer, StoryScene } from '$lib/api';
+import type { MixdownCount, MixdownKey, MixdownLayer, MixdownScene } from '$lib/api';
 
 /** The token a counting layer carries where its number goes. */
 export const COUNT_TOKEN = '{{n}}';
@@ -20,7 +20,7 @@ export function ease(p: number): number {
 	return 1 - q * q * q;
 }
 
-function at(keys: StoryKey[] | undefined, t: number, rest: number): number {
+function at(keys: MixdownKey[] | undefined, t: number, rest: number): number {
 	if (!keys || keys.length === 0) return rest;
 	const first = keys[0];
 	const last = keys[keys.length - 1];
@@ -43,7 +43,7 @@ export interface LayerState {
 }
 
 /** A layer's opacity and transform at `t` milliseconds into its scene. */
-export function layerState(layer: StoryLayer, t: number): LayerState {
+export function layerState(layer: MixdownLayer, t: number): LayerState {
 	const tr = layer.tracks;
 	const s = at(tr.scale, t, 1);
 	const sx = s * at(tr.scale_x, t, 1);
@@ -65,7 +65,7 @@ export function layerState(layer: StoryLayer, t: number): LayerState {
 }
 
 /** The value a counting layer shows at `t`. Ends on the real figure. */
-export function countAt(c: StoryCount, t: number): number {
+export function countAt(c: MixdownCount, t: number): number {
 	if (t <= c.start_ms) return c.from;
 	if (t >= c.end_ms) return c.to;
 	const p = (t - c.start_ms) / Math.max(1, c.end_ms - c.start_ms);
@@ -74,7 +74,7 @@ export function countAt(c: StoryCount, t: number): number {
 
 /**
  * Thousands separators the way the server writes them — commas, whatever the
- * browser's locale — so a figure in the story reads the same as in the video
+ * browser's locale — so a figure in the mixdown reads the same as in the video
  * and on the card.
  */
 export function thousands(n: number): string {
@@ -82,7 +82,7 @@ export function thousands(n: number): string {
 }
 
 /** How visible the whole scene is at `t`: full, until it hands over. */
-export function envelope(scene: StoryScene, t: number): number {
+export function envelope(scene: MixdownScene, t: number): number {
 	if (scene.fade_out_ms === 0 || t + scene.fade_out_ms <= scene.duration_ms) return 1;
 	return Math.min(1, Math.max(0, (scene.duration_ms - t) / scene.fade_out_ms));
 }

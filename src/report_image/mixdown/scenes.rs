@@ -1,4 +1,4 @@
-//! The built-in story: which scenes a period gets and what each one draws.
+//! The built-in mixdown: which scenes a period gets and what each one draws.
 //!
 //! The rules are the cards' rules. A scene with nothing to say is left out
 //! rather than drawn empty; every figure is the report's own; a count that is
@@ -13,7 +13,7 @@ use super::super::fonts::{ellipsise, width, Face};
 use super::super::layout::{self, nf, ordinal, Unit, M};
 use super::super::svg::{Anchor, Doc};
 use super::super::theme::{period_colour, Palette, Theme};
-use super::{href_ok, Art, Count, Layer, Scene, Story, Tracks, COUNT_TOKEN, FPS, HEIGHT, WIDTH};
+use super::{href_ok, Art, Count, Layer, Mixdown, Scene, Tracks, COUNT_TOKEN, FPS, HEIGHT, WIDTH};
 
 /// How long a scene takes to hand over to the next.
 const FADE_MS: u32 = 260;
@@ -57,8 +57,8 @@ impl B<'_> {
         Layer { svg: d.into_fragment(), origin, tracks, count: None }
     }
 
-    /// A picture this story may draw, noted with the size it is drawn at. An
-    /// address of a shape a story does not load is dropped here, so it is
+    /// A picture this mixdown may draw, noted with the size it is drawn at. An
+    /// address of a shape a mixdown does not load is dropped here, so it is
     /// neither drawn nor fetched.
     fn picture(&mut self, href: Option<&String>, side: f32) -> Option<String> {
         let href = href.filter(|h| href_ok(h))?.clone();
@@ -513,7 +513,7 @@ fn scene(id: &str, duration_ms: u32, layers: Vec<Layer>) -> Scene {
     Scene { id: id.to_string(), duration_ms, fade_out_ms: FADE_MS, layers }
 }
 
-pub(super) fn build(c: &Card, unit: Unit, theme: Theme, art: &Art) -> Story {
+pub(super) fn build(c: &Card, unit: Unit, theme: Theme, art: &Art) -> Mixdown {
     let p = theme.palette();
     let colour = period_colour(c.colour.as_deref(), &p);
     let mut b = B {
@@ -527,7 +527,7 @@ pub(super) fn build(c: &Card, unit: Unit, theme: Theme, art: &Art) -> Story {
         used: Vec::new(),
     };
 
-    // The ground: the card's own, so a story and the card it ends on are
+    // The ground: the card's own, so a mixdown and the card it ends on are
     // plainly the same object.
     let mut d = Doc::new(b.m.w, b.m.h);
     d.rect(0.0, 0.0, b.m.w, b.m.h, b.p.bg);
@@ -547,7 +547,7 @@ pub(super) fn build(c: &Card, unit: Unit, theme: Theme, art: &Art) -> Story {
         last.fade_out_ms = 0;
     }
 
-    Story {
+    Mixdown {
         width: WIDTH,
         height: HEIGHT,
         fps: FPS,

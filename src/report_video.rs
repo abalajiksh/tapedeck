@@ -1,10 +1,10 @@
-//! A report story as an MP4: the frames drawn here, the encoding done by
+//! A report mixdown as an MP4: the frames drawn here, the encoding done by
 //! `ffmpeg`.
 //!
 //! **ffmpeg is optional and found at run time.** Tapedeck stays one binary
 //! with no C in it; a host that has `ffmpeg` with libx264 on its `PATH` (or at
 //! `TAPEDECK_FFMPEG`) can export a video, and one that does not still plays
-//! the story in the browser and simply does not offer the export.
+//! the mixdown in the browser and simply does not offer the export.
 //!
 //! What the Pi 4B measurement (2026-11-10) decided:
 //!
@@ -12,7 +12,7 @@
 //! * **Drawing is the bottleneck, not encoding.** x264 `veryfast` took every
 //!   frame as fast as it was offered, so the effort here goes into drawing
 //!   less: a frame whose SVG is byte-identical to the one before is written
-//!   again without being rasterised, and a story is mostly held frames.
+//!   again without being rasterised, and a mixdown is mostly held frames.
 //! * The Pi's hardware encoder was no faster and made files three times the
 //!   size, so there is one encoder and no probing for another.
 //!
@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use crate::report_image::story::Story;
+use crate::report_image::mixdown::Mixdown;
 
 /// How long a finished video is kept before it is deleted.
 const KEEP: Duration = Duration::from_secs(60 * 60);
@@ -58,15 +58,17 @@ pub fn available() -> bool {
             .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains("libx264"))
             .unwrap_or(false);
         if found {
-            tracing::info!("🎞️ ffmpeg with libx264 found: report stories can be exported as video");
+            tracing::info!(
+                "🎞️ ffmpeg with libx264 found: report mixdowns can be exported as video"
+            );
         } else {
-            tracing::info!("🎞️ No ffmpeg with libx264: report stories play in the browser only");
+            tracing::info!("🎞️ No ffmpeg with libx264: report mixdowns play in the browser only");
         }
         found
     })
 }
 
-/// The pictures a story's frames may draw: each `href` in the story mapped to
+/// The pictures a mixdown's frames may draw: each `href` in the mixdown mapped to
 /// a small PNG already cropped and sized for it.
 pub type Images = HashMap<String, Arc<Vec<u8>>>;
 
@@ -168,7 +170,7 @@ fn kind(bytes: Arc<Vec<u8>>) -> Option<usvg::ImageKind> {
 /// usvg options that resolve an `<image>` from `images` and from nowhere
 /// else.
 ///
-/// **The default resolver reads the href as a path on this machine.** A story
+/// **The default resolver reads the href as a path on this machine.** A mixdown
 /// puts addresses from the database into `href`s, so with the default a
 /// stored value naming a local file would be read and painted into
 /// somebody's video. Here an href either is one of the prepared pictures or
@@ -228,20 +230,20 @@ fn draw(
     Ok(px)
 }
 
-/// Draw every frame of `story` and encode it to `out`. Returns the file size.
+/// Draw every frame of `mixdown` and encode it to `out`. Returns the file size.
 ///
 /// **Blocking and long** (tens of seconds on a Pi): run it on
 /// `spawn_blocking`. `done` is advanced as frames are handed to the encoder.
 pub fn encode(
-    story: &Story,
+    mixdown: &Mixdown,
     images: &Arc<Images>,
     out: &Path,
     done: &AtomicU32,
 ) -> Result<u64, String> {
-    let (w, h, fps) = (story.width, story.height, story.fps);
-    let total = story.frames();
+    let (w, h, fps) = (mixdown.width, mixdown.height, mixdown.fps);
+    let total = mixdown.frames();
     if total == 0 {
-        return Err("the story has no frames".into());
+        return Err("the mixdown has no frames".into());
     }
 
     let mut child = Command::new(ffmpeg_bin())
@@ -273,8 +275,8 @@ pub fn encode(
             let svgs: Vec<String> = (f..f + n)
                 .map(|i| {
                     let ms = (i as u64 * 1000 / fps as u64) as u32;
-                    let (scene, t) = story.locate(ms);
-                    story.frame_svg(scene, t)
+                    let (scene, t) = mixdown.locate(ms);
+                    mixdown.frame_svg(scene, t)
                 })
                 .collect();
             // A frame identical to the one before it is not drawn again.
@@ -363,7 +365,7 @@ pub struct Job {
 }
 
 /// Every export this instance knows about. In memory on purpose: a video is
-/// regenerable from the history in under two minutes, so a restart losing the
+/// regenerable from the himixdown in under two minutes, so a restart losing the
 /// list loses nothing a second click does not bring back.
 #[derive(Clone)]
 pub struct VideoJobs {
@@ -430,7 +432,7 @@ impl VideoJobs {
     }
 
     /// Queue an export and start it in the background. Returns at once.
-    pub fn start(&self, user_id: i64, stem: String, story: Story, images: Images) -> Job {
+    pub fn start(&self, user_id: i64, stem: String, mixdown: Mixdown, images: Images) -> Job {
         self.prune(user_id);
         let id = {
             use rand::Rng;
@@ -442,7 +444,7 @@ impl VideoJobs {
             user_id,
             stem,
             phase: Phase::Queued,
-            frames_total: story.frames(),
+            frames_total: mixdown.frames(),
             frames_done: Arc::new(AtomicU32::new(0)),
             path: self.dir.join(format!("{id}.mp4")),
             bytes: 0,
@@ -468,14 +470,14 @@ impl VideoJobs {
             let dir = this.dir.clone();
             let result = tokio::task::spawn_blocking(move || {
                 std::fs::create_dir_all(&dir).map_err(|e| format!("no room for the video: {e}"))?;
-                encode(&story, &Arc::new(images), &path, &done)
+                encode(&mixdown, &Arc::new(images), &path, &done)
             })
             .await
             .unwrap_or_else(|e| Err(format!("the render stopped: {e}")));
             match result {
                 Ok(bytes) => {
                     tracing::info!(
-                        "🎞️ Story video {id} for user {user_id}: {bytes} bytes in {:.1}s",
+                        "🎞️ Mixdown video {id} for user {user_id}: {bytes} bytes in {:.1}s",
                         began.elapsed().as_secs_f32()
                     );
                     set(&|j| {
@@ -484,7 +486,7 @@ impl VideoJobs {
                     });
                 }
                 Err(e) => {
-                    tracing::error!("Story video {id} for user {user_id} failed: {e}");
+                    tracing::error!("Mixdown video {id} for user {user_id} failed: {e}");
                     set(&|j| {
                         j.phase = Phase::Failed;
                         j.error = Some("The video could not be made".into());
@@ -567,7 +569,7 @@ mod tests {
     /// WebP (lossy and lossless) and GIF are sized from their headers and
     /// drawn, the same as a JPEG. Media servers hand out WebP, and a video
     /// that showed lettered tiles where the browser showed covers would be a
-    /// different story from the one on screen.
+    /// different mixdown from the one on screen.
     #[test]
     fn webp_and_gif_pictures_are_drawn_too() {
         fn hex(s: &str) -> Vec<u8> {
@@ -630,25 +632,25 @@ mod tests {
 
     /// Encodes the sample year for real and checks ffmpeg was fed every frame.
     /// Ignored: it needs ffmpeg and takes seconds.
-    /// `TAPEDECK_CARD_DIR=/tmp/story cargo test -- --ignored encode_the_sample`
+    /// `TAPEDECK_CARD_DIR=/tmp/mixdown cargo test -- --ignored encode_the_sample`
     #[test]
     #[ignore]
     fn encode_the_sample_year() {
         assert!(available(), "this needs an ffmpeg with libx264");
         let dir = std::env::var("TAPEDECK_CARD_DIR").expect("set TAPEDECK_CARD_DIR");
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let story =
-            Story::build(&Card::sample(Unit::Year), Unit::Year, Theme::Dark, &Default::default());
-        let out = Path::new(&dir).join("story-year.mp4");
+        let mixdown =
+            Mixdown::build(&Card::sample(Unit::Year), Unit::Year, Theme::Dark, &Default::default());
+        let out = Path::new(&dir).join("mixdown-year.mp4");
         let done = AtomicU32::new(0);
         let began = Instant::now();
-        let bytes = encode(&story, &Default::default(), &out, &done).expect("encode");
-        assert_eq!(done.load(Ordering::Relaxed), story.frames());
+        let bytes = encode(&mixdown, &Default::default(), &out, &done).expect("encode");
+        assert_eq!(done.load(Ordering::Relaxed), mixdown.frames());
         println!(
             "{} ({bytes} bytes, {} frames, {:.1}s of video in {:.1}s)",
             out.display(),
-            story.frames(),
-            story.duration_ms() as f32 / 1000.0,
+            mixdown.frames(),
+            mixdown.duration_ms() as f32 / 1000.0,
             began.elapsed().as_secs_f32()
         );
     }

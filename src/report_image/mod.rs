@@ -22,9 +22,9 @@
 pub mod card;
 pub mod fonts;
 pub mod layout;
+pub mod mixdown;
 pub mod month;
 pub mod sitting;
-pub mod story;
 pub mod svg;
 pub mod theme;
 pub mod week;

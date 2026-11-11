@@ -1,11 +1,11 @@
-//! `GET /api/v1/reports/story` and the video made from it.
+//! `GET /api/v1/reports/mixdown` and the video made from it.
 //!
-//! A report period told as a short animated story — see
-//! `crate::report_image::story` for what a story is and
+//! A report period told as a short animated mixdown — see
+//! `crate::report_image::mixdown` for what a mixdown is and
 //! `crate::report_video` for how one becomes an MP4.
 //!
 //! Like the share image, this **computes nothing**: the period comes from
-//! `reports()` through the same loader the image uses, so a story cannot
+//! `reports()` through the same loader the image uses, so a mixdown cannot
 //! disagree with the chapter it was opened from.
 //!
 //! The export is `ReadAuth` even though it is a `POST`. It writes nothing of
@@ -25,7 +25,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::models::AuthUser;
-use crate::report_image::story::{href_ok, Art, Story};
+use crate::report_image::mixdown::{href_ok, Art, Mixdown};
 use crate::report_image::{Card, Theme, Unit};
 use crate::report_video::{self, Images, Job, Phase};
 use crate::server::auth::ReadAuth;
@@ -35,7 +35,7 @@ use crate::server::AppState;
 
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
-pub struct StoryQuery {
+pub struct MixdownQuery {
     /// `week`, `month` (default) or `year`.
     #[param(pattern = "^(week|month|year)$", default = "month")]
     pub unit: Option<String>,
@@ -46,20 +46,20 @@ pub struct StoryQuery {
     pub theme: Option<String>,
 }
 
-/// A story, and whether this server can turn it into a video.
+/// A mixdown, and whether this server can turn it into a video.
 #[derive(Serialize, utoipa::ToSchema)]
-pub struct StoryResponse {
+pub struct MixdownResponse {
     #[serde(flatten)]
-    pub story: Story,
+    pub mixdown: Mixdown,
     /// True when the server has an encoder and `POST
-    /// /api/v1/reports/story/video` will work. False is not an error: the
-    /// story still plays, there is just nothing to download.
+    /// /api/v1/reports/mixdown/video` will work. False is not an error: the
+    /// mixdown still plays, there is just nothing to download.
     pub video_export: bool,
 }
 
 /// Where a video export has got to.
 #[derive(Serialize, utoipa::ToSchema)]
-pub struct StoryVideo {
+pub struct MixdownVideo {
     pub id: String,
     /// `queued` (another render is running), `rendering`, `done` or `failed`.
     #[schema(pattern = "^(queued|rendering|done|failed)$")]
@@ -73,9 +73,9 @@ pub struct StoryVideo {
     pub error: Option<String>,
 }
 
-impl From<&Job> for StoryVideo {
+impl From<&Job> for MixdownVideo {
     fn from(j: &Job) -> Self {
-        StoryVideo {
+        MixdownVideo {
             id: j.id.clone(),
             state: j.phase.as_str().to_string(),
             frames_done: j.frames_done.load(Ordering::Relaxed).min(j.frames_total),
@@ -132,7 +132,7 @@ async fn album_cover(
 /// the cover of the album the track is from — never a compilation's.
 ///
 /// Addresses only — nothing is fetched here. A browser follows them; the
-/// video fetches them in `fetch_art`. Every one may be absent, and the story
+/// video fetches them in `fetch_art`. Every one may be absent, and the mixdown
 /// then shows the lettered tile it always had.
 async fn resolve_art(state: &Arc<AppState>, user_id: i64, period: &serde_json::Value) -> Art {
     let field = |entity: &str, key: &str| {
@@ -238,7 +238,7 @@ async fn fetch_picture(
     None
 }
 
-/// Fetch and size every picture the story draws, for the video.
+/// Fetch and size every picture the mixdown draws, for the video.
 ///
 /// All at once and each under a deadline: a media server that is off costs
 /// the export eight seconds and one picture, never the export. Whatever does
@@ -248,9 +248,9 @@ async fn fetch_art(
     state: &Arc<AppState>,
     user: &AuthUser,
     headers: &HeaderMap,
-    story: &Story,
+    mixdown: &Mixdown,
 ) -> Images {
-    let fetches = story.art.iter().map(|(href, px)| async move {
+    let fetches = mixdown.art.iter().map(|(href, px)| async move {
         let bytes =
             tokio::time::timeout(PICTURE_TIMEOUT, fetch_picture(state, user, headers, href))
                 .await
@@ -266,12 +266,12 @@ async fn fetch_art(
     futures_util::future::join_all(fetches).await.into_iter().flatten().collect()
 }
 
-/// The story of the period the query names, and a filename stem for it.
+/// The mixdown of the period the query names, and a filename stem for it.
 async fn build(
     state: &Arc<AppState>,
     auth: ReadAuth,
-    q: &StoryQuery,
-) -> Result<(Story, String), axum::response::Response> {
+    q: &MixdownQuery,
+) -> Result<(Mixdown, String), axum::response::Response> {
     // An unknown bucket is refused rather than defaulted: the wrong one would
     // be an answer that looks entirely right.
     let unit_str = q.unit.clone().unwrap_or_else(|| "month".into());
@@ -282,22 +282,22 @@ async fn build(
     let user_id = auth.user.user_id;
     let period = load_period(state, auth, unit, q.offset.unwrap_or(0)).await?;
     let stem = format!(
-        "tapedeck-{}-story",
+        "tapedeck-{}-mixdown",
         slug(period.get("key").and_then(serde_json::Value::as_str).unwrap_or(unit.as_str()))
     );
     let card = Card::from_period(&period);
     let art = resolve_art(state, user_id, &period).await;
     // Measuring text walks the font tables; cheap, but not free on a Pi.
-    let story = tokio::task::spawn_blocking(move || Story::build(&card, unit, theme, &art))
+    let mixdown = tokio::task::spawn_blocking(move || Mixdown::build(&card, unit, theme, &art))
         .await
         .map_err(|e| {
-        tracing::error!("Report story could not be built: {e}");
-        err(500, "Could not build the story")
-    })?;
-    Ok((story, stem))
+            tracing::error!("Report mixdown could not be built: {e}");
+            err(500, "Could not build the mixdown")
+        })?;
+    Ok((mixdown, stem))
 }
 
-/// A report period as a short animated story.
+/// A report period as a short animated mixdown.
 ///
 /// Scope: `read` *(since v0.131)*.
 ///
@@ -331,25 +331,25 @@ async fn build(
 ///
 /// It **computes nothing**: every figure comes from `GET /api/v1/reports`
 /// with the same `unit` and `offset`. A scene the period has nothing to say
-/// in is absent rather than empty, so a thin period is a shorter story.
+/// in is absent rather than empty, so a thin period is a shorter mixdown.
 #[utoipa::path(
     get,
-    path = "/api/v1/reports/story",
+    path = "/api/v1/reports/mixdown",
     tag = "Statistics",
     security(("sessionCookie" = []), ("apiToken" = ["read"])),
-    params(StoryQuery),
+    params(MixdownQuery),
     responses(
-        (status = 200, description = "The story.", body = StoryResponse),
+        (status = 200, description = "The mixdown.", body = MixdownResponse),
         (status = 400, description = "An unsupported unit.", body = ErrorResponse),
-        (status = 404, description = "No report for that period — an offset past the end of the history, or an instance with nothing in it yet.", body = ErrorResponse),
+        (status = 404, description = "No report for that period — an offset past the end of the himixdown, or an instance with nothing in it yet.", body = ErrorResponse),
     )
 )]
-pub async fn report_story(
+pub async fn report_mixdown(
     State(state): State<Arc<AppState>>,
     auth: ReadAuth,
-    Query(q): Query<StoryQuery>,
+    Query(q): Query<MixdownQuery>,
 ) -> impl IntoResponse {
-    let (story, _) = match build(&state, auth, &q).await {
+    let (mixdown, _) = match build(&state, auth, &q).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
@@ -358,19 +358,19 @@ pub async fn report_story(
         StatusCode::OK,
         // One person's listening: out of any shared cache.
         [(header::CACHE_CONTROL, "private, max-age=60")],
-        Json(StoryResponse { story, video_export }),
+        Json(MixdownResponse { mixdown, video_export }),
     )
         .into_response()
 }
 
-/// Start making a video of a story.
+/// Start making a video of a mixdown.
 ///
 /// Scope: `read` *(since v0.131)*. A `POST` that needs only `read`: nothing
 /// of yours is written, the result is a temporary file.
 ///
 /// Returns at once with a job to poll at
-/// `GET /api/v1/reports/story/video/{id}`. The video is 1080×1920 H.264 at
-/// 30 frames a second with no sound, drawn from the same story the `GET`
+/// `GET /api/v1/reports/mixdown/video/{id}`. The video is 1080×1920 H.264 at
+/// 30 frames a second with no sound, drawn from the same mixdown the `GET`
 /// returns, and is kept for an hour.
 ///
 /// Pictures are fetched by the server before the first frame, each with a
@@ -381,23 +381,23 @@ pub async fn report_story(
 /// somebody else's is being drawn. Each user may have one export in flight.
 #[utoipa::path(
     post,
-    path = "/api/v1/reports/story/video",
+    path = "/api/v1/reports/mixdown/video",
     tag = "Statistics",
     security(("sessionCookie" = []), ("apiToken" = ["read"])),
-    params(StoryQuery),
+    params(MixdownQuery),
     responses(
-        (status = 202, description = "The export was queued.", body = StoryVideo),
+        (status = 202, description = "The export was queued.", body = MixdownVideo),
         (status = 400, description = "An unsupported unit.", body = ErrorResponse),
         (status = 404, description = "No report for that period.", body = ErrorResponse),
         (status = 409, description = "You already have a video being made.", body = ErrorResponse),
-        (status = 501, description = "This server has no video encoder (ffmpeg with libx264). The story still plays.", body = ErrorResponse),
+        (status = 501, description = "This server has no video encoder (ffmpeg with libx264). The mixdown still plays.", body = ErrorResponse),
     )
 )]
-pub async fn report_story_video_start(
+pub async fn report_mixdown_video_start(
     State(state): State<Arc<AppState>>,
     auth: ReadAuth,
     headers: HeaderMap,
-    Query(q): Query<StoryQuery>,
+    Query(q): Query<MixdownQuery>,
 ) -> impl IntoResponse {
     let user = auth.user.clone();
     let user_id = user.user_id;
@@ -407,13 +407,13 @@ pub async fn report_story_video_start(
     if state.video_jobs.active(user_id).is_some() {
         return err(409, "You already have a video being made");
     }
-    let (story, stem) = match build(&state, auth, &q).await {
+    let (mixdown, stem) = match build(&state, auth, &q).await {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let images = fetch_art(&state, &user, &headers, &story).await;
-    let job = state.video_jobs.start(user_id, stem, story, images);
-    (StatusCode::ACCEPTED, Json(StoryVideo::from(&job))).into_response()
+    let images = fetch_art(&state, &user, &headers, &mixdown).await;
+    let job = state.video_jobs.start(user_id, stem, mixdown, images);
+    (StatusCode::ACCEPTED, Json(MixdownVideo::from(&job))).into_response()
 }
 
 /// How a video export is getting on.
@@ -421,22 +421,22 @@ pub async fn report_story_video_start(
 /// Scope: `read` *(since v0.131)*.
 #[utoipa::path(
     get,
-    path = "/api/v1/reports/story/video/{id}",
+    path = "/api/v1/reports/mixdown/video/{id}",
     tag = "Statistics",
     security(("sessionCookie" = []), ("apiToken" = ["read"])),
-    params(("id" = String, Path, description = "The export, as `POST /api/v1/reports/story/video` named it.")),
+    params(("id" = String, Path, description = "The export, as `POST /api/v1/reports/mixdown/video` named it.")),
     responses(
-        (status = 200, description = "The export's state.", body = StoryVideo),
+        (status = 200, description = "The export's state.", body = MixdownVideo),
         (status = 404, description = "No such export. They are kept for an hour, and only their owner can see them.", body = ErrorResponse),
     )
 )]
-pub async fn report_story_video_status(
+pub async fn report_mixdown_video_status(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.video_jobs.get(&id, user.user_id) {
-        Some(job) => Json(StoryVideo::from(&job)).into_response(),
+        Some(job) => Json(MixdownVideo::from(&job)).into_response(),
         None => err(404, "There is no such video"),
     }
 }
@@ -446,7 +446,7 @@ pub async fn report_story_video_status(
 /// Scope: `read` *(since v0.131)*.
 #[utoipa::path(
     get,
-    path = "/api/v1/reports/story/video/{id}/file",
+    path = "/api/v1/reports/mixdown/video/{id}/file",
     tag = "Statistics",
     security(("sessionCookie" = []), ("apiToken" = ["read"])),
     params(("id" = String, Path, description = "The export.")),
@@ -456,7 +456,7 @@ pub async fn report_story_video_status(
         (status = 409, description = "The export is not finished yet.", body = ErrorResponse),
     )
 )]
-pub async fn report_story_video_file(
+pub async fn report_mixdown_video_file(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
     Path(id): Path<String>,
@@ -479,7 +479,7 @@ pub async fn report_story_video_file(
         )
             .into_response(),
         Err(e) => {
-            tracing::error!("Story video {id} is listed but could not be read: {e}");
+            tracing::error!("Mixdown video {id} is listed but could not be read: {e}");
             err(404, "There is no such video")
         }
     }
@@ -487,17 +487,17 @@ pub async fn report_story_video_file(
 
 #[derive(utoipa::OpenApi)]
 #[openapi(paths(
-    report_story,
-    report_story_video_start,
-    report_story_video_status,
-    report_story_video_file
+    report_mixdown,
+    report_mixdown_video_start,
+    report_mixdown_video_status,
+    report_mixdown_video_file
 ))]
 pub struct Api;
 
-pub fn create_report_story_router() -> Router<Arc<AppState>> {
+pub fn create_report_mixdown_router() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/api/v1/reports/story", get(report_story))
-        .route("/api/v1/reports/story/video", post(report_story_video_start))
-        .route("/api/v1/reports/story/video/:id", get(report_story_video_status))
-        .route("/api/v1/reports/story/video/:id/file", get(report_story_video_file))
+        .route("/api/v1/reports/mixdown", get(report_mixdown))
+        .route("/api/v1/reports/mixdown/video", post(report_mixdown_video_start))
+        .route("/api/v1/reports/mixdown/video/:id", get(report_mixdown_video_status))
+        .route("/api/v1/reports/mixdown/video/:id/file", get(report_mixdown_video_file))
 }

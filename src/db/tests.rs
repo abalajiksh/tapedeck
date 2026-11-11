@@ -592,7 +592,7 @@ async fn a_grouped_cover_comes_from_one_listen() {
 /// A track's record is the artist's own album, however recently it was heard
 /// on a compilation.
 ///
-/// The story gives the track of the period its album's cover. "The cover it
+/// The mixdown gives the track of the period its album's cover. "The cover it
 /// was last heard under" put a "100 Hits" sleeve on a track the moment its
 /// newest play came from one.
 #[tokio::test]

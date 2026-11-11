@@ -221,7 +221,7 @@ impl Doc {
     /// A picture, cropped to fill a rounded rectangle.
     ///
     /// `id` names the clip and must be unique in the finished document — the
-    /// caller passes it because a story stacks several of these writers into
+    /// caller passes it because a mixdown stacks several of these writers into
     /// one frame, and two clips with one name would crop each other's picture.
     ///
     /// The `href` is written, never fetched: a browser loads it, and the
@@ -255,7 +255,7 @@ impl Doc {
     /// The document's contents without the `<svg>` around them: `<defs>` (if
     /// any) followed by the body.
     ///
-    /// For the story, where one frame is several of these stacked inside one
+    /// For the mixdown, where one frame is several of these stacked inside one
     /// root — each layer is drawn with the same writer the cards use, so the
     /// escaping and the coverage accounting are not done a second way.
     pub fn into_fragment(self) -> String {
@@ -287,7 +287,7 @@ mod tests {
 
     /// An ampersand in an artist name must not take the whole image down.
     ///
-    /// `Simon & Garfunkel` is in this history and is a name rather than a
+    /// `Simon & Garfunkel` is in this himixdown and is a name rather than a
     /// credit — the sanitiser leaves it alone deliberately — so it reaches the
     /// document exactly as stored. Unescaped it makes the SVG unparseable, and
     /// usvg fails the *document*, so one band would cost the entire card.

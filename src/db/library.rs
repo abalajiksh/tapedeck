@@ -500,7 +500,7 @@ impl Database {
     /// report's track of the period), so that the track can wear **its
     /// album's cover** — resolved the way the album page resolves it — rather
     /// than whichever sleeve its latest listen happened to carry. A track
-    /// heard on its album and on "100 Hits" has two covers in the history,
+    /// heard on its album and on "100 Hits" has two covers in the himixdown,
     /// and one listen's release ids can name a compilation even under the
     /// album's own title.
     ///
