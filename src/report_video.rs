@@ -66,14 +66,116 @@ pub fn available() -> bool {
     })
 }
 
+/// The pictures a story's frames may draw: each `href` in the story mapped to
+/// a small PNG already cropped and sized for it.
+pub type Images = HashMap<String, Arc<Vec<u8>>>;
+
+/// The largest picture, per side, that will be decoded at all. A cover is a
+/// few hundred pixels across; this is only a ceiling on what a hostile or
+/// absurd file can make the decoder allocate (4096² is 64 MB of RGBA).
+const MAX_SIDE: u32 = 4096;
+
+/// What kind of picture these bytes are and how big, read from the header
+/// alone. Only JPEG and PNG: they are what covers and portraits are in
+/// practice, and each states its size where it can be read without decoding.
+fn sniff(bytes: &[u8]) -> Option<(bool, u32, u32)> {
+    if bytes.len() > 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR" {
+        let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+        let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+        return Some((true, w, h));
+    }
+    if bytes.starts_with(&[0xFF, 0xD8]) {
+        // Walk the segments to the frame header, which carries the size.
+        let mut i = 2;
+        while i + 9 < bytes.len() {
+            if bytes[i] != 0xFF {
+                return None;
+            }
+            let marker = bytes[i + 1];
+            if marker == 0xFF {
+                i += 1;
+                continue;
+            }
+            let frame = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+            if frame {
+                let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
+                let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
+                return Some((false, w, h));
+            }
+            let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+            if len < 2 {
+                return None;
+            }
+            i += 2 + len;
+        }
+    }
+    None
+}
+
+fn kind(bytes: Arc<Vec<u8>>) -> Option<usvg::ImageKind> {
+    match sniff(&bytes)? {
+        (_, w, h) if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE => None,
+        (true, ..) => Some(usvg::ImageKind::PNG(bytes)),
+        (false, ..) => Some(usvg::ImageKind::JPEG(bytes)),
+    }
+}
+
+/// usvg options that resolve an `<image>` from `images` and from nowhere
+/// else.
+///
+/// **The default resolver reads the href as a path on this machine.** A story
+/// puts addresses from the database into `href`s, so with the default a
+/// stored value naming a local file would be read and painted into
+/// somebody's video. Here an href either is one of the prepared pictures or
+/// draws nothing, and a `data:` URL draws nothing either.
+fn options(fontdb: &Arc<fontdb::Database>, images: &Arc<Images>) -> usvg::Options<'static> {
+    let images = images.clone();
+    let mut opt = usvg::Options {
+        fontdb: fontdb.clone(),
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: Box::new(|_, _, _| None),
+            resolve_string: Box::new(move |href, _| images.get(href).cloned().and_then(kind)),
+        },
+        ..Default::default()
+    };
+    opt.font_family = crate::report_image::fonts::BODY.to_string();
+    opt
+}
+
+/// Turn a fetched picture into what a frame draws: cropped to a square that
+/// fills `side` pixels, as a PNG.
+///
+/// Done once per picture so that a frame decodes a few hundred pixels rather
+/// than a 1200-pixel cover thirty times a second. `None` for anything that
+/// is not a JPEG or PNG of a sane size, or that does not decode — the
+/// lettered tile underneath is then what the video shows.
+pub fn prepare(bytes: Vec<u8>, side: u32) -> Option<Vec<u8>> {
+    let side = side.clamp(16, 1024);
+    let mut one = Images::new();
+    one.insert("p".into(), Arc::new(bytes));
+    let fontdb = Arc::new(fontdb::Database::new());
+    let svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{side}" height="{side}"><image href="p" width="{side}" height="{side}" preserveAspectRatio="xMidYMid slice"/></svg>"#
+    );
+    let tree = usvg::Tree::from_str(&svg, &options(&fontdb, &Arc::new(one))).ok()?;
+    let mut px = tiny_skia::Pixmap::new(side, side)?;
+    resvg::render(&tree, tiny_skia::Transform::identity(), &mut px.as_mut());
+    // A file that claimed to be a picture and did not decode leaves the
+    // pixmap untouched; an empty square is not a cover.
+    if px.pixels().iter().all(|p| p.alpha() == 0) {
+        return None;
+    }
+    px.encode_png().ok()
+}
+
 fn draw(
     svg: &str,
     fontdb: &Arc<fontdb::Database>,
+    images: &Arc<Images>,
     w: u32,
     h: u32,
 ) -> Result<tiny_skia::Pixmap, String> {
-    let mut opt = usvg::Options { fontdb: fontdb.clone(), ..Default::default() };
-    opt.font_family = crate::report_image::fonts::BODY.to_string();
+    let opt = options(fontdb, images);
     let tree =
         usvg::Tree::from_str(svg, &opt).map_err(|e| format!("a frame is not valid SVG: {e}"))?;
     let mut px = tiny_skia::Pixmap::new(w, h).ok_or("could not allocate a frame")?;
@@ -85,7 +187,12 @@ fn draw(
 ///
 /// **Blocking and long** (tens of seconds on a Pi): run it on
 /// `spawn_blocking`. `done` is advanced as frames are handed to the encoder.
-pub fn encode(story: &Story, out: &Path, done: &AtomicU32) -> Result<u64, String> {
+pub fn encode(
+    story: &Story,
+    images: &Arc<Images>,
+    out: &Path,
+    done: &AtomicU32,
+) -> Result<u64, String> {
     let (w, h, fps) = (story.width, story.height, story.fps);
     let total = story.frames();
     if total == 0 {
@@ -138,7 +245,7 @@ pub fn encode(story: &Story, out: &Path, done: &AtomicU32) -> Result<u64, String
                     .zip(&fresh)
                     .map(|(svg, fresh)| {
                         let fontdb = &fontdb;
-                        fresh.then(|| sc.spawn(move || draw(svg, fontdb, w, h)))
+                        fresh.then(|| sc.spawn(move || draw(svg, fontdb, images, w, h)))
                     })
                     .collect();
                 handles
@@ -278,7 +385,7 @@ impl VideoJobs {
     }
 
     /// Queue an export and start it in the background. Returns at once.
-    pub fn start(&self, user_id: i64, stem: String, story: Story) -> Job {
+    pub fn start(&self, user_id: i64, stem: String, story: Story, images: Images) -> Job {
         self.prune(user_id);
         let id = {
             use rand::Rng;
@@ -316,7 +423,7 @@ impl VideoJobs {
             let dir = this.dir.clone();
             let result = tokio::task::spawn_blocking(move || {
                 std::fs::create_dir_all(&dir).map_err(|e| format!("no room for the video: {e}"))?;
-                encode(&story, &path, &done)
+                encode(&story, &Arc::new(images), &path, &done)
             })
             .await
             .unwrap_or_else(|e| Err(format!("the render stopped: {e}")));
@@ -373,6 +480,70 @@ mod tests {
         assert!(jobs.active(8).is_none());
     }
 
+    /// A picture is prepared to the size it is drawn at, and nothing that is
+    /// not a sane JPEG or PNG is decoded at all.
+    #[test]
+    fn a_picture_is_sized_once_and_a_bad_one_is_refused_unread() {
+        let mut src = tiny_skia::Pixmap::new(300, 200).unwrap();
+        src.fill(tiny_skia::Color::from_rgba8(200, 60, 40, 255));
+        let png = src.encode_png().unwrap();
+        assert_eq!(sniff(&png), Some((true, 300, 200)));
+
+        let small = prepare(png.clone(), 148).expect("a real PNG is prepared");
+        let out = tiny_skia::Pixmap::decode_png(&small).unwrap();
+        assert_eq!((out.width(), out.height()), (148, 148), "cropped to fill the square");
+        let mid = out.pixel(74, 74).unwrap();
+        assert!(mid.red() > 150 && mid.alpha() == 255, "and it is the picture, not a blank");
+
+        // A PNG header that claims a size no cover has is never handed on.
+        let mut huge = png.clone();
+        huge[16..20].copy_from_slice(&60_000u32.to_be_bytes());
+        assert!(kind(Arc::new(huge.clone())).is_none());
+        assert!(prepare(huge, 148).is_none());
+
+        for bad in [
+            &b"GIF89a......"[..],
+            b"<svg xmlns='http://www.w3.org/2000/svg'/>",
+            b"",
+            b"\xFF\xD8\xFF",
+        ] {
+            assert!(prepare(bad.to_vec(), 148).is_none());
+        }
+        // A baseline JPEG header: SOI, an APP0 segment, then SOF0 800x600.
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x02,
+            0x58, 0x03, 0x20, 0x03, 0x01, 0x22, 0x00,
+        ];
+        assert_eq!(sniff(&jpeg), Some((false, 800, 600)));
+    }
+
+    /// A frame draws a prepared picture and nothing else an `href` names: not
+    /// a file on this machine, and not a `data:` URL.
+    #[test]
+    fn a_frame_draws_prepared_pictures_and_never_a_local_file() {
+        let fontdb = Arc::new(fontdb::Database::new());
+        let mut src = tiny_skia::Pixmap::new(64, 64).unwrap();
+        src.fill(tiny_skia::Color::from_rgba8(10, 200, 10, 255));
+        let png = src.encode_png().unwrap();
+        let path = std::env::temp_dir().join(format!("tapedeck-href-{}.png", std::process::id()));
+        std::fs::write(&path, &png).unwrap();
+
+        let frame = |href: &str, images: &Arc<Images>| {
+            let svg = format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64"><image href="{href}" width="64" height="64"/></svg>"#
+            );
+            let px = draw(&svg, &fontdb, images, 64, 64).expect("draw");
+            px.pixels().iter().any(|p| p.alpha() > 0)
+        };
+        let mut held = Images::new();
+        held.insert("/api/v1/art/5".into(), Arc::new(png));
+        let held = Arc::new(held);
+        assert!(frame("/api/v1/art/5", &held), "a prepared picture is drawn");
+        assert!(!frame(path.to_str().unwrap(), &held), "a path on this machine is not read");
+        assert!(!frame("/api/v1/art/6", &held), "an href nobody prepared draws nothing");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Encodes the sample year for real and checks ffmpeg was fed every frame.
     /// Ignored: it needs ffmpeg and takes seconds.
     /// `TAPEDECK_CARD_DIR=/tmp/story cargo test -- --ignored encode_the_sample`
@@ -382,11 +553,12 @@ mod tests {
         assert!(available(), "this needs an ffmpeg with libx264");
         let dir = std::env::var("TAPEDECK_CARD_DIR").expect("set TAPEDECK_CARD_DIR");
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let story = Story::build(&Card::sample(Unit::Year), Unit::Year, Theme::Dark);
+        let story =
+            Story::build(&Card::sample(Unit::Year), Unit::Year, Theme::Dark, &Default::default());
         let out = Path::new(&dir).join("story-year.mp4");
         let done = AtomicU32::new(0);
         let began = Instant::now();
-        let bytes = encode(&story, &out, &done).expect("encode");
+        let bytes = encode(&story, &Default::default(), &out, &done).expect("encode");
         assert_eq!(done.load(Ordering::Relaxed), story.frames());
         println!(
             "{} ({bytes} bytes, {} frames, {:.1}s of video in {:.1}s)",

@@ -40,6 +40,36 @@ pub const FPS: u32 = 30;
 /// The token a counting layer carries where its number goes.
 pub const COUNT_TOKEN: &str = "{{n}}";
 
+/// The pictures a story may show, as addresses a browser can load: an
+/// `http(s)` URL, or a path under this server's own `/api/v1/`.
+///
+/// Every one is optional and every one has the lettered tile underneath it,
+/// so a picture that is missing, refused or fails to load leaves the design
+/// the cards already have rather than a hole.
+#[derive(Clone, Debug, Default)]
+pub struct Art {
+    /// The top artist's portrait.
+    pub artist: Option<String>,
+    /// The cover of the record of the period.
+    pub album: Option<String>,
+    /// The cover the track of the period was last heard under.
+    pub track: Option<String>,
+}
+
+/// Whether an address is one a story will put in an `href`.
+///
+/// These come from the database — a cover URL a source reported, a portrait
+/// somebody pasted — so the shapes are named rather than trusted: a web URL,
+/// or one of this server's own API paths with nothing that climbs out of it.
+pub fn href_ok(href: &str) -> bool {
+    let plain = !href.is_empty()
+        && href.len() <= 2048
+        && !href.chars().any(|c| c.is_control() || c.is_whitespace());
+    let web = href.starts_with("https://") || href.starts_with("http://");
+    let own = href.starts_with("/api/v1/") && !href.contains("..") && !href.contains("//");
+    plain && (web || own)
+}
+
 /// One thing on screen: a piece of SVG and how it moves.
 #[derive(Clone, Debug, Serialize, utoipa::ToSchema)]
 #[schema(as = StoryLayer)]
@@ -89,12 +119,17 @@ pub struct Story {
     /// fonts cannot draw. The video may then show boxes for it; a browser,
     /// which has its own fonts, usually will not.
     pub fully_covered: bool,
+    /// Every picture a layer refers to, with the largest side it is drawn at
+    /// in story pixels. For the video renderer, which has to fetch and size
+    /// them before the first frame; a browser just follows the `href`s.
+    #[serde(skip)]
+    pub art: Vec<(String, u32)>,
 }
 
 impl Story {
     /// Build the story of one period.
-    pub fn build(c: &Card, unit: Unit, theme: Theme) -> Story {
-        scenes::build(c, unit, theme)
+    pub fn build(c: &Card, unit: Unit, theme: Theme, art: &Art) -> Story {
+        scenes::build(c, unit, theme, art)
     }
 
     pub fn duration_ms(&self) -> u32 {
@@ -188,10 +223,20 @@ mod tests {
         opt
     }
 
+    /// Pictures of every kind a story takes: a remote cover, one of this
+    /// server's own paths, and an address with markup in it.
+    fn sample_art() -> Art {
+        Art {
+            artist: Some("/api/v1/artists/12/pictures/portrait".into()),
+            album: Some("https://coverartarchive.org/release/abc/123-500.jpg".into()),
+            track: Some("https://example.org/a.jpg?x=1&y=\"2\"".into()),
+        }
+    }
+
     fn stories() -> Vec<(Unit, Story)> {
         [Unit::Week, Unit::Month, Unit::Year]
             .into_iter()
-            .map(|u| (u, Story::build(&Card::sample(u), u, Theme::Dark)))
+            .map(|u| (u, Story::build(&Card::sample(u), u, Theme::Dark, &sample_art())))
             .collect()
     }
 
@@ -224,7 +269,7 @@ mod tests {
         c.top_artist =
             Some(super::super::card::Named { name: "Simon & <Garfunkel>".into(), plays: 12 });
         c.top_chain = Some("\"Desk\" <2>".into());
-        let story = Story::build(&c, Unit::Year, Theme::Light);
+        let story = Story::build(&c, Unit::Year, Theme::Light, &sample_art());
         let opt = options();
         for (i, s) in story.scenes.iter().enumerate() {
             usvg::Tree::from_str(&story.frame_svg(i, s.duration_ms / 2), &opt)
@@ -260,7 +305,8 @@ mod tests {
                 }
             }
         }
-        let year = Story::build(&Card::sample(Unit::Year), Unit::Year, Theme::Dark);
+        let year =
+            Story::build(&Card::sample(Unit::Year), Unit::Year, Theme::Dark, &Art::default());
         let vol = year.scenes.iter().position(|s| s.id == "volume").expect("a volume scene");
         assert!(year.frame_svg(vol, year.scenes[vol].duration_ms - 400).contains("21,390"));
     }
@@ -294,7 +340,8 @@ mod tests {
     /// repeat a frame instead of drawing it — and a moving one does not.
     #[test]
     fn a_held_moment_is_the_same_frame_and_a_moving_one_is_not() {
-        let story = Story::build(&Card::sample(Unit::Year), Unit::Year, Theme::Dark);
+        let story =
+            Story::build(&Card::sample(Unit::Year), Unit::Year, Theme::Dark, &Art::default());
         let s = &story.scenes[0];
         let rest = s.duration_ms - s.fade_out_ms - 100;
         assert_eq!(story.frame_svg(0, rest), story.frame_svg(0, rest + 33));
@@ -306,13 +353,46 @@ mod tests {
     #[test]
     fn a_thin_period_drops_scenes_rather_than_drawing_empty_ones() {
         let c = Card { label: "March 2019".into(), plays: 3, ..Default::default() };
-        let story = Story::build(&c, Unit::Month, Theme::Dark);
+        let story = Story::build(&c, Unit::Month, Theme::Dark, &Art::default());
         let ids: Vec<&str> = story.scenes.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, ["intro", "volume", "outro"]);
         assert_eq!(story.scenes.last().unwrap().fade_out_ms, 0, "the last scene is held");
         let (scene, t) = story.locate(story.duration_ms() + 5000);
         assert_eq!(scene, story.scenes.len() - 1);
         assert_eq!(t, story.scenes[scene].duration_ms);
+    }
+
+    /// A picture is named in the story exactly when a layer draws it, and an
+    /// address that is not a web URL or one of this server's own paths never
+    /// reaches a frame.
+    #[test]
+    fn only_addresses_a_story_may_load_are_drawn() {
+        let year = Story::build(&Card::sample(Unit::Year), Unit::Year, Theme::Dark, &sample_art());
+        assert_eq!(year.art.len(), 3);
+        let all: String = (0..year.scenes.len()).map(|i| year.frame_svg(i, 2500)).collect();
+        for (href, px) in &year.art {
+            assert!(*px >= 100, "{href} is drawn at {px}px");
+            assert!(all.contains(&super::super::svg::esc(href)), "{href} is listed but not drawn");
+        }
+
+        for bad in [
+            "file:///etc/passwd",
+            "/etc/passwd",
+            "javascript:alert(1)",
+            "/api/v1/../x",
+            "",
+            "//evil.example/x.jpg",
+            "https://a b",
+        ] {
+            assert!(!href_ok(bad), "{bad:?}");
+            let art =
+                Art { artist: Some(bad.into()), album: Some(bad.into()), track: Some(bad.into()) };
+            let s = Story::build(&Card::sample(Unit::Year), Unit::Year, Theme::Dark, &art);
+            assert!(s.art.is_empty(), "{bad:?} was accepted");
+            assert!(!(0..s.scenes.len()).any(|i| s.frame_svg(i, 2500).contains("<image")));
+        }
+        assert!(href_ok("/api/v1/art/5"));
+        assert!(href_ok("https://coverartarchive.org/release/x/1-500.jpg"));
     }
 
     /// Writes one PNG per scene (at rest) to `TAPEDECK_CARD_DIR`, because
@@ -326,7 +406,7 @@ mod tests {
         let opt = options();
         for unit in [Unit::Week, Unit::Month, Unit::Year] {
             for theme in [Theme::Dark, Theme::Light] {
-                let story = Story::build(&Card::sample(unit), unit, theme);
+                let story = Story::build(&Card::sample(unit), unit, theme, &Art::default());
                 for (i, s) in story.scenes.iter().enumerate() {
                     let svg = story.frame_svg(i, s.duration_ms - s.fade_out_ms - 1);
                     let tree = usvg::Tree::from_str(&svg, &opt).expect("svg");
