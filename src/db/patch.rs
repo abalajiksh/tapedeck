@@ -1391,15 +1391,10 @@ impl Database {
     /// carry `joint_session_id`, which `capture_into_spool` stamps on every
     /// play made by a member in the room — so they *are* the sitting.
     ///
-    /// Three rules, all of them the ones a live capture already follows:
+    /// Two rules, both of them ones a live capture already follows (a third,
+    /// that the chain be shared, went on 2026-11-11 with the rule it copied:
+    /// a sitting hands over every play):
     ///
-    /// * **The chain must be shared.** `joint_session_id` is stamped *before*
-    ///   the chain gate — deliberately, since nobody but the owner reads it —
-    ///   so a listen through a private chain is in this set and must not be
-    ///   offered. Re-applied here by joining `signal_chains`, the same way
-    ///   `retro_spool_from_session` does. Dropping that join would publish
-    ///   every private-chain listen of the evening while looking like a
-    ///   simplification.
     /// * **Only members who were actually in the room** — joined, or joined
     ///   and since gone home. Somebody who *declined* never had a play stamped
     ///   with this uuid in the first place, and reading 'left' as "was never
@@ -1460,7 +1455,6 @@ impl Database {
             sqlx::query_as(&crate::sql!(
                 "SELECT s.user_id, s.title, s.artist, s.album, s.duration, s.timestamp
                FROM scrobbles s
-               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = TRUE
               WHERE s.joint_session_id = ? AND s.user_id != ? AND s.skipped = FALSE
                 AND s.timestamp >= COALESCE(?, s.timestamp)
                 AND s.timestamp <= COALESCE(?, s.timestamp)
@@ -1594,25 +1588,26 @@ impl Database {
             captured,
         }))
     }
-    /// Whether a play in a sitting reaches this viewer's timeline. Binds the
-    /// viewer's id twice; needs `s` (scrobbles), `u` (its owner) and a
-    /// `LEFT JOIN`ed `c` (its chain).
+    /// Whether a play in a sitting reaches this viewer's timeline: **always**,
+    /// for somebody in the sitting. Binds the viewer's id twice; needs `s`
+    /// (scrobbles).
     ///
-    /// Your own, always. Somebody else's on `PATCH_VISIBLE_LISTENS`' terms:
-    /// they share the chain it ran through, or they have opened everything to
-    /// the decks they let in and yours is one of them. Through v0.126.2 this was
-    /// the chain alone — the rule the Reel dropped on 2026-08-26 — so a member
-    /// who had switched on *show patched decks every listen* still had every
-    /// play counted as withheld here while the same plays sat on your Reel.
+    /// Through v0.131 this was the Reel's rule — the owner shares the chain
+    /// the play ran through, or has opened everything to the decks they let
+    /// in — because a sitting did not bypass the sharing switch. Ashwin
+    /// reversed that on 2026-11-11: **a Shared Spool hands over every play**,
+    /// whatever chain it ran through. Starting a sitting, or joining one, is
+    /// the consent; the chain switch goes on deciding what reaches the Reel,
+    /// the Instance tab and Discover, where nobody was invited into a room.
     ///
-    /// What this does **not** widen is capturing: a play enters somebody else's
-    /// history only through a shared chain (`set_chain_shared`). Seen here
-    /// through the switch alone, a play is `theirs` — it happened, nobody
-    /// offered it.
-    const SITTING_VISIBLE: &'static str = "(s.user_id = ? OR c.shared = TRUE \
-         OR (u.share_all_with_patched = 1 AND EXISTS (SELECT 1 FROM patches p \
-             WHERE p.follower_user_id = ? AND p.target_user_id = s.user_id \
-               AND p.state = 'accepted')))";
+    /// What stays private is the chain itself. A sitting names a title, an
+    /// artist and a time, and an accepted copy carries the format it arrived
+    /// in; nobody's chain or gear is named to anybody else, here or anywhere.
+    ///
+    /// Kept as a predicate with its two binds, rather than deleted, so the
+    /// queries that apply it still say where the rule lives: the callers are
+    /// membership-gated, and this is what a member sees.
+    const SITTING_VISIBLE: &'static str = "(s.user_id = ? OR ? > 0)";
 
     /// Every sitting this person was actually in, newest first.
     ///
@@ -2565,16 +2560,15 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
 
-        // **The same shared-chain rule a live sitting follows**, so a spool made
-        // late captures exactly what one started on time would have. What it
-        // therefore leaves out is counted and returned, never silently dropped —
-        // and unlike a live sitting there is a recovery: share the chain and do
-        // it again.
+        // **The rule a live sitting follows: every play, whatever chain it ran
+        // through** (2026-11-11), so a spool made late captures exactly what
+        // one started on time would have. Only skips are left out, as
+        // everywhere, so the count of listens withheld is now only ever what
+        // this person had already been offered.
         let plays: Vec<(String, String, Option<String>, Option<i64>, i64)> =
             sqlx::query_as(&crate::sql!(
                 "SELECT s.title, s.artist, s.album, s.duration, s.timestamp
                FROM scrobbles s
-               JOIN signal_chains c ON c.id = s.chain_id AND c.shared = TRUE
               WHERE s.session_id = ? AND s.skipped = FALSE
               ORDER BY s.timestamp"
             ))
@@ -3008,17 +3002,9 @@ impl Database {
     }
     /// Mark a listen as having happened in company, and offer it to the others.
     ///
-    /// **Two jobs, and the order between them is the whole point.** Stamping
-    /// `joint_session_id` says *I was not alone when I heard this* — a fact
-    /// about this listener's own listening, which nobody else ever sees.
-    /// Fanning out a capture says *here, have this play* — publishing. They
-    /// used to be one gated block, so a host who shared no chain had **none of
-    /// their own listens marked as social** even though they were demonstrably
-    /// hosting a sitting. Two different questions fused because they shared a
-    /// function.
-    ///
-    /// So the stamp happens for anyone in a joined sitting, and only the
-    /// fan-out below is gated on the chain.
+    /// **Two jobs.** Stamping `joint_session_id` says *I was not alone when I
+    /// heard this* — a fact about this listener's own listening, which nobody
+    /// else ever sees. Fanning out a capture says *here, have this play*.
     ///
     /// Called from `save_scrobble` for **live, unskipped** listens only. An
     /// import must not fan out — twenty thousand rows would put twenty thousand
@@ -3026,26 +3012,33 @@ impl Database {
     /// be *stamped* either: a backfilled row was not heard in company just
     /// because a sitting happens to be running while it imports.
     ///
-    /// **For the fan-out the chain must be shared, exactly as for the Reel.**
-    /// The other reading was considered and rejected: a spool is a bounded
-    /// event both people opted into, so "everyone in the room gets the plays"
-    /// is defensible and is probably what a user expects. But the rule this
-    /// phase is built on says a listen through an unshared chain is *not
-    /// published, not counted and not delivered*, with no per-listen override —
-    /// and a capture is publishing. Allowing it would mean two ways a listen
-    /// becomes visible while the settings page explains only one, and it would
-    /// let somebody start a sitting and quietly hand over a chain they had
-    /// deliberately kept private.
+    /// **Every play is handed over, whatever chain it ran through.** Until
+    /// v0.131 the fan-out needed a shared chain, exactly as the Reel does: a
+    /// capture was treated as publishing, and a sitting did not bypass the
+    /// sharing switch. In use that meant a host on an unshared chain — or on
+    /// no chain at all, which is every Navidrome-plugin listen — ran a whole
+    /// evening that reached nobody, silently (the household instance,
+    /// 2026-11-08: a spool started, thirty-three plays, no captures). Ashwin
+    /// reversed it on 2026-11-11: starting a sitting or joining one **is** the
+    /// consent, and everyone in the room gets the plays.
     ///
-    /// The consequence is real and has to be surfaced rather than discovered: a
-    /// host with no shared chain captures nothing, and the screen says so.
+    /// What the switch still decides is everything outside a room — the Reel,
+    /// the Instance tab, Discover — and what stays private inside one is the
+    /// chain itself: a capture names a title, an artist and a time, an
+    /// accepted copy takes the format the host's listen arrived in
+    /// (`host_audio`), and nobody's chain or gear is named to anybody else.
+    ///
+    /// Two things are unchanged. A capture is written only for somebody who
+    /// has **joined** — an unanswered invitation gets nothing until it is
+    /// accepted, and then `offer_spool_backlog` hands over the evening. And a
+    /// capture is an **offer**: it enters a history only when its recipient
+    /// accepts it.
     ///
     /// Cheap when nothing is running: one indexed lookup that returns no rows.
     pub(super) async fn capture_into_spool(
         &self,
         user_id: i64,
         play: &Play,
-        chain_id: Option<i64>,
     ) -> Result<(), sqlx::Error> {
         // **A play accepted out of one sitting is not a play in another.**
         // `settle_captures` writes a real listen, and with a spool chain named
@@ -3129,23 +3122,9 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // From here down is publishing, and publishing is gated on the chain.
-        // No chain is no sharing — the default has to be exclusion, the same
-        // call `reel` makes by joining rather than left-joining.
-        let Some(chain_id) = chain_id else {
-            return Ok(());
-        };
-        let shared: i64 = sqlx::query_scalar(&crate::sql!(
-            "SELECT COUNT(*) FROM signal_chains WHERE id = ? AND user_id = ? AND shared = TRUE",
-        ))
-        .bind(chain_id)
-        .bind(user_id)
-        .fetch_one(&self.pool)
-        .await?;
-        if shared == 0 {
-            return Ok(());
-        }
-
+        // **Every play is handed over, whatever chain it ran through** — see
+        // the note on this function. No chain, a private chain and a shared
+        // one are the same thing to a room that heard all three.
         // The capture carries who was in the room **when the play happened**,
         // not when it is eventually accepted. Those can be hours apart, and
         // somebody joining in between was not there for this one.
