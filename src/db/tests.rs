@@ -589,6 +589,77 @@ async fn a_grouped_cover_comes_from_one_listen() {
     assert_eq!(page_url.as_deref(), row.artwork_url.as_deref());
 }
 
+/// A track's record is the artist's own album, however recently it was heard
+/// on a compilation.
+///
+/// The story gives the track of the period its album's cover. "The cover it
+/// was last heard under" put a "100 Hits" sleeve on a track the moment its
+/// newest play came from one.
+#[tokio::test]
+async fn a_tracks_record_is_its_own_album_and_never_a_compilation() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let now = Database::now_secs() as u64;
+
+    // Twice on the album, then three times — and most recently — on a
+    // compilation filed under Various Artists.
+    for (ts, album, filed) in [
+        (now - 9_000, "Blonde", None),
+        (now - 8_000, "Blonde", None),
+        (now - 300, "100 Hits", Some("Various Artists")),
+        (now - 200, "100 Hits", Some("Various Artists")),
+        (now - 100, "100 Hits", Some("Various Artists")),
+    ] {
+        let mut p = play("Adieu", "Cœur de pirate", ts);
+        p.album = Some(album.into());
+        let source_id = p.source_id.clone();
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE scrobbles SET album_filed_under = ? WHERE user_id = ? AND source_id = ?",
+        )
+        .bind(filed)
+        .bind(uid)
+        .bind(&source_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        db.track_album(uid, " cœur de pirate ", "ADIEU").await.unwrap().as_deref(),
+        Some("Blonde"),
+        "the album, though the compilation was played more and later"
+    );
+
+    // Heard only on a compilation: no record of its own to name.
+    let mut p = play("Somewhere", "Somebody", now - 50);
+    p.album = Some("100 Hits".into());
+    let source_id = p.source_id.clone();
+    db.save_scrobble(uid, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE scrobbles SET album_filed_under = 'Various Artists' WHERE user_id = ? AND source_id = ?")
+        .bind(uid)
+        .bind(&source_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(db.track_album(uid, "Somebody", "Somewhere").await.unwrap(), None);
+    assert_eq!(db.track_album(uid, "Nobody", "Nothing").await.unwrap(), None);
+}
+
 /// A listen with no cover must not blank a group that has one.
 ///
 /// The naive "take the newest row" would: an import carries no artwork at
