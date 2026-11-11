@@ -492,4 +492,30 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
     }
+
+    /// The cover a track was last heard under: `album_artwork`'s answer for
+    /// a title rather than a record, for the one place that names a track
+    /// without naming its album (a report's track of the period).
+    ///
+    /// Newest first and one row, so it walks the user's listens only as far
+    /// back as the latest play of that track that has a cover.
+    pub async fn track_artwork(
+        &self,
+        user_id: i64,
+        artist: &str,
+        title: &str,
+    ) -> Result<Option<(Option<String>, Option<i64>, Option<String>)>, sqlx::Error> {
+        sqlx::query_as(&crate::sql!(
+            "SELECT artwork_url, caa_id, caa_release_mbid FROM scrobbles
+             WHERE user_id = ? AND skipped = FALSE
+               AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(title)) = ?
+               AND (artwork_url IS NOT NULL AND artwork_url != '' OR caa_id > 0)
+             ORDER BY timestamp DESC LIMIT 1"
+        ))
+        .bind(user_id)
+        .bind(artist.trim().to_lowercase())
+        .bind(title.trim().to_lowercase())
+        .fetch_optional(&self.pool)
+        .await
+    }
 }

@@ -218,6 +218,40 @@ impl Doc {
     /// two answer different questions: the box is the coordinate system every
     /// position above was computed in, and the size is what a renderer with no
     /// opinion of its own falls back to.
+    /// A picture, cropped to fill a rounded rectangle.
+    ///
+    /// `id` names the clip and must be unique in the finished document — the
+    /// caller passes it because a story stacks several of these writers into
+    /// one frame, and two clips with one name would crop each other's picture.
+    ///
+    /// The `href` is written, never fetched: a browser loads it, and the
+    /// video renderer is handed the bytes for exactly the hrefs it prepared
+    /// (`crate::report_video`). Nothing here can make usvg read a file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn image(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        r: f32,
+        href: &str,
+        id: &str,
+    ) -> &mut Self {
+        let _ = write!(
+            self.defs,
+            r#"<clipPath id="{id}"><rect x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}" rx="{r:.2}" ry="{r:.2}"/></clipPath>"#,
+            id = esc(id)
+        );
+        let _ = write!(
+            self.body,
+            r#"<image href="{}" x="{x:.2}" y="{y:.2}" width="{w:.2}" height="{h:.2}" preserveAspectRatio="xMidYMid slice" clip-path="url(#{})"/>"#,
+            esc(href),
+            esc(id)
+        );
+        self
+    }
+
     /// The document's contents without the `<svg>` around them: `<defs>` (if
     /// any) followed by the body.
     ///
