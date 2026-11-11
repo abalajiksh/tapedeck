@@ -75,14 +75,57 @@ pub type Images = HashMap<String, Arc<Vec<u8>>>;
 /// absurd file can make the decoder allocate (4096² is 64 MB of RGBA).
 const MAX_SIDE: u32 = 4096;
 
+/// The picture formats a frame can draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Format {
+    Png,
+    Jpeg,
+    Gif,
+    Webp,
+}
+
+fn le16(b: &[u8], at: usize) -> Option<u32> {
+    Some(u16::from_le_bytes([*b.get(at)?, *b.get(at + 1)?]) as u32)
+}
+
 /// What kind of picture these bytes are and how big, read from the header
-/// alone. Only JPEG and PNG: they are what covers and portraits are in
-/// practice, and each states its size where it can be read without decoding.
-fn sniff(bytes: &[u8]) -> Option<(bool, u32, u32)> {
+/// alone — before anything is decoded, so that a file claiming an absurd
+/// size is refused without the decoder ever allocating for it.
+///
+/// PNG, JPEG, GIF and WebP: what covers and portraits arrive as (Plex and
+/// Jellyfin hand out WebP, and a pasted portrait can be anything). Each
+/// states its size somewhere fixed; a format that is none of these is not
+/// drawn.
+fn sniff(bytes: &[u8]) -> Option<(Format, u32, u32)> {
     if bytes.len() > 24 && bytes.starts_with(b"\x89PNG\r\n\x1a\n") && &bytes[12..16] == b"IHDR" {
         let w = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
         let h = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
-        return Some((true, w, h));
+        return Some((Format::Png, w, h));
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        // The logical screen. An animated one draws its first frame.
+        return Some((Format::Gif, le16(bytes, 6)?, le16(bytes, 8)?));
+    }
+    if bytes.len() > 30 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        let (w, h) = match &bytes[12..16] {
+            // Lossy: a frame tag, the start code, then 14 bits each.
+            b"VP8 " if bytes[23..26] == [0x9D, 0x01, 0x2A] => {
+                (le16(bytes, 26)? & 0x3FFF, le16(bytes, 28)? & 0x3FFF)
+            }
+            // Lossless: a signature byte, then 14 bits of each, less one.
+            b"VP8L" if bytes[20] == 0x2F => {
+                let bits = u32::from_le_bytes(bytes[21..25].try_into().ok()?);
+                ((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1)
+            }
+            // Extended (alpha, animation): the canvas, 24 bits each, less one.
+            b"VP8X" => {
+                let w = u32::from_le_bytes([bytes[24], bytes[25], bytes[26], 0]) + 1;
+                let h = u32::from_le_bytes([bytes[27], bytes[28], bytes[29], 0]) + 1;
+                (w, h)
+            }
+            _ => return None,
+        };
+        return Some((Format::Webp, w, h));
     }
     if bytes.starts_with(&[0xFF, 0xD8]) {
         // Walk the segments to the frame header, which carries the size.
@@ -100,7 +143,7 @@ fn sniff(bytes: &[u8]) -> Option<(bool, u32, u32)> {
             if frame {
                 let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]) as u32;
                 let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]) as u32;
-                return Some((false, w, h));
+                return Some((Format::Jpeg, w, h));
             }
             let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
             if len < 2 {
@@ -115,8 +158,10 @@ fn sniff(bytes: &[u8]) -> Option<(bool, u32, u32)> {
 fn kind(bytes: Arc<Vec<u8>>) -> Option<usvg::ImageKind> {
     match sniff(&bytes)? {
         (_, w, h) if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE => None,
-        (true, ..) => Some(usvg::ImageKind::PNG(bytes)),
-        (false, ..) => Some(usvg::ImageKind::JPEG(bytes)),
+        (Format::Png, ..) => Some(usvg::ImageKind::PNG(bytes)),
+        (Format::Jpeg, ..) => Some(usvg::ImageKind::JPEG(bytes)),
+        (Format::Gif, ..) => Some(usvg::ImageKind::GIF(bytes)),
+        (Format::Webp, ..) => Some(usvg::ImageKind::WEBP(bytes)),
     }
 }
 
@@ -147,7 +192,7 @@ fn options(fontdb: &Arc<fontdb::Database>, images: &Arc<Images>) -> usvg::Option
 ///
 /// Done once per picture so that a frame decodes a few hundred pixels rather
 /// than a 1200-pixel cover thirty times a second. `None` for anything that
-/// is not a JPEG or PNG of a sane size, or that does not decode — the
+/// is not a PNG, JPEG, GIF or WebP of a sane size, or that does not decode — the
 /// lettered tile underneath is then what the video shows.
 pub fn prepare(bytes: Vec<u8>, side: u32) -> Option<Vec<u8>> {
     let side = side.clamp(16, 1024);
@@ -487,7 +532,7 @@ mod tests {
         let mut src = tiny_skia::Pixmap::new(300, 200).unwrap();
         src.fill(tiny_skia::Color::from_rgba8(200, 60, 40, 255));
         let png = src.encode_png().unwrap();
-        assert_eq!(sniff(&png), Some((true, 300, 200)));
+        assert_eq!(sniff(&png), Some((Format::Png, 300, 200)));
 
         let small = prepare(png.clone(), 148).expect("a real PNG is prepared");
         let out = tiny_skia::Pixmap::decode_png(&small).unwrap();
@@ -502,10 +547,12 @@ mod tests {
         assert!(prepare(huge, 148).is_none());
 
         for bad in [
-            &b"GIF89a......"[..],
+            &b"GIF89a"[..],
             b"<svg xmlns='http://www.w3.org/2000/svg'/>",
             b"",
             b"\xFF\xD8\xFF",
+            b"RIFF\x00\x00\x00\x00WEBPVP8 ",
+            b"BM\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
         ] {
             assert!(prepare(bad.to_vec(), 148).is_none());
         }
@@ -514,7 +561,44 @@ mod tests {
             0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00, 0xFF, 0xC0, 0x00, 0x11, 0x08, 0x02,
             0x58, 0x03, 0x20, 0x03, 0x01, 0x22, 0x00,
         ];
-        assert_eq!(sniff(&jpeg), Some((false, 800, 600)));
+        assert_eq!(sniff(&jpeg), Some((Format::Jpeg, 800, 600)));
+    }
+
+    /// WebP (lossy and lossless) and GIF are sized from their headers and
+    /// drawn, the same as a JPEG. Media servers hand out WebP, and a video
+    /// that showed lettered tiles where the browser showed covers would be a
+    /// different story from the one on screen.
+    #[test]
+    fn webp_and_gif_pictures_are_drawn_too() {
+        fn hex(s: &str) -> Vec<u8> {
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        }
+        // 16x12 of one green, written by Pillow.
+        let lossless =
+            hex("524946461e000000574542505650384c110000002f0fc002000750e08214a8ff8188e87f0000");
+        let lossy = hex(
+            "5249464634000000574542505650382028000000b001009d012a10000c0002c04c25a00274ba0004aa00009bfc6f379ad28fff9827ebf7cf9e540000",
+        );
+        // The classic one-pixel GIF.
+        let gif = hex("47494638396101000100800000ff00000000002c00000000010001000002024401003b");
+
+        assert_eq!(sniff(&lossless), Some((Format::Webp, 16, 12)));
+        assert_eq!(sniff(&lossy), Some((Format::Webp, 16, 12)));
+        assert_eq!(sniff(&gif), Some((Format::Gif, 1, 1)));
+
+        for (name, bytes) in [("lossless webp", lossless), ("lossy webp", lossy), ("gif", gif)] {
+            let png = prepare(bytes, 64).unwrap_or_else(|| panic!("{name} was not drawn"));
+            let out = tiny_skia::Pixmap::decode_png(&png).unwrap();
+            assert_eq!((out.width(), out.height()), (64, 64), "{name}");
+            assert_eq!(out.pixel(32, 32).unwrap().alpha(), 255, "{name} is a blank");
+        }
+
+        // An extended WebP header naming a canvas far too large is refused
+        // on the header alone.
+        let mut vp8x = b"RIFF\x00\x00\x00\x00WEBPVP8X\x0a\x00\x00\x00\x00\x00\x00\x00".to_vec();
+        vp8x.extend_from_slice(&[0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0, 0]);
+        assert_eq!(sniff(&vp8x), Some((Format::Webp, 65_536, 65_536)));
+        assert!(kind(Arc::new(vp8x)).is_none());
     }
 
     /// A frame draws a prepared picture and nothing else an `href` names: not

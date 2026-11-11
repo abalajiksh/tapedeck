@@ -52,7 +52,7 @@ pub struct Art {
     pub artist: Option<String>,
     /// The cover of the record of the period.
     pub album: Option<String>,
-    /// The cover the track of the period was last heard under.
+    /// The cover of the album the track of the period is from.
     pub track: Option<String>,
 }
 

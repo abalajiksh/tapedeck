@@ -104,9 +104,32 @@ fn cover(row: Option<(Option<String>, Option<i64>, Option<String>)>) -> Option<S
     })
 }
 
+/// A record's cover as its own page shows it: a hand-set one first, else the
+/// one its listens carry.
+async fn album_cover(
+    state: &Arc<AppState>,
+    user_id: i64,
+    artist: &str,
+    album: &str,
+) -> Option<String> {
+    // `find_entity` falls back to any record of that name when the exact one
+    // has no entity, so the artist is checked: another artist's hand-set
+    // cover is not this record's.
+    let chosen = match state.db.find_entity("release", album, Some(artist)).await {
+        Ok(Some(e)) if e.artist_name.trim().eq_ignore_ascii_case(artist.trim()) => {
+            state.db.entity_image(e.id).await.ok().flatten().filter(|u| !u.is_empty())
+        }
+        _ => None,
+    };
+    match chosen {
+        Some(url) => Some(url),
+        None => cover(state.db.album_artwork(user_id, artist, album).await.ok().flatten()),
+    }
+}
+
 /// Where the period's pictures are: the top artist's portrait as this person
 /// sees it, the record's cover (a hand-set one first, as on its page), and
-/// the cover the track was last heard under.
+/// the cover of the album the track is from — never a compilation's.
 ///
 /// Addresses only — nothing is fetched here. A browser follows them; the
 /// video fetches them in `fetch_art`. Every one may be absent, and the story
@@ -135,24 +158,17 @@ async fn resolve_art(state: &Arc<AppState>, user_id: i64, period: &serde_json::V
 
     if let (Some(album), Some(artist)) = (field("top_album", "name"), field("top_album", "artist"))
     {
-        // `find_entity` falls back to any record of that name when the exact
-        // one has no entity, so the artist is checked: another artist's
-        // hand-set cover is not this record's.
-        let chosen = match state.db.find_entity("release", &album, Some(&artist)).await {
-            Ok(Some(e)) if e.artist_name.trim().eq_ignore_ascii_case(artist.trim()) => {
-                state.db.entity_image(e.id).await.ok().flatten().filter(|u| !u.is_empty())
-            }
-            _ => None,
-        };
-        art.album = match chosen {
-            Some(url) => Some(url),
-            None => cover(state.db.album_artwork(user_id, &artist, &album).await.ok().flatten()),
-        };
+        art.album = album_cover(state, user_id, &artist, &album).await;
     }
 
+    // A track wears its album's cover, found the way the record's is. The
+    // album is the artist's own that the track was played from most; a track
+    // only ever heard on a compilation keeps its lettered tile.
     if let (Some(title), Some(artist)) = (field("top_track", "title"), field("top_track", "artist"))
     {
-        art.track = cover(state.db.track_artwork(user_id, &artist, &title).await.ok().flatten());
+        if let Ok(Some(album)) = state.db.track_album(user_id, &artist, &title).await {
+            art.track = album_cover(state, user_id, &artist, &album).await;
+        }
     }
     art
 }
@@ -226,7 +242,7 @@ async fn fetch_picture(
 ///
 /// All at once and each under a deadline: a media server that is off costs
 /// the export eight seconds and one picture, never the export. Whatever does
-/// not arrive, or is not a JPEG or PNG, is simply not in the map, and the
+/// not arrive, or is not a picture a frame can draw, is simply not in the map, and the
 /// frame shows the lettered tile under it.
 async fn fetch_art(
     state: &Arc<AppState>,
@@ -358,7 +374,7 @@ pub async fn report_story(
 /// returns, and is kept for an hour.
 ///
 /// Pictures are fetched by the server before the first frame, each with a
-/// deadline. One that does not arrive, or is not a JPEG or PNG, is left
+/// deadline. One that does not arrive, or is not a PNG, JPEG, GIF or WebP, is left
 /// out and its lettered tile shows instead; the export does not fail.
 ///
 /// One video is made at a time on the whole server, so `queued` means

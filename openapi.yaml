@@ -3626,7 +3626,7 @@ paths:
         returns, and is kept for an hour.
 
         Pictures are fetched by the server before the first frame, each with a
-        deadline. One that does not arrive, or is not a JPEG or PNG, is left
+        deadline. One that does not arrive, or is not a PNG, JPEG, GIF or WebP, is left
         out and its lettered tile shows instead; the export does not fail.
 
         One video is made at a time on the whole server, so `queued` means
