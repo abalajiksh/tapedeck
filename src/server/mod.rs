@@ -32,7 +32,7 @@ pub mod ratelimit;
 mod ratings;
 pub mod rediscovery;
 pub mod report_image;
-pub mod report_story;
+pub mod report_mixdown;
 pub mod reports;
 pub mod scrobbles;
 pub mod sessions;
@@ -96,7 +96,7 @@ pub struct AppState {
     pub everynoise: crate::everynoise::store::EveryNoiseStore,
     /// Progress for the one genre-map scrape that may be running.
     pub everynoise_jobs: crate::everynoise::scrape::ScrapeRegistry,
-    /// Report-story video exports: one render at a time, kept for an hour.
+    /// Report-mixdown video exports: one render at a time, kept for an hour.
     pub video_jobs: crate::report_video::VideoJobs,
     /// Where uploaded sleeve and booklet scans live on disk. Outside the
     /// database on purpose — see `DatabaseConfig::uploads_dir`.
@@ -134,7 +134,7 @@ pub fn api_docs() -> Vec<utoipa::openapi::OpenApi> {
         export::Api::openapi(),
         reports::Api::openapi(),
         report_image::Api::openapi(),
-        report_story::Api::openapi(),
+        report_mixdown::Api::openapi(),
         rediscovery::Api::openapi(),
         playlist_lab::Api::openapi(),
         library::Api::openapi(),
@@ -201,7 +201,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(patch::create_patch_router())
         .merge(reports::create_reports_router())
         .merge(report_image::create_report_image_router())
-        .merge(report_story::create_report_story_router())
+        .merge(report_mixdown::create_report_mixdown_router())
         .merge(crate_shelf::create_crate_router())
         .merge(mcp::create_mcp_router())
         .merge(oauth::create_oauth_router())

@@ -492,4 +492,46 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
     }
+
+    /// The record a track is *from*: the artist's own album it was played
+    /// from most, and never a compilation it also turned up on.
+    ///
+    /// For the one place that names a track without naming its album (a
+    /// report's track of the period), so that the track can wear **its
+    /// album's cover** — resolved the way the album page resolves it — rather
+    /// than whichever sleeve its latest listen happened to carry. A track
+    /// heard on its album and on "100 Hits" has two covers in the himixdown,
+    /// and one listen's release ids can name a compilation even under the
+    /// album's own title.
+    ///
+    /// Only listens **filed under the track's own artist** count — the album
+    /// expression every album query uses — which leaves out anything filed
+    /// under Various Artists or another name. `None` when the track was only
+    /// ever heard on such a record, or with no album named at all.
+    ///
+    /// The kind of a release is not stored, so a best-of under the artist's
+    /// own name still counts as theirs.
+    pub async fn track_album(
+        &self,
+        user_id: i64,
+        artist: &str,
+        title: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let artist = artist.trim().to_lowercase();
+        sqlx::query_scalar(&crate::sql!(
+            "SELECT MAX(album) FROM scrobbles
+              WHERE user_id = ? AND skipped = FALSE
+                AND LOWER(TRIM(artist)) = ? AND LOWER(TRIM(title)) = ?
+                AND LOWER(TRIM(COALESCE(album_filed_under, artist))) = ?
+                AND TRIM(COALESCE(album, '')) != ''
+              GROUP BY LOWER(TRIM(album))
+              ORDER BY COUNT(*) DESC, MAX(timestamp) DESC LIMIT 1"
+        ))
+        .bind(user_id)
+        .bind(&artist)
+        .bind(title.trim().to_lowercase())
+        .bind(&artist)
+        .fetch_optional(&self.pool)
+        .await
+    }
 }

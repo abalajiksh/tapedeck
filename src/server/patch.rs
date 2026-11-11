@@ -281,8 +281,8 @@ pub struct HandedOver {
     /// `spool` only: plays offered to them as captures…
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offered: Option<i64>,
-    /// …and plays held back because they ran through a chain you do not
-    /// share.
+    /// …and plays held back. Always 0 now: a sitting hands over every play,
+    /// whatever chain it ran through. Kept so a client reading it still can.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub withheld: Option<i64>,
 }
@@ -1726,12 +1726,12 @@ async fn sittings_sent(
 /// You must be patched with them in either direction, and the sitting must
 /// be yours.
 ///
-/// **Both kinds pass on only listens through shared chains** — a sitting
-/// made late captures exactly what one made on time would have, and this
-/// phase has one switch for publishing rather than two. What is withheld is
-/// counted either way (`withheld` here, `omitted` on the document), never
-/// silently dropped. Unlike a live sitting there is a recovery: share the
-/// chain and do it again.
+/// **The two kinds pass on different things.** A `spool` hands over **every
+/// play of the sitting, whatever chain it ran through** — exactly what a
+/// live sitting hands over, so one made late captures what one made on time
+/// would have. A `recommendation` follows the Reel: only listens they could
+/// already see, with the rest counted as `omitted` on the document, never
+/// silently dropped. Nobody's chain or gear is named in either.
 #[utoipa::path(
     post,
     path = "/api/v1/patch/sittings",

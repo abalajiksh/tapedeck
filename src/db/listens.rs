@@ -185,7 +185,7 @@ impl Database {
         // which is almost always. That is affordable per *live* listen — a
         // handful an hour — and would not be per imported one.
         if !disposition.imported && !disposition.skipped {
-            self.capture_into_spool(user_id, play, chain_id).await?;
+            self.capture_into_spool(user_id, play).await?;
         }
 
         Ok(true)

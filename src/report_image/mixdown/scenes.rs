@@ -1,4 +1,4 @@
-//! The built-in story: which scenes a period gets and what each one draws.
+//! The built-in mixdown: which scenes a period gets and what each one draws.
 //!
 //! The rules are the cards' rules. A scene with nothing to say is left out
 //! rather than drawn empty; every figure is the report's own; a count that is
@@ -13,7 +13,7 @@ use super::super::fonts::{ellipsise, width, Face};
 use super::super::layout::{self, nf, ordinal, Unit, M};
 use super::super::svg::{Anchor, Doc};
 use super::super::theme::{period_colour, Palette, Theme};
-use super::{Count, Layer, Scene, Story, Tracks, COUNT_TOKEN, FPS, HEIGHT, WIDTH};
+use super::{href_ok, Art, Count, Layer, Mixdown, Scene, Tracks, COUNT_TOKEN, FPS, HEIGHT, WIDTH};
 
 /// How long a scene takes to hand over to the next.
 const FADE_MS: u32 = 260;
@@ -25,6 +25,9 @@ struct B<'a> {
     unit: Unit,
     c: &'a Card,
     covered: bool,
+    art: &'a Art,
+    /// The pictures actually drawn, with the largest side each is drawn at.
+    used: Vec<(String, u32)>,
 }
 
 /// The largest size up to `max` at which `text` fits in `room`, never below
@@ -52,6 +55,19 @@ impl B<'_> {
         draw(&mut d, self);
         self.covered &= d.fully_covered();
         Layer { svg: d.into_fragment(), origin, tracks, count: None }
+    }
+
+    /// A picture this mixdown may draw, noted with the size it is drawn at. An
+    /// address of a shape a mixdown does not load is dropped here, so it is
+    /// neither drawn nor fetched.
+    fn picture(&mut self, href: Option<&String>, side: f32) -> Option<String> {
+        let href = href.filter(|h| href_ok(h))?.clone();
+        let px = side.ceil() as u32;
+        match self.used.iter_mut().find(|(h, _)| *h == href) {
+            Some(seen) => seen.1 = seen.1.max(px),
+            None => self.used.push((href.clone(), px)),
+        }
+        Some(href)
     }
 
     /// A small tracked heading, the cards' eyebrow.
@@ -284,8 +300,12 @@ impl B<'_> {
 
         let side = 380.0;
         let (tx, ty) = (cx - side / 2.0, top + 70.0);
+        let portrait = self.picture(self.art.artist.as_ref(), side);
         layers.push(self.layer([cx, ty + side / 2.0], Tracks::pop(300), |d, b| {
-            d.rounded(tx, ty, side, side, b.m.radius * 1.4, &b.colour);
+            // The lettered tile first and the portrait over it: if the
+            // picture never arrives, what is left is the design, not a hole.
+            let r = b.m.radius * 1.4;
+            d.rounded(tx, ty, side, side, r, &b.colour);
             let px = side * 0.56;
             d.text(
                 cx,
@@ -296,6 +316,9 @@ impl B<'_> {
                 b.p.bg,
                 Anchor::Middle,
             );
+            if let Some(href) = &portrait {
+                d.image(tx, ty, side, side, r, href, "art-artist");
+            }
         }));
 
         let px = fit(&a.name, Face::Display, 112.0, content);
@@ -329,9 +352,15 @@ impl B<'_> {
         let mut y = top + 60.0;
         let mut start = 300;
         let unit = self.unit_upper();
-        let rows = [("RECORD", c.top_album.as_ref()), ("TRACK", c.top_track.as_ref())];
-        for (kind, item) in rows {
+        let rows = [
+            ("RECORD", c.top_album.as_ref(), self.art.album.as_ref(), "art-record"),
+            ("TRACK", c.top_track.as_ref(), self.art.track.as_ref(), "art-track"),
+        ];
+        // Where `entity_row` puts its tile.
+        let (tile, inset) = (self.m.tile, self.m.tile * 0.16);
+        for (kind, item, cover, clip) in rows {
             let Some(t) = item else { continue };
+            let cover = self.picture(cover, tile);
             let label = format!("{kind} OF THE {unit}");
             let sub = if t.artist.is_empty() {
                 format!("{} plays", nf(t.plays))
@@ -353,6 +382,10 @@ impl B<'_> {
                     &sub,
                     &Card::initial(&t.title),
                 );
+                if let Some(href) = &cover {
+                    let r = b.m.radius * 0.8;
+                    d.image(pad + inset, row_y + inset, tile, tile, r, href, clip);
+                }
             }));
             y += self.m.entity_h() + self.m.gap * 1.6;
             start += 500;
@@ -480,13 +513,21 @@ fn scene(id: &str, duration_ms: u32, layers: Vec<Layer>) -> Scene {
     Scene { id: id.to_string(), duration_ms, fade_out_ms: FADE_MS, layers }
 }
 
-pub(super) fn build(c: &Card, unit: Unit, theme: Theme) -> Story {
+pub(super) fn build(c: &Card, unit: Unit, theme: Theme, art: &Art) -> Mixdown {
     let p = theme.palette();
     let colour = period_colour(c.colour.as_deref(), &p);
-    let mut b =
-        B { m: M::for_size(super::super::layout::Size::Story), p, colour, unit, c, covered: true };
+    let mut b = B {
+        m: M::for_size(super::super::layout::Size::Story),
+        p,
+        colour,
+        unit,
+        c,
+        covered: true,
+        art,
+        used: Vec::new(),
+    };
 
-    // The ground: the card's own, so a story and the card it ends on are
+    // The ground: the card's own, so a mixdown and the card it ends on are
     // plainly the same object.
     let mut d = Doc::new(b.m.w, b.m.h);
     d.rect(0.0, 0.0, b.m.w, b.m.h, b.p.bg);
@@ -506,7 +547,7 @@ pub(super) fn build(c: &Card, unit: Unit, theme: Theme) -> Story {
         last.fade_out_ms = 0;
     }
 
-    Story {
+    Mixdown {
         width: WIDTH,
         height: HEIGHT,
         fps: FPS,
@@ -516,5 +557,6 @@ pub(super) fn build(c: &Card, unit: Unit, theme: Theme) -> Story {
         background,
         scenes,
         fully_covered: b.covered,
+        art: b.used,
     }
 }

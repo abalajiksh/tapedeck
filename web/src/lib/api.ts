@@ -586,47 +586,47 @@ export interface StatsGraphs {
 	anchors: { name: string; plays: number; title: string; title_plays: number; share: number; tracks: number }[];
 }
 
-/** One point on a story track: at `t` ms into the scene the value is `v`. */
-export interface StoryKey {
+/** One point on a mixdown track: at `t` ms into the scene the value is `v`. */
+export interface MixdownKey {
 	t: number;
 	v: number;
 }
 
-/** How a story layer moves. An absent track is at rest. See `$lib/story`. */
-export interface StoryTracks {
-	opacity?: StoryKey[];
-	dx?: StoryKey[];
-	dy?: StoryKey[];
-	scale?: StoryKey[];
-	scale_x?: StoryKey[];
-	scale_y?: StoryKey[];
+/** How a mixdown layer moves. An absent track is at rest. See `$lib/mixdown`. */
+export interface MixdownTracks {
+	opacity?: MixdownKey[];
+	dx?: MixdownKey[];
+	dy?: MixdownKey[];
+	scale?: MixdownKey[];
+	scale_x?: MixdownKey[];
+	scale_y?: MixdownKey[];
 }
 
 /** A number that counts up; the layer's `svg` carries `{{n}}` in its place. */
-export interface StoryCount {
+export interface MixdownCount {
 	from: number;
 	to: number;
 	start_ms: number;
 	end_ms: number;
 }
 
-export interface StoryLayer {
+export interface MixdownLayer {
 	/** SVG elements drawn by the server: fitted, escaped, ready to inline. */
 	svg: string;
 	origin: [number, number];
-	tracks: StoryTracks;
-	count?: StoryCount;
+	tracks: MixdownTracks;
+	count?: MixdownCount;
 }
 
-export interface StoryScene {
+export interface MixdownScene {
 	id: string;
 	duration_ms: number;
 	fade_out_ms: number;
-	layers: StoryLayer[];
+	layers: MixdownLayer[];
 }
 
-/** `GET /api/v1/reports/story` — a report period as a short animated story. */
-export interface ReportStory {
+/** `GET /api/v1/reports/mixdown` — a report period as a short animated mixdown. */
+export interface ReportMixdown {
 	width: number;
 	height: number;
 	fps: number;
@@ -634,14 +634,14 @@ export interface ReportStory {
 	label: string;
 	theme: string;
 	background: string;
-	scenes: StoryScene[];
+	scenes: MixdownScene[];
 	fully_covered: boolean;
 	/** Whether the server has an encoder, so a video can be asked for. */
 	video_export: boolean;
 }
 
-/** Where a story's video export has got to. */
-export interface StoryVideo {
+/** Where a mixdown's video export has got to. */
+export interface MixdownVideo {
 	id: string;
 	state: 'queued' | 'rendering' | 'done' | 'failed';
 	frames_done: number;
@@ -2797,33 +2797,33 @@ class TapedeckAPI {
 		return this.get(`/api/v1/reports?unit=${unit}&limit=${limit}&offset=${offset}`);
 	}
 
-	/** A report period as an animated story, drawn by the server. */
-	async getReportStory(
+	/** A report period as an animated mixdown, drawn by the server. */
+	async getReportMixdown(
 		unit: 'week' | 'month' | 'year',
 		offset: number,
 		theme: 'dark' | 'light'
-	): Promise<ReportStory> {
-		return this.get(`/api/v1/reports/story?unit=${unit}&offset=${offset}&theme=${theme}`);
+	): Promise<ReportMixdown> {
+		return this.get(`/api/v1/reports/mixdown?unit=${unit}&offset=${offset}&theme=${theme}`);
 	}
 
-	/** Ask the server to make a video of a story. Poll the job it returns. */
-	async startStoryVideo(
+	/** Ask the server to make a video of a mixdown. Poll the job it returns. */
+	async startMixdownVideo(
 		unit: 'week' | 'month' | 'year',
 		offset: number,
 		theme: 'dark' | 'light'
-	): Promise<StoryVideo> {
-		return this.post(`/api/v1/reports/story/video?unit=${unit}&offset=${offset}&theme=${theme}`);
+	): Promise<MixdownVideo> {
+		return this.post(`/api/v1/reports/mixdown/video?unit=${unit}&offset=${offset}&theme=${theme}`);
 	}
 
-	async getStoryVideo(id: string): Promise<StoryVideo> {
-		return this.get(`/api/v1/reports/story/video/${encodeURIComponent(id)}`);
+	async getMixdownVideo(id: string): Promise<MixdownVideo> {
+		return this.get(`/api/v1/reports/mixdown/video/${encodeURIComponent(id)}`);
 	}
 
-	/** A finished story video, as a blob to save. Fetched rather than linked:
+	/** A finished mixdown video, as a blob to save. Fetched rather than linked:
 	 *  a cross-origin `download` attribute is ignored, so a link would navigate
 	 *  to the file while looking like it worked. */
-	async getStoryVideoFile(id: string): Promise<Blob> {
-		const res = await fetch(`${BASE}/api/v1/reports/story/video/${encodeURIComponent(id)}/file`, {
+	async getMixdownVideoFile(id: string): Promise<Blob> {
+		const res = await fetch(`${BASE}/api/v1/reports/mixdown/video/${encodeURIComponent(id)}/file`, {
 			credentials: 'same-origin'
 		});
 		if (!res.ok) throw new Error(`API ${res.status}: ${await res.text()}`);

@@ -7,9 +7,9 @@
 	//
 	// **Membership is what admits you, not the patch.** You were in the room,
 	// and un-patching afterwards has no standing to un-happen an evening you
-	// attended. What that does *not* widen is what the timeline shows: the
-	// per-chain sharing switch still decides that, in the server's SQL, and
-	// `withheld` says how much it kept off.
+	// attended. Everybody in a sitting sees every play of it, whatever chain
+	// it ran through (since 2026-11-11), so `withheld` is always 0 now; the
+	// line that reports it stays for a server that still counts some.
 	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { api, humanError } from '$lib/api';

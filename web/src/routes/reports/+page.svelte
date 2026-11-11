@@ -23,7 +23,7 @@
 	import PeriodNote from '$lib/components/reports/PeriodNote.svelte';
 	import ReportGraphs from '$lib/components/reports/ReportGraphs.svelte';
 	import ShareChapter from '$lib/components/reports/ShareChapter.svelte';
-	import StoryPlayer from '$lib/components/reports/StoryPlayer.svelte';
+	import MixdownPlayer from '$lib/components/reports/MixdownPlayer.svelte';
 
 	const UNITS: { k: 'week' | 'month' | 'year'; label: string }[] = [
 		{ k: 'week', label: 'Week' },
@@ -47,8 +47,8 @@
 	 *  `ShareChapter` — so nothing here lays anything out. */
 	let sharing = false;
 
-	/** The chapter played as a story. Drawn on the server too — see
-	 *  `StoryPlayer` — and offered beside the stepper so one button serves all
+	/** The chapter played as a Mixdown. Drawn on the server too — see
+	 *  `MixdownPlayer` — and offered beside the stepper so one button serves all
 	 *  three units. */
 	let playing = false;
 
@@ -188,7 +188,7 @@
 	{#if period}
 		<div class="play-row">
 			<button class="btn btn-secondary play" on:click={() => (playing = true)}>
-				<svg viewBox="0 0 24 24" width="14" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12.5-7.5a1 1 0 0 0 0-1.72L8.5 3.64A1 1 0 0 0 7 4.5z"/></svg>Play as a story
+				<svg viewBox="0 0 24 24" width="14" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12.5-7.5a1 1 0 0 0 0-1.72L8.5 3.64A1 1 0 0 0 7 4.5z"/></svg>Play the Mixdown
 			</button>
 		</div>
 	{/if}
@@ -263,7 +263,7 @@
 		{/key}
 
 		{#key `${unit}:${idx}`}
-			<StoryPlayer {unit} offset={idx} label={period.label} bind:open={playing} />
+			<MixdownPlayer {unit} offset={idx} label={period.label} bind:open={playing} />
 		{/key}
 	{/if}
 

@@ -589,6 +589,77 @@ async fn a_grouped_cover_comes_from_one_listen() {
     assert_eq!(page_url.as_deref(), row.artwork_url.as_deref());
 }
 
+/// A track's record is the artist's own album, however recently it was heard
+/// on a compilation.
+///
+/// The mixdown gives the track of the period its album's cover. "The cover it
+/// was last heard under" put a "100 Hits" sleeve on a track the moment its
+/// newest play came from one.
+#[tokio::test]
+async fn a_tracks_record_is_its_own_album_and_never_a_compilation() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let now = Database::now_secs() as u64;
+
+    // Twice on the album, then three times — and most recently — on a
+    // compilation filed under Various Artists.
+    for (ts, album, filed) in [
+        (now - 9_000, "Blonde", None),
+        (now - 8_000, "Blonde", None),
+        (now - 300, "100 Hits", Some("Various Artists")),
+        (now - 200, "100 Hits", Some("Various Artists")),
+        (now - 100, "100 Hits", Some("Various Artists")),
+    ] {
+        let mut p = play("Adieu", "Cœur de pirate", ts);
+        p.album = Some(album.into());
+        let source_id = p.source_id.clone();
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE scrobbles SET album_filed_under = ? WHERE user_id = ? AND source_id = ?",
+        )
+        .bind(filed)
+        .bind(uid)
+        .bind(&source_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        db.track_album(uid, " cœur de pirate ", "ADIEU").await.unwrap().as_deref(),
+        Some("Blonde"),
+        "the album, though the compilation was played more and later"
+    );
+
+    // Heard only on a compilation: no record of its own to name.
+    let mut p = play("Somewhere", "Somebody", now - 50);
+    p.album = Some("100 Hits".into());
+    let source_id = p.source_id.clone();
+    db.save_scrobble(uid, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE scrobbles SET album_filed_under = 'Various Artists' WHERE user_id = ? AND source_id = ?")
+        .bind(uid)
+        .bind(&source_id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(db.track_album(uid, "Somebody", "Somewhere").await.unwrap(), None);
+    assert_eq!(db.track_album(uid, "Nobody", "Nothing").await.unwrap(), None);
+}
+
 /// A listen with no cover must not blank a group that has one.
 ///
 /// The naive "take the newest row" would: an import carries no artwork at
@@ -5788,12 +5859,19 @@ async fn a_sitting_reconstructed_late_reaches_the_history_a_live_one_would_have(
     assert!(db.retro_spool_from_session(them, &sitting, stranger).await.is_err());
 
     let (spool, offered, withheld) = db.retro_spool_from_session(them, &sitting, me).await.unwrap();
-    assert_eq!(offered, 1);
-    assert_eq!(withheld, 1, "a sitting made late captures what one made on time would have");
+    assert_eq!(offered, 2, "every play of the sitting, the private chain's included");
+    assert_eq!(withheld, 0, "a sitting made late captures what one made on time would have");
 
     // It arrives in the ordinary capture inbox — indistinguishable, from
     // the recipient's side, from a live sitting.
-    let caps = db.spool_captures(me).await.unwrap();
+    let caps: Vec<_> = db
+        .spool_captures(me)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.title == "Together")
+        .collect();
+    assert_eq!(db.spool_captures(me).await.unwrap().len(), 2);
     assert_eq!(caps.len(), 1);
     assert_eq!(caps[0].title, "Together");
     assert_eq!(caps[0].state, "pending");
@@ -5988,10 +6066,12 @@ async fn an_unshared_chain_still_knows_you_were_not_alone() {
         assert_eq!(company.as_deref(), Some("ash"), "{title}: and it names who was there");
     }
 
-    // The publishing half is untouched: only the shared chain was offered.
-    let offered: Vec<String> =
+    // And both were offered to the room: a sitting hands over every play,
+    // whatever chain it ran through (2026-11-11).
+    let mut offered: Vec<String> =
         db.spool_captures(me).await.unwrap().into_iter().map(|c| c.title).collect();
-    assert_eq!(offered, ["Shared"], "an unshared chain still publishes nothing");
+    offered.sort();
+    assert_eq!(offered, ["Shared", "Unshared"], "the room heard both");
 }
 
 /// Company is stored per listen, names who was actually in the room, and
@@ -6230,12 +6310,13 @@ async fn an_unanswered_invitation_outlives_the_sitting_and_still_carries_its_pla
     // And answering it now is what it always should have been.
     assert_eq!(
         db.set_spool_membership(&spool, me, true).await.unwrap(),
-        Some(("joined".into(), 1)),
-        "joining late offers the sitting's plays, and only the shareable ones"
+        Some(("joined".into(), 3)),
+        "joining late offers every play of the sitting, exactly as joining on time would have"
     );
     let titles: Vec<String> =
         db.spool_captures(me).await.unwrap().into_iter().map(|c| c.title).collect();
-    assert_eq!(titles, ["Shared"], "a private chain is no more published late than on time");
+    assert_eq!(titles.len(), 3, "{titles:?}");
+    assert!(titles.contains(&"Shared".to_string()));
 
     // Answered, so it stops asking.
     assert!(db.active_spool(me).await.unwrap().is_none());
@@ -6246,7 +6327,7 @@ async fn an_unanswered_invitation_outlives_the_sitting_and_still_carries_its_pla
         db.set_spool_membership(&spool, me, true).await.unwrap(),
         Some(("joined".into(), 0))
     );
-    assert_eq!(db.spool_captures(me).await.unwrap().len(), 1);
+    assert_eq!(db.spool_captures(me).await.unwrap().len(), 3);
 }
 
 /// **A play out of a sitting is forwarded only if its owner asked for it,
@@ -6393,16 +6474,17 @@ async fn answering_a_live_sitting_takes_its_banner_away() {
     assert!(db.active_spool(third).await.unwrap().is_none());
 }
 
-/// **A sitting does not bypass the sharing switch.**
+/// **A sitting hands over every play, whatever chain it ran through.**
 ///
-/// The other reading is defensible — a spool is a bounded event both people
-/// opted into — and it was rejected: the rule this phase rests on is that a
-/// listen through an unshared chain is not published, not counted and not
-/// delivered, with no per-listen override. A capture is publishing, and
-/// allowing it here would let somebody start a sitting and hand over a
-/// chain they had deliberately kept private.
+/// Until v0.131 it did not: a capture was treated as publishing, so a play
+/// through an unshared chain, or through none, reached nobody. On the
+/// household instance that was a whole evening (2026-11-08: a spool started,
+/// thirty-three Navidrome-plugin plays, nothing in anybody's inbox). Ashwin
+/// reversed it on 2026-11-11 — starting or joining a sitting is the consent.
+/// The chain switch still decides the Reel; see
+/// `a_private_chain_still_stays_off_the_reel_during_a_sitting`.
 #[tokio::test]
-async fn a_sitting_captures_only_from_shared_chains() {
+async fn a_sitting_hands_over_every_play_whatever_chain_it_ran_through() {
     let db = testdb().await;
     let (me, them, shared) = patched_pair(&db).await;
     let private = sqlx::query_scalar::<_, i64>(
@@ -6425,9 +6507,39 @@ async fn a_sitting_captures_only_from_shared_chains() {
         db.spool_captures(me).await.unwrap().into_iter().map(|c| c.title).collect();
     assert_eq!(
         titles,
-        ["Shared"],
-        "an unshared chain and a chainless listen are not offered to the room either"
+        ["Shared", "Chainless", "Private"],
+        "the private chain's play and the chainless one are offered like any other"
     );
+    // Offered, not delivered: nothing is in the history until it is accepted.
+    assert_eq!(db.total_plays(me).await.unwrap(), 0);
+}
+
+/// What a sitting hands over, it hands to the room — not to the Reel.
+///
+/// The switch that a sitting no longer consults is still the only thing that
+/// puts a listen in front of somebody who was *not* invited into a room.
+#[tokio::test]
+async fn a_private_chain_still_stays_off_the_reel_during_a_sitting() {
+    let db = testdb().await;
+    let (me, them, shared) = patched_pair(&db).await;
+    let private = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO signal_chains (user_id, name, created_at) VALUES (?, 'Bedroom', ?) RETURNING id",
+    )
+    .bind(them)
+    .bind(Database::now_secs())
+    .fetch_all(&db.pool)
+    .await
+    .unwrap()[0];
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    db.set_spool_membership(&spool, me, true).await.unwrap();
+    let now = Database::now_secs();
+    listen(&db, them, Some(private), "Private", "Talk Talk", (now - 200) as u64).await;
+    listen(&db, them, Some(shared), "Shared", "Talk Talk", (now - 100) as u64).await;
+
+    assert_eq!(db.spool_captures(me).await.unwrap().len(), 2, "the room gets both");
+    let reel: Vec<String> =
+        db.reel(me, 50, None, None, None).await.unwrap().into_iter().map(|l| l.title).collect();
+    assert_eq!(reel, ["Shared"], "and the Reel still shows only the shared chain's");
 }
 
 /// One running sitting per host, enforced by the index rather than by a
@@ -8890,15 +9002,14 @@ async fn a_sitting_is_one_row_per_play_however_many_decks_were_in_it() {
     );
 }
 
-/// A sitting shows what the sharing switch allows and **says how much it is not
-/// showing**.
+/// A sitting shows everybody in it every play — the private chain's too —
+/// and so has nothing to report as withheld.
 ///
-/// The withheld count is the half that matters. A page with invisible holes
-/// misrepresents the evening and the reader could never tell — the rule
-/// `handed_sitting` already carries, in the one other place this application
-/// shows somebody an evening.
+/// It used to show what the sharing switch allowed and count the rest. Since
+/// 2026-11-11 a sitting hands over every play, and a page that hid a play
+/// its reader had been offered would be the two disagreeing about one evening.
 #[tokio::test]
-async fn a_sitting_says_what_it_is_not_showing() {
+async fn a_sitting_shows_every_play_to_the_people_in_it() {
     let db = testdb().await;
     let (me, them, shared) = patched_pair(&db).await;
     let private = sqlx::query_scalar::<_, i64>(
@@ -8918,12 +9029,9 @@ async fn a_sitting_says_what_it_is_not_showing() {
 
     let view = db.spool_detail(&spool, me).await.unwrap().unwrap();
     let titles: Vec<&str> = view.plays.iter().map(|p| p.title.as_str()).collect();
-    assert_eq!(
-        titles,
-        vec!["Teardrop"],
-        "a play through an unshared chain does not reach somebody else's screen"
-    );
-    assert_eq!(view.withheld, 1, "and the evening says so rather than quietly omitting it");
+    assert_eq!(titles, vec!["Teardrop", "Karmacoma"], "the private chain's play is on the page");
+    assert_eq!(view.withheld, 0, "so there is nothing the evening is not showing");
+    assert!(view.plays.iter().all(|p| p.standing == "pending"), "each one an offer to answer");
 }
 
 /// An accepted play carries what the host's deck said about the file.
@@ -9016,16 +9124,16 @@ async fn an_accepted_play_carries_the_hosts_audio_details() {
     assert_eq!((bare.1, bare.5), (None, None), "nothing reported, nothing copied");
 }
 
-/// *Show patched decks every listen* reaches the sitting page, not only the
-/// Reel.
+/// Being in the room is what shows you a sitting's plays — not a patch, not a
+/// chain, and not the *show patched decks every listen* switch.
 ///
-/// Found on a running instance (2026-10-31): a guest switched it on mid-sitting
-/// and the host's page still counted all three of their plays as withheld,
-/// while the guest's page showed the host's — one evening, two different
-/// timelines, and the same plays on the host's Reel. The page had kept the
-/// chain-only rule the Reel dropped in August.
+/// The history of this test is the rule's: first the page kept a chain-only
+/// rule the Reel had dropped (2026-10-31), then the switch was honoured here
+/// too, and on 2026-11-11 the sitting stopped consulting either. A chainless
+/// play — every Navidrome-plugin listen — is seen and offered to everyone
+/// who joined, including somebody the host never let into their deck.
 #[tokio::test]
-async fn a_sitting_shows_what_the_open_everything_switch_opens() {
+async fn a_sitting_shows_its_plays_to_everyone_who_joined() {
     let db = testdb().await;
     let (me, them, _) = patched_pair(&db).await;
     // Patched the other way round: `them` follows lou, so lou may be invited,
@@ -9037,30 +9145,16 @@ async fn a_sitting_shows_what_the_open_everything_switch_opens() {
     let spool = db.start_spool(them, None, &[me, stranger], &[]).await.unwrap();
     db.set_spool_membership(&spool, me, true).await.unwrap();
     db.set_spool_membership(&spool, stranger, true).await.unwrap();
-    // Navidrome-style: no chain at all, so only the switch can publish it.
+    // Navidrome-style: no chain at all, and the switch is off.
     listen(&db, them, None, "Teardrop", "Massive Attack", 1_760_000_000).await;
 
-    let closed = db.spool_detail(&spool, me).await.unwrap().unwrap();
-    assert!(closed.plays.is_empty(), "with the switch off a chainless play is withheld");
-    assert_eq!(closed.withheld, 1);
-
-    db.set_share_all_with_patched(them, true).await.unwrap();
-
-    let open = db.spool_detail(&spool, me).await.unwrap().unwrap();
-    assert_eq!(open.plays.len(), 1, "the switch publishes it to a deck they let in");
-    assert_eq!(open.withheld, 0);
-    assert_eq!(
-        open.plays[0].standing, "theirs",
-        "seen, never offered — capturing into a history still takes a shared chain"
-    );
+    for who in [me, stranger] {
+        let view = db.spool_detail(&spool, who).await.unwrap().unwrap();
+        assert_eq!(view.plays.len(), 1, "everyone in the room sees the play");
+        assert_eq!(view.withheld, 0);
+        assert_eq!(view.plays[0].standing, "pending", "and has it as an offer to answer");
+    }
     assert_eq!(db.spool_history(me, 50).await.unwrap()[0].plays, 1, "and the list counts it too");
-
-    let outsider = db.spool_detail(&spool, stranger).await.unwrap().unwrap();
-    assert!(
-        outsider.plays.is_empty(),
-        "being in the room is not a patch: the switch opens up to decks they let in"
-    );
-    assert_eq!(outsider.withheld, 1);
 }
 
 /// Somebody else's play never carries the artwork proxy URL.

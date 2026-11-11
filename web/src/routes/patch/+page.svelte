@@ -374,10 +374,9 @@
 				? { label: 'Discoverable', open: true }
 				: { label: 'Now playing is public', open: true };
 
-	// A sitting captures only from shared chains, so a host who publishes
-	// nothing passes nothing on. Read from the chains endpoint rather than
-	// inferred from an empty capture list, which would be indistinguishable
-	// from "nothing has played yet".
+	// How many of your chains reach the Reel. A sitting no longer consults
+	// this (since 2026-11-11 it hands over every play, whatever chain it ran
+	// through); the Decks tab still shows it.
 	let mySharedChains = 0;
 	// The full list, so the Decks tab can offer the switch. **One state, two
 	// places** is real rather than aspirational because this and the Signal
@@ -1373,11 +1372,6 @@
 				</div>
 			{/if}
 			<!--
-				A sitting does not bypass the sharing switch, so a host who
-				publishes no chain captures nothing — and that has to be said
-				here rather than discovered from an empty inbox.
-			-->
-			<!--
 				The reported bug in one line. With the room closed, "Join" reads
 				as though it can only be pointless — so the banner says what it
 				actually does, which is hand over the evening it held.
@@ -1386,12 +1380,6 @@
 				<div class="swarn">
 					Joining still works. It puts the plays from that sitting in your
 					inbox, and each one is yours to keep or drop.
-				</div>
-			{/if}
-			{#if spool.hosting && !mySharedChains}
-				<div class="swarn">
-					You share no chains, so nothing you play is being passed on.
-					<a href="/chains">Share one</a> to change that.
 				</div>
 			{/if}
 		</div>
@@ -2609,15 +2597,15 @@
 				</p>
 
 				<!--
-					The moment to say this is here, not after an empty inbox: a
-					host who shares no chain captures nothing at all.
+					Said before the room opens, because it is the one place a
+					private chain's plays leave your deck: a sitting hands over
+					everything, and the chain switch only governs the Reel.
 				-->
-				{#if !mySharedChains}
-					<div class="dwarn">
-						You share no chains, so nothing you play would be passed on.
-						<a href="/chains">Share one first</a>.
-					</div>
-				{/if}
+				<p style="margin:0 0 15px;text-wrap:pretty;">
+					Everything you play while it runs is offered to everyone in it, whichever
+					chain it runs through — shared, private or none. Your chain and gear are
+					never shown to them.
+				</p>
 
 				<div class="field" style="margin-bottom:14px;">
 					<label for="sp-title">Call it something <span style="opacity:.6">(optional)</span></label>
@@ -2912,7 +2900,6 @@
 	.spool .sgo { font-size: 13px; opacity: 0.6; }
 	.spool .smembers { font-size: 12.5px; color: #a4967c; margin-top: 2px; }
 	.spool .swarn { font-size: 12.5px; color: #e0b48c; margin-top: 7px; max-width: 56ch; }
-	.spool .swarn a { color: #f0c8a4; text-decoration: underline; }
 	.smain { flex: 1; min-width: 200px; }
 	.sacts { display: flex; gap: 9px; flex-wrap: wrap; }
 	.spulse { display: flex; gap: 4px; flex: none; }
@@ -2943,7 +2930,6 @@
 	   page — the `--td-panel` trap, which is a text colour left to chance
 	   reading correctly in exactly one theme. */
 	.spool.over .swarn { color: var(--td-muted-2); }
-	.spool.over .swarn a { color: var(--td-accent); }
 	.spool.over .sav { background: var(--td-surface2); color: var(--td-text); }
 	/* The clock and what the sitting has offered. Both were already in the
 	   payload — `started_at` and `captured` — and drawn nowhere. */
@@ -3360,21 +3346,6 @@
 	}
 
 	/* — the start dialog — */
-	/* Deliberately *not* `--td-bad-*`. That pair is the destructive red, and
-	   this is a consequence worth knowing rather than a dangerous act — using
-	   it here would blunt the one signal that means "careful". Body text stays
-	   `--td-text` and the accent marks the edge, so it reads in both themes by
-	   construction rather than by a colour pairing invented for one. */
-	.dwarn {
-		font-size: 12.5px;
-		color: var(--td-text);
-		background: color-mix(in srgb, var(--td-accent) 10%, transparent);
-		border-left: 3px solid var(--td-accent);
-		border-radius: 0 12px 12px 0;
-		padding: 9px 12px;
-		margin-bottom: 14px;
-	}
-	.dwarn a { color: var(--td-accent); text-decoration: underline; }
 	.picklist {
 		display: flex;
 		flex-direction: column;

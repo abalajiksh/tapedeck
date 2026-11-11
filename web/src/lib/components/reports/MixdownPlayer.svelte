@@ -1,11 +1,11 @@
 <script lang="ts">
 	/**
-	 * A report chapter played as a story, and saved as a video.
+	 * A report chapter played as a mixdown, and saved as a video.
 	 *
 	 * **Nothing is laid out here.** The server draws every layer — fitted text,
 	 * embedded-font metrics, the period's colour — and this component only
-	 * moves them, by evaluating the tracks in `$lib/story` on each animation
-	 * frame. The MP4 is made by the server from the same story with the same
+	 * moves them, by evaluating the tracks in `$lib/mixdown` on each animation
+	 * frame. The MP4 is made by the server from the same mixdown with the same
 	 * arithmetic, which is what keeps the two from drifting.
 	 *
 	 * The layers are written with `innerHTML` rather than `{@html}`: they go
@@ -14,8 +14,8 @@
 	 * rather than unknown HTML elements.
 	 */
 	import { onDestroy, tick } from 'svelte';
-	import { api, humanError, type ReportStory, type StoryVideo } from '$lib/api';
-	import { COUNT_TOKEN, countAt, envelope, layerState, thousands } from '$lib/story';
+	import { api, humanError, type ReportMixdown, type MixdownVideo } from '$lib/api';
+	import { COUNT_TOKEN, countAt, envelope, layerState, thousands } from '$lib/mixdown';
 
 	export let unit: 'week' | 'month' | 'year';
 	/** Periods back from the newest, as the Reports stepper counts. */
@@ -30,7 +30,7 @@
 	];
 
 	let theme: Theme = 'dark';
-	let story: ReportStory | null = null;
+	let mixdown: ReportMixdown | null = null;
 	let loading = false;
 	let error = '';
 
@@ -48,7 +48,7 @@
 	let raf = 0;
 	let last = 0;
 
-	let video: StoryVideo | null = null;
+	let video: MixdownVideo | null = null;
 	let videoError = '';
 	let saving = false;
 	let poll: ReturnType<typeof setTimeout> | null = null;
@@ -60,19 +60,19 @@
 		stop();
 		loading = true;
 		error = '';
-		story = null;
+		mixdown = null;
 		try {
-			const s = await api.getReportStory(u, o, th);
+			const s = await api.getReportMixdown(u, o, th);
 			// A slower answer for a look that is no longer selected is dropped.
 			if (!open || u !== unit || o !== offset || th !== theme) return;
-			story = s;
+			mixdown = s;
 			await tick();
 			if (ground) ground.innerHTML = s.background;
 			show(0);
 			last = performance.now();
 			raf = requestAnimationFrame(frame);
 		} catch (e) {
-			error = humanError(e, 'The story could not be loaded');
+			error = humanError(e, 'The Mixdown could not be loaded');
 		} finally {
 			loading = false;
 		}
@@ -85,14 +85,14 @@
 
 	/** Put a scene's layers on the stage, at its first moment. */
 	function show(i: number) {
-		if (!story || !stage) return;
+		if (!mixdown || !stage) return;
 		scene = i;
 		elapsed = 0;
 		ended = false;
 		stage.innerHTML = '';
 		groups = [];
 		shown = [];
-		for (const layer of story.scenes[i].layers) {
+		for (const layer of mixdown.scenes[i].layers) {
 			const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
 			if (!layer.count) g.innerHTML = layer.svg;
 			stage.appendChild(g);
@@ -103,8 +103,8 @@
 	}
 
 	function draw() {
-		if (!story) return;
-		const s = story.scenes[scene];
+		if (!mixdown) return;
+		const s = mixdown.scenes[scene];
 		stage.setAttribute('opacity', String(envelope(s, elapsed)));
 		s.layers.forEach((layer, k) => {
 			const g = groups[k];
@@ -127,11 +127,11 @@
 		raf = requestAnimationFrame(frame);
 		const dt = Math.min(100, now - last);
 		last = now;
-		if (!story || paused || ended) return;
+		if (!mixdown || paused || ended) return;
 		elapsed += dt;
-		const s = story.scenes[scene];
+		const s = mixdown.scenes[scene];
 		if (elapsed >= s.duration_ms) {
-			if (scene + 1 < story.scenes.length) {
+			if (scene + 1 < mixdown.scenes.length) {
 				show(scene + 1);
 				return;
 			}
@@ -143,10 +143,10 @@
 	}
 
 	function go(by: number) {
-		if (!story) return;
+		if (!mixdown) return;
 		const next = scene + by;
 		if (next < 0) show(0);
-		else if (next < story.scenes.length) show(next);
+		else if (next < mixdown.scenes.length) show(next);
 		else close();
 	}
 
@@ -168,15 +168,15 @@
 
 	/** How full each scene's bar is, 0 to 1. */
 	function fill(i: number, sc: number, el: number): number {
-		if (!story || i > sc) return 0;
+		if (!mixdown || i > sc) return 0;
 		if (i < sc) return 1;
-		return Math.min(1, el / story.scenes[i].duration_ms);
+		return Math.min(1, el / mixdown.scenes[i].duration_ms);
 	}
 
 	async function makeVideo() {
 		videoError = '';
 		try {
-			video = await api.startStoryVideo(unit, offset, theme);
+			video = await api.startMixdownVideo(unit, offset, theme);
 			watch();
 		} catch (e) {
 			videoError = humanError(e, 'The video could not be started');
@@ -188,7 +188,7 @@
 		poll = setTimeout(async () => {
 			if (!video) return;
 			try {
-				video = await api.getStoryVideo(video.id);
+				video = await api.getMixdownVideo(video.id);
 				if (video.state === 'done') await saveVideo();
 				else if (video.state === 'failed') videoError = video.error ?? 'The video could not be made';
 				else watch();
@@ -202,11 +202,11 @@
 		if (!video) return;
 		saving = true;
 		try {
-			const blob = await api.getStoryVideoFile(video.id);
+			const blob = await api.getMixdownVideoFile(video.id);
 			const url = URL.createObjectURL(blob);
 			const a = document.createElement('a');
 			a.href = url;
-			a.download = `tapedeck-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-story.mp4`;
+			a.download = `tapedeck-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-mixdown.mp4`;
 			a.click();
 			setTimeout(() => URL.revokeObjectURL(url), 60_000);
 		} catch (e) {
@@ -250,35 +250,35 @@
 			on:keydown|stopPropagation
 			role="dialog"
 			aria-modal="true"
-			aria-label="{label} as a story"
+			aria-label="{label} as a Mixdown"
 			tabindex="-1"
 		>
 			<div class="top">
 				<div class="dialog-title">{label}</div>
-				<button class="btn btn-secondary x" on:click={close} aria-label="Close the story">
+				<button class="btn btn-secondary x" on:click={close} aria-label="Close the Mixdown">
 					<svg viewBox="0 0 24 24" width="15" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
 				</button>
 			</div>
 
 			<div class="frame">
-				{#if story}
+				{#if mixdown}
 					<div class="bars" aria-hidden="true">
-						{#each story.scenes as s, i (s.id)}
+						{#each mixdown.scenes as s, i (s.id)}
 							<span class="bar"><span style="width:{fill(i, scene, elapsed) * 100}%"></span></span>
 						{/each}
 					</div>
 				{/if}
 				<svg
 					class="screen"
-					viewBox="0 0 {story?.width ?? 1080} {story?.height ?? 1920}"
+					viewBox="0 0 {mixdown?.width ?? 1080} {mixdown?.height ?? 1920}"
 					role="img"
-					aria-label={story ? `Scene ${scene + 1} of ${story.scenes.length}` : 'Loading the story'}
+					aria-label={mixdown ? `Scene ${scene + 1} of ${mixdown.scenes.length}` : 'Loading the Mixdown'}
 				>
 					<g bind:this={ground}></g>
 					<g bind:this={stage}></g>
 				</svg>
-				{#if story}
-					<!-- Two halves over the picture, the way a story is driven on a
+				{#if mixdown}
+					<!-- Two halves over the picture, the way a mixdown is driven on a
 					     phone. Real buttons, so a keyboard reaches them too. -->
 					<button class="half left" on:click={() => go(-1)} aria-label="Previous scene"></button>
 					<button class="half right" on:click={() => go(1)} aria-label="Next scene"></button>
@@ -295,7 +295,7 @@
 						<button class="seg-btn" class:on={theme === t.k} on:click={() => setTheme(t.k)}>{t.label}</button>
 					{/each}
 				</div>
-				{#if story}
+				{#if mixdown}
 					{#if ended}
 						<button class="btn btn-secondary" on:click={replay}>Play again</button>
 					{:else}
@@ -303,7 +303,7 @@
 							{paused ? 'Play' : 'Pause'}
 						</button>
 					{/if}
-					{#if story.video_export}
+					{#if mixdown.video_export}
 						<button class="btn btn-primary" on:click={makeVideo} disabled={busy || saving}>
 							{#if video?.state === 'queued'}
 								Waiting for a turn…
@@ -319,13 +319,13 @@
 				{/if}
 			</div>
 
-			{#if story && !story.video_export}
+			{#if mixdown && !mixdown.video_export}
 				<p class="hint">
-					This server can't make videos: it needs ffmpeg installed. The story plays here
+					This server can't make videos: it needs ffmpeg installed. The Mixdown plays here
 					all the same.
 				</p>
 			{/if}
-			{#if story && !story.fully_covered && story.video_export}
+			{#if mixdown && !mixdown.fully_covered && mixdown.video_export}
 				<p class="hint">
 					Some characters here aren't in Tapedeck's own fonts, so in the video they may
 					come out as boxes. On this screen your browser draws them.
@@ -357,7 +357,7 @@
 		overflow: hidden;
 		border: 1px solid var(--td-border);
 		background: var(--td-surface2);
-		/* The story's own shape, as tall as the window allows. */
+		/* The mixdown's own shape, as tall as the window allows. */
 		aspect-ratio: 9 / 16;
 		max-height: calc(100vh - 250px);
 		margin: 0 auto;
