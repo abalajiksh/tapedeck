@@ -23,6 +23,7 @@
 	import PeriodNote from '$lib/components/reports/PeriodNote.svelte';
 	import ReportGraphs from '$lib/components/reports/ReportGraphs.svelte';
 	import ShareChapter from '$lib/components/reports/ShareChapter.svelte';
+	import StoryPlayer from '$lib/components/reports/StoryPlayer.svelte';
 
 	const UNITS: { k: 'week' | 'month' | 'year'; label: string }[] = [
 		{ k: 'week', label: 'Week' },
@@ -45,6 +46,11 @@
 	/** The export dialog. The image itself is drawn on the server — see
 	 *  `ShareChapter` — so nothing here lays anything out. */
 	let sharing = false;
+
+	/** The chapter played as a story. Drawn on the server too — see
+	 *  `StoryPlayer` — and offered beside the stepper so one button serves all
+	 *  three units. */
+	let playing = false;
 
 	$: total = data?.total_periods ?? 0;
 	$: canOlder = idx + 1 < total;
@@ -179,6 +185,13 @@
 		</button>
 	</div>
 	<p class="step-of">{idx + 1} of {total} {unit === 'week' ? 'weeks' : unit === 'month' ? 'months' : 'years'}</p>
+	{#if period}
+		<div class="play-row">
+			<button class="btn btn-secondary play" on:click={() => (playing = true)}>
+				<svg viewBox="0 0 24 24" width="14" fill="currentColor" aria-hidden="true"><path d="M7 4.5v15a1 1 0 0 0 1.5.86l12.5-7.5a1 1 0 0 0 0-1.72L8.5 3.64A1 1 0 0 0 7 4.5z"/></svg>Play as a story
+			</button>
+		</div>
+	{/if}
 {/if}
 
 {#if loading && !data}
@@ -248,12 +261,18 @@
 					bind:open={sharing}
 				/>
 		{/key}
+
+		{#key `${unit}:${idx}`}
+			<StoryPlayer {unit} offset={idx} label={period.label} bind:open={playing} />
+		{/key}
 	{/if}
 
 	<ToTop />
 {/if}
 
 <style>
+	.play-row { display: flex; margin: -6px 0 18px 14px; }
+	.play { font-size: 13px; padding: 9px 16px; gap: 7px; }
 	/* Same segmented control as Statistics and Top Charts. Svelte scopes styles
 	   per component, so this is repeated rather than inherited. */
 	.seg-btn {
