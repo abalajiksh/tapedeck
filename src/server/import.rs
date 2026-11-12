@@ -673,7 +673,13 @@ async fn run_lastfm(
     username: &str,
     api_key: &str,
 ) -> Result<(), String> {
-    let client = reqwest::Client::new();
+    // The same timeouts as run_listenbrainz, for the same reason: the default
+    // client has none, and a stalled page would hang the job forever.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
     let mut page = 1u32;
     loop {
         let url = format!(

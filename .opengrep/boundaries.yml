@@ -1,0 +1,74 @@
+# Tapedeck's house rules that depend on WHERE code is: which module may build
+# an HTTP client, open a query, or construct a sink. Severities and exceptions
+# work as in tapedeck.yml (read its header).
+#
+# No boundaries.rs of test cases: `opengrep test` ignores `paths:`, so a case
+# would fire wherever the test file lives. These are checked by the scan of
+# the tree itself.
+
+rules:
+  - id: source-client-outside-egress
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A source reaches the network through its Egress (UserSource::egress() or
+      Egress::for_owner(user.is_admin)), never a client of its own. A member's
+      source may reach the public internet and TAPEDECK_SOURCE_NETWORKS only —
+      never loopback, link-local or the rest of the LAN — and only Egress
+      enforces that, at connect time and on every redirect.
+    paths:
+      include: ["src/sources/**"]
+      exclude: ["src/sources/egress.rs"]
+    pattern-either:
+      - pattern: reqwest::Client::new()
+      - pattern: reqwest::Client::builder()
+      - pattern: Client::new()
+      - pattern: Client::builder()
+
+  - id: http-client-outside-egress
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      An HTTP client built outside sources::egress. Fine for a fixed public host
+      (Last.fm, ListenBrainz, MusicBrainz, LRCLIB). A URL that a user stored or
+      sent must go through Egress::check_url() and Egress::client() instead.
+    paths:
+      exclude: ["src/sources/**"]
+    pattern-either:
+      - pattern: reqwest::Client::new()
+      - pattern: reqwest::Client::builder()
+
+  - id: sql-outside-a-store
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      Database access belongs in db/ — or in one of the stores that keep a
+      database of their own: everynoise/, lyrics.rs, musicbrainz.rs. A query
+      anywhere else bypasses the skip filter and per-user scoping that db/guards
+      checks.
+    paths:
+      exclude:
+        - "src/db/**"
+        - "src/everynoise/**"
+        - "src/lyrics.rs"
+        - "src/musicbrainz.rs"
+    pattern-either:
+      - pattern: sqlx::query(...)
+      - pattern: sqlx::query_as(...)
+      - pattern: sqlx::query_scalar(...)
+
+  - id: sink-outside-sinks-for-user
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      Forwarding is strictly per user: a sink is built by sinks::sinks_for_user
+      from that user's own connections, and nowhere else. A sink built anywhere
+      else is a server-wide sink, which would forward one member's listens
+      through somebody else's account.
+    paths:
+      exclude: ["src/sinks/**"]
+    pattern-either:
+      - pattern: LastFmSink::new(...)
+      - pattern: LastFmSink::libre_fm(...)
+      - pattern: ListenBrainzSink::new(...)
+

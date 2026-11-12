@@ -77,7 +77,9 @@ impl LastFmSink {
                 .timeout(std::time::Duration::from_secs(30))
                 .user_agent(user_agent)
                 .build()
-                .unwrap_or_else(|_| Client::new());
+                // Fails only where Client::new() would panic too (no TLS backend);
+                // falling back to it would quietly drop the timeout.
+                .expect("reqwest client");
 
         Self {
             api_key,

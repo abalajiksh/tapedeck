@@ -88,7 +88,11 @@ cargo clippy --bin tapedeck                               # advisory, but don't 
 cargo test --bin tapedeck                                 # SQLite suite (also builds the UI)
 TAPEDECK_SKIP_WEB_BUILD=1 cargo test --bin tapedeck --features postgres
 (cd web && bun run check)                                 # svelte-check, advisory
+scripts/opengrep.sh                                       # house rules: what your branch adds
 ```
+
+`scripts/opengrep.sh` downloads the pinned Opengrep release the first time (checked
+against its SHA-256) unless that version is already on your `PATH`.
 
 The two suites are different sets, not the same set run twice: the feature decides
 which code compiles. There are also **live Postgres checks**, which are the only thing
@@ -122,7 +126,7 @@ codebase's worst bugs were exactly that.
 
 A Jenkins pipeline called the **PR guard** tests every PR. It starts within a minute of
 you opening the PR, pushing to it, or a maintainer labelling it, and **a run takes about
-15 minutes**. While it runs, both statuses show as pending, with a link to the build.
+15 minutes**. While it runs, all three statuses show as pending, with a link to the build.
 Runs are one at a time, so with several PRs open yours may wait in the queue first.
 
 ### Who gets tested
@@ -164,23 +168,53 @@ What lands is the merge, so the merge is what gets checked.
 | No stored data lost on upgrade, unless the PR says it means to | yes |
 | clippy: a warning only if your change *adds* warnings compared with `main` | no |
 | `svelte-check` | no |
+| No new **error** finding from the house rules in `.opengrep/` (see [below](#the-house-rules-opengrep)) | yes, but never closes the PR |
+| No new **warning** from the house rules | no |
 | The version was bumped when code changed | no |
 | No binary over 5 MB added | no |
 
 ### What you get back
 
-Two **commit statuses** appear on your PR:
+Three **commit statuses** appear on your PR:
 
 - `tapedeck-pr/tests`: the build, formatting, both suites, the live checks and commit
   hygiene.
 - `tapedeck-pr/migrations`: what your change does to an existing database.
+- `tapedeck-pr/static`: the house rules, checked by reading the code.
 
-`main` requires both before anything can be merged.
+`main` requires all three before anything can be merged.
 
 And **one comment** carries the full report. It is edited in place on each push, so a
 PR with twenty pushes has one report, and its title names the commit it describes. It
 links the Jenkins build, its console log and the archived results (every check's log),
 all readable without an account.
+
+### The house rules (Opengrep)
+
+Some of this project's rules are written down as [Opengrep](https://github.com/opengrep/opengrep)
+rules in `.opengrep/`, so a tool holds every change to them rather than a reviewer's
+memory: an HTTP client without a timeout, a source reaching the network outside its
+`Egress`, a request value spliced into SQL text, a query outside the database layer, a
+sink built outside `sinks_for_user`, the `log` crate, `history.replaceState`. Each rule's
+message says why it exists.
+
+- **Only what your PR adds counts.** Findings already on `main` are never yours.
+- **The rules come from `main`, not from your branch**, so a PR cannot loosen the rule
+  it is being checked against. If your PR changes `.opengrep/`, its own rules are run
+  and tested too, and reported, but the verdict uses `main`'s.
+- **ERROR findings fail `tapedeck-pr/static`. WARNINGs are listed and block nothing.**
+- **A deliberate exception** says so on the line, with the reason on the line above
+  (anything after the rule id would be read as another rule id):
+
+  ```rust
+  // plex.tv, a fixed public host — not the server URL anyone stored.
+  let client = Client::builder() // nosemgrep: source-client-outside-egress
+  ```
+
+- **A false positive** is a bug in the rule: add the case to `.opengrep/tapedeck.rs` as
+  an `ok:` case and fix the rule (`opengrep test .opengrep`).
+
+Opengrep does not read `.svelte` files, so the frontend rules see `.ts` only.
 
 ### If it fails: your PR is closed
 
@@ -199,6 +233,8 @@ What does **not** close your PR:
   and those findings never fail your PR. If neither the release nor your change can
   start on a backend at all, that backend is reported as *not checked* rather than
   failed.
+- **A house-rule finding.** `tapedeck-pr/static` fails and blocks the merge, and the PR
+  stays open: fix it on the branch and push.
 - **A title starting with `WIP:` or `[WIP]`.** The PR is tested and reported on, but
   left open. Remove the prefix when it's ready.
 
@@ -207,7 +243,7 @@ What does **not** close your PR:
 `main` is protected:
 
 - **No direct pushes**, by anyone.
-- **Both statuses green.**
+- **All three statuses green.**
 - **Your branch must be up to date with `main`.** If `main` has moved since your last
   push, merge or rebase it in. That is a new push, so it is tested again, and the green
   check covers what will actually land.

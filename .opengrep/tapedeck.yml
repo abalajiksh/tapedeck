@@ -1,0 +1,206 @@
+# Tapedeck's house rules, as Opengrep checks them.
+#
+# Each rule is a decision this project already made, written so a tool can hold
+# every change to it. The message says why, because that is what someone (or
+# some model) reads at the moment they break it.
+#
+#   scripts/opengrep.sh          run them the way the PR guard does
+#   opengrep test .opengrep      the cases in tapedeck.rs / tapedeck.ts
+#
+# Rules that depend on where a file is (`paths:`) live in boundaries.yml:
+# `opengrep test` ignores `paths:`, so those are checked by scanning the tree.
+#
+# ERROR blocks a PR (status tapedeck-pr/static) when the PR adds a finding;
+# WARNING is listed in the guard's comment and blocks nothing. Findings already
+# on main are never a PR's. To accept one deliberately, say why on the line:
+#
+#   // plex.tv is a fixed public host, not a URL anyone stored.
+#   let client = Client::builder() // nosemgrep: source-client-outside-egress
+#
+# The reason goes on the line above: anything after the rule id is read as
+# another rule id.
+#
+# Opengrep does not match Rust attributes, so test code is recognised by its
+# module's name (`mod tests`, and the few other names in use). It does not
+# parse .svelte files at all: the frontend rules see .ts only.
+
+rules:
+  # ── HTTP clients ─────────────────────────────────────────────────────────
+  - id: reqwest-client-without-timeout
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      This HTTP client has no timeout. reqwest's default never gives up, so a
+      host that accepts the connection and stops answering holds the task open
+      for good — it is how one unreachable host stalled the engine tick on
+      2026-08-24. Set .timeout(..) on the builder, or take Egress::client(timeout).
+    patterns:
+      - pattern-either:
+          - pattern: reqwest::Client::new()
+          - pattern: reqwest::get(...)
+          - patterns:
+              - pattern: reqwest::Client::builder(). ... .build()
+              - pattern-not: reqwest::Client::builder(). ... .timeout(...). ... .build()
+          - patterns:
+              - pattern: Client::builder(). ... .build()
+              - pattern-not: Client::builder(). ... .timeout(...). ... .build()
+          - patterns:
+              - pattern-inside: |
+                  use reqwest::Client;
+                  ...
+              - pattern: Client::new()
+      - pattern-not-inside: mod tests { ... }
+      - pattern-not-inside: mod relay_tests { ... }
+      - pattern-not-inside: mod name_tests { ... }
+      - pattern-not-inside: mod merge_tests { ... }
+      - pattern-not-inside: mod credit_tests { ... }
+      - pattern-not-inside: mod credit_parse_tests { ... }
+      - pattern-not-inside: mod variant_promotion_tests { ... }
+      - pattern-not-inside: mod backfill_rotation_tests { ... }
+      - pattern-not-inside: mod guards { ... }
+      - pattern-not-inside: mod drift { ... }
+
+  # ── SQL ──────────────────────────────────────────────────────────────────
+  - id: request-value-into-sql-text
+    languages: [rust]
+    severity: ERROR
+    mode: taint
+    message: >-
+      A value from the request reaches the text of a SQL statement. Bind it
+      (? / $n) instead. If it chooses a column or a sort direction, map it
+      through a match over a fixed set of strings first.
+    pattern-sources:
+      - patterns:
+          - pattern-inside: "fn $F(..., Query($Q): $T, ...) { ... }"
+          - pattern: $Q
+      - patterns:
+          - pattern-inside: "fn $F(..., Json($Q): $T, ...) { ... }"
+          - pattern: $Q
+      - patterns:
+          - pattern-inside: "fn $F(..., Path($Q): $T, ...) { ... }"
+          - pattern: $Q
+      - patterns:
+          - pattern-inside: "fn $F(..., Form($Q): $T, ...) { ... }"
+          - pattern: $Q
+    pattern-sanitizers:
+      # Opengrep cannot parse a Rust `match` as a pattern; this is the textual
+      # stand-in for "came out of a match over literals".
+      - pattern-regex: 'match\s+[^{]+\{[^}]*\}'
+    pattern-sinks:
+      - pattern: crate::sql!($E)
+
+  - id: sql-format-interpolates-a-value
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      `$A` is spliced into SQL text. Constant fragments (SCREAMING_CASE, such as
+      FIDELITY_KNOWN) are fine. A value must be bound instead, and an identifier
+      must come from a fixed set — say which with nosemgrep if it does.
+    patterns:
+      - pattern-either:
+          - pattern: crate::sql!(&format!($S, ..., $A, ...))
+          - pattern: crate::sql!(format!($S, ..., $A, ...))
+      - metavariable-regex:
+          metavariable: $A
+          regex: '^(?![A-Z][A-Z0-9_]*$)'
+      - focus-metavariable: $A
+
+  - id: count-in-rust
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      Every matching listen is fetched and then counted or filtered in Rust.
+      Do it in SQL (COUNT, WHERE, GROUP BY, a window) so only the answer crosses
+      the wire: on the Pi 4B a whole-history read is seconds. Paired counts must
+      still share one population.
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: $Q.fetch_all($P).await?.len()
+          - patterns:
+              - pattern-either:
+                  - pattern-inside: |
+                      let $R = $Q.fetch_all($P).await?;
+                      ...
+                  - pattern-inside: |
+                      let $R: $T = $Q.fetch_all($P).await?;
+                      ...
+                  - pattern-inside: |
+                      let mut $R = $Q.fetch_all($P).await?;
+                      ...
+                  - pattern-inside: |
+                      let mut $R: $T = $Q.fetch_all($P).await?;
+                      ...
+              - pattern-either:
+                  - pattern: $R.len()
+                  - pattern: $R.$IT().filter(...)
+              - pattern-not-inside: Vec::with_capacity(...)
+              - pattern-not-inside: HashMap::with_capacity(...)
+      # Only the tables that grow with the history, and only a read with no
+      # LIMIT: a capped read (`LIMIT cap + 1`, `LIMIT 2`) is a bounded probe.
+      - metavariable-regex:
+          metavariable: $Q
+          regex: '(?is)^(?!.*\bLIMIT\b).*\bFROM\s+scrobble(s|_artists)\b'
+
+  # ── Logging ──────────────────────────────────────────────────────────────
+  - id: log-crate-not-tracing
+    languages: [rust]
+    severity: ERROR
+    message: Tapedeck logs through `tracing`, never the `log` crate.
+    pattern-either:
+      - pattern: log::info!(...)
+      - pattern: log::warn!(...)
+      - pattern: log::error!(...)
+      - pattern: log::debug!(...)
+      - pattern: log::trace!(...)
+      - pattern: use log::$X;
+
+  - id: print-outside-tests
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      println!/eprintln! outside a test. A running server says things through
+      tracing, where the log level and the log file apply. A CLI subcommand's
+      own output is the exception: mark it with nosemgrep and say so.
+    paths:
+      exclude: ["**/tests.rs"]
+    patterns:
+      - pattern-either:
+          - pattern: println!(...)
+          - pattern: eprintln!(...)
+      - pattern-not-inside: mod tests { ... }
+      - pattern-not-inside: mod relay_tests { ... }
+      - pattern-not-inside: mod name_tests { ... }
+      - pattern-not-inside: mod merge_tests { ... }
+      - pattern-not-inside: mod credit_tests { ... }
+      - pattern-not-inside: mod credit_parse_tests { ... }
+      - pattern-not-inside: mod variant_promotion_tests { ... }
+      - pattern-not-inside: mod backfill_rotation_tests { ... }
+      - pattern-not-inside: mod guards { ... }
+      - pattern-not-inside: mod drift { ... }
+
+  # ── Frontend (.ts only — Opengrep does not parse .svelte) ────────────────
+  - id: history-replacestate
+    languages: [typescript]
+    severity: ERROR
+    message: >-
+      URL state goes through syncUrl() in $lib/url.ts. history.replaceState
+      wipes the history index SvelteKit keeps in history.state, after which the
+      first Back appears to do nothing and the second jumps two pages.
+    paths:
+      exclude: ["web/src/lib/url.ts"]
+    pattern-either:
+      - pattern: history.replaceState(...)
+      - pattern: window.history.replaceState(...)
+
+  - id: fetch-outside-api-ts
+    languages: [typescript]
+    severity: WARNING
+    message: >-
+      API calls go through web/src/lib/api.ts, which sets the base path and the
+      session cookie and turns a failed response into an error in one place. A
+      bare fetch() has to repeat all three, and a check that a call is typed
+      against the API cannot see it.
+    paths:
+      exclude: ["web/src/lib/api.ts"]
+    pattern: fetch(...)

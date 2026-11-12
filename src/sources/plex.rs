@@ -977,7 +977,9 @@ impl PlexSource {
             email: Option<String>,
         }
 
-        let client = Client::builder()
+        // plex.tv, a fixed public host — not the server URL anyone stored, which
+        // is what Egress guards.
+        let client = Client::builder() // nosemgrep: source-client-outside-egress
             .timeout(Duration::from_secs(10))
             .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
             .build()?;
