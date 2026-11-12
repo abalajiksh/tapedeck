@@ -313,7 +313,12 @@ impl Egress {
                 )
             }
         };
-        builder.build().unwrap_or_else(|_| reqwest::Client::new())
+        // Fail closed. The old fallback, `reqwest::Client::new()`, carried
+        // neither the GuardedResolver nor the redirect policy nor a timeout,
+        // so a member's source would have reached anything had the build ever
+        // failed. It fails only where Client::new() panics too (no TLS
+        // backend, unreadable resolver configuration).
+        builder.build().expect("reqwest client")
     }
 }
 

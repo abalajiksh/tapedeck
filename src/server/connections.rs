@@ -15,12 +15,26 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 use utoipa::ToSchema;
 
 use super::auth::AuthUser;
 use super::models::ErrorResponse;
 use super::AppState;
 use crate::openapi::{BadRequest, Unauthorized};
+
+/// The client for connecting an account (ListenBrainz token check, Last.fm and
+/// Libre.fm auth). `reqwest::Client::new()` has no timeout, so a host that
+/// accepts the connection and never answers would hold the request open
+/// until the browser gave up.
+fn http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        // Fails only where Client::new() would panic too: no TLS backend.
+        .expect("reqwest client")
+}
 
 /// Your forwarding connections. Never carries a token or session key.
 #[derive(Serialize, ToSchema)]
@@ -309,11 +323,7 @@ async fn connect_listenbrainz(
     }
     // Validate against ListenBrainz and capture the account name.
     let url = format!("{}/1/validate-token", state.listenbrainz_url.trim_end_matches('/'));
-    let resp = reqwest::Client::new()
-        .get(&url)
-        .header("Authorization", format!("Token {token}"))
-        .send()
-        .await;
+    let resp = http().get(&url).header("Authorization", format!("Token {token}")).send().await;
     let username = match resp {
         Ok(r) if r.status().is_success() => {
             let v: serde_json::Value = r.json().await.unwrap_or_default();
@@ -379,7 +389,7 @@ async fn scrobbler_start(svc: &Scrobbler) -> axum::response::Response {
         crate::sinks::LASTFM_API_KEY,
         sig,
     );
-    let resp = reqwest::Client::new().get(&url).send().await;
+    let resp = http().get(&url).send().await;
     let token = match resp {
         Ok(r) => {
             let v: serde_json::Value = r.json().await.unwrap_or_default();
@@ -430,7 +440,7 @@ async fn scrobbler_complete(
         token,
         sig,
     );
-    let resp = reqwest::Client::new().get(&url).send().await;
+    let resp = http().get(&url).send().await;
     let (session_key, username) = match resp {
         Ok(r) => {
             let v: serde_json::Value = r.json().await.unwrap_or_default();

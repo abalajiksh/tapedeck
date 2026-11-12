@@ -72,7 +72,9 @@ impl DeezerProvider {
                 .timeout(Duration::from_secs(10))
                 .user_agent(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")))
                 .build()
-                .unwrap_or_else(|_| Client::new()),
+                // Fails only where Client::new() would panic too (no TLS backend);
+                // falling back to it would quietly drop the timeout.
+                .expect("reqwest client"),
         }
     }
 
