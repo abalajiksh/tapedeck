@@ -679,7 +679,11 @@ async fn get_settings(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {
-    let prefs = state.db.get_preferences(user.user_id).await.unwrap_or_default();
+    // The settings are the answer: unread, the defaults would be shown as yours.
+    let prefs = match state.db.get_preferences(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("your radio settings", &e).into_response(),
+    };
     Json(RadioSettings::from_prefs(&prefs)).into_response()
 }
 

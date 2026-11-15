@@ -4,6 +4,7 @@
 //! anything belonging to a user, and it makes outbound requests to a third
 //! party — neither is a decision an ordinary account should be making.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -537,7 +538,11 @@ pub async fn genre_map(
         );
     }
 
-    let counts = state.db.genre_play_counts(user.user_id, None).await.unwrap_or_default();
+    // Your genres are the map's point: unread, it would plot nobody.
+    let counts = match state.db.genre_play_counts(user.user_id, None).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("your genres", &e).into_response(),
+    };
     let names: Vec<String> = counts.iter().map(|(n, _)| n.clone()).collect();
     let coords = match state.everynoise.coordinates_for(&names).await {
         Ok(c) => c,
@@ -575,8 +580,12 @@ pub async fn genre_map(
     let placed = weighted.len();
 
     let (w, h) = state.everynoise.extent().await.unwrap_or((1500.0, 22648.0));
-    let (with_genres, total) =
-        state.db.genre_backfill_progress(user.user_id).await.unwrap_or((0, 0));
+    let (with_genres, total) = state
+        .db
+        .genre_backfill_progress(user.user_id)
+        .await
+        .or_warn("genre_map: genre_backfill_progress")
+        .unwrap_or((0, 0));
 
     (
         StatusCode::OK,
@@ -739,6 +748,7 @@ pub async fn genre_trajectory(
         .db
         .listens_by_period(user.user_id, offset_hours, fmt)
         .await
+        .or_warn("genre_trajectory: listens_by_period")
         .unwrap_or_default()
         .into_iter()
         .map(|(y, listens, enriched)| (y, (listens, enriched)))
@@ -953,7 +963,11 @@ pub async fn genre_neighbours(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {
-    let counts = state.db.genre_play_counts(user.user_id, None).await.unwrap_or_default();
+    // Unread, this would be the empty answer below: "no genres yet".
+    let counts = match state.db.genre_play_counts(user.user_id, None).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("your genres", &e).into_response(),
+    };
     if counts.is_empty() {
         // The full shape, empty. This used to be `{nearby, opposite}` — a key
         // the real answer has never had — so the map page read
@@ -1000,7 +1014,12 @@ pub async fn genre_neighbours(
     // in this response may come from.
     let mut mine_by_genre: std::collections::HashMap<String, Vec<(String, i64)>> =
         Default::default();
-    for (genre, artist, plays) in state.db.artists_by_genre(user.user_id).await.unwrap_or_default()
+    for (genre, artist, plays) in state
+        .db
+        .artists_by_genre(user.user_id)
+        .await
+        .or_warn("genre_neighbours: artists_by_genre")
+        .unwrap_or_default()
     {
         mine_by_genre
             .entry(crate::everynoise::store::genre_key(&genre))

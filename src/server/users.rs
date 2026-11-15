@@ -1,3 +1,4 @@
+use crate::logging::OrWarn;
 use axum::{
     extract::{ConnectInfo, Multipart, Path, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
@@ -110,13 +111,19 @@ async fn auth_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
     //
     // Same family as the fidelity cards — "we could not measure" rendered as a
     // measurement — except this one says it about the whole instance.
-    let needs_setup = state.db.needs_setup().await.unwrap_or(false);
+    let needs_setup =
+        state.db.needs_setup().await.or_warn("auth_status: needs_setup").unwrap_or(false);
 
     let session_user = if let Some(session_token) =
         headers.get("cookie").and_then(|v| v.to_str().ok()).and_then(|c| {
             c.split(';').find_map(|s| s.trim().strip_prefix("td_session=").map(|v| v.to_string()))
         }) {
-        state.db.validate_session(&session_token).await.ok().flatten()
+        state
+            .db
+            .validate_session(&session_token)
+            .await
+            .or_warn("auth_status: validate_session")
+            .flatten()
     } else {
         None
     };
@@ -660,8 +667,13 @@ async fn update_user(
         Err(e) => return failed(e.to_string()),
     };
     let target_is_active_admin = target_role == "admin" && !target_disabled;
-    let is_last_admin =
-        target_is_active_admin && state.db.count_active_admins().await.unwrap_or(0) <= 1;
+    // Counted only when it matters, and a count that failed is not "one": it
+    // used to refuse with "the last admin" when nobody knew.
+    let is_last_admin = target_is_active_admin
+        && match state.db.count_active_admins().await {
+            Ok(n) => n <= 1,
+            Err(e) => return super::read_failed("the admin count", &e).into_response(),
+        };
 
     // **Every check before any write.** The writes below are three separate
     // statements, and a refusal after the first of them used to leave it in
@@ -746,14 +758,19 @@ async fn delete_user(
             .into_response();
     }
     // Guard against removing the last admin who can still log in.
-    let (role, disabled) = state
-        .db
-        .get_user_role_disabled(id)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| ("user".into(), false));
-    if role == "admin" && !disabled && state.db.count_active_admins().await.unwrap_or(0) <= 1 {
+    // A role that could not be read is not an ordinary user's: defaulting to
+    // one let a failed read wave the last admin through.
+    let (role, disabled) = match state.db.get_user_role_disabled(id).await {
+        Ok(found) => found.unwrap_or_else(|| ("user".into(), false)),
+        Err(e) => return super::read_failed("that account", &e).into_response(),
+    };
+    let last_admin = role == "admin"
+        && !disabled
+        && match state.db.count_active_admins().await {
+            Ok(n) => n <= 1,
+            Err(e) => return super::read_failed("the admin count", &e).into_response(),
+        };
+    if last_admin {
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse { code: 400, error: "Cannot delete the last admin".into() }),
@@ -1601,8 +1618,13 @@ async fn upload_avatar(
 
     // The one it replaces, so a user swapping their picture ten times leaves
     // one file rather than ten.
-    let previous =
-        state.db.get_profile(user.user_id).await.ok().flatten().and_then(|p| p.avatar_url);
+    let previous = state
+        .db
+        .get_profile(user.user_id)
+        .await
+        .or_warn("upload_avatar: get_profile")
+        .flatten()
+        .and_then(|p| p.avatar_url);
 
     if let Err(e) = state.db.update_profile(user.user_id, None, None, Some(Some(rel))).await {
         return bad(StatusCode::INTERNAL_SERVER_ERROR, &format!("Could not save: {e}"));
@@ -1649,7 +1671,10 @@ async fn serve_avatar(
     State(state): State<Arc<AppState>>,
     ReadAuth { user }: ReadAuth,
 ) -> impl IntoResponse {
-    let stored = state.db.get_profile(user.user_id).await.ok().flatten().and_then(|p| p.avatar_url);
+    let stored = match state.db.get_profile(user.user_id).await {
+        Ok(p) => p.and_then(|p| p.avatar_url),
+        Err(e) => return super::read_failed("your profile", &e).into_response(),
+    };
     let Some(rel) = stored.filter(|s| !s.starts_with("http")) else {
         return (
             StatusCode::NOT_FOUND,
@@ -1692,8 +1717,13 @@ async fn serve_avatar(
     )
 )]
 async fn delete_avatar(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
-    let previous =
-        state.db.get_profile(user.user_id).await.ok().flatten().and_then(|p| p.avatar_url);
+    let previous = state
+        .db
+        .get_profile(user.user_id)
+        .await
+        .or_warn("delete_avatar: get_profile")
+        .flatten()
+        .and_then(|p| p.avatar_url);
     if let Err(e) = state.db.update_profile(user.user_id, None, None, Some(None)).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

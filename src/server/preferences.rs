@@ -1,3 +1,4 @@
+use crate::logging::OrWarn;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -205,7 +206,12 @@ async fn put_preferences(
             )
                 .into_response();
         }
-        let current = state.db.credit_primary(user.user_id).await.unwrap_or_default();
+        let current = state
+            .db
+            .credit_primary(user.user_id)
+            .await
+            .or_warn("put_preferences: credit_primary")
+            .unwrap_or_default();
         if current != v {
             if let Err(e) = state.db.set_credit_primary(user.user_id, v).await {
                 return (

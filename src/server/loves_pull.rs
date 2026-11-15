@@ -333,7 +333,11 @@ async fn store_love(
     )
 )]
 async fn pull_loves(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
-    let conns = state.db.list_connections(user.user_id).await.unwrap_or_default();
+    // Unread, this would report that there is nothing to pull from.
+    let conns = match state.db.list_connections(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("your connections", &e).into_response(),
+    };
     let mut reports: Vec<PullReport> = Vec::new();
 
     for (service, username, _) in conns {

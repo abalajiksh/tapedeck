@@ -25,6 +25,7 @@
 pub mod icy;
 pub mod machine;
 
+use crate::logging::OrWarn;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -394,7 +395,12 @@ pub async fn tune_in(
 
     stop(state, user_id, "retuned").await;
 
-    let prefs = state.db.get_preferences(user_id).await.unwrap_or_default();
+    let prefs = state
+        .db
+        .get_preferences(user_id)
+        .await
+        .or_warn("tune_in: get_preferences")
+        .unwrap_or_default();
     let settings = RadioSettings::from_prefs(&prefs);
     let mut chain_id = None;
     let mut chain_name = None;
@@ -504,7 +510,12 @@ async fn settle(
     natural_end: bool,
 ) {
     let Some(heard) = &track.payload else { return };
-    let prefs = state.db.get_preferences(user_id).await.unwrap_or_default();
+    let prefs = state
+        .db
+        .get_preferences(user_id)
+        .await
+        .or_warn("settle: get_preferences")
+        .unwrap_or_default();
     let threshold = ScrobbleThreshold::from_prefs(&prefs);
     let kind = if heard.tagged { "track" } else { "guess" };
     let mbid = heard.play.mbid_recording.clone();
@@ -916,21 +927,25 @@ pub async fn keep(
     user_id: i64,
     id: i64,
 ) -> Result<crate::db::AirLogEntry, TuneError> {
-    let line = state
-        .db
-        .air_line(user_id, id)
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| TuneError(404, "No such line".into()))?;
+    let line = read_air_line(state, user_id, id).await?;
     if !matches!(line.status.as_str(), "review" | "held") {
         return Err(TuneError(409, format!("That line is already {}", line.status)));
     }
     let (Some(artist), Some(title)) = (line.artist.clone(), line.title.clone()) else {
         return Err(TuneError(409, "Only a line naming a track can be kept".into()));
     };
-    let session = state.db.radio_session(user_id, line.session_id).await.ok().flatten();
-    let prefs = state.db.get_preferences(user_id).await.unwrap_or_default();
+    let session = state
+        .db
+        .radio_session(user_id, line.session_id)
+        .await
+        .or_warn("keep: radio_session")
+        .flatten();
+    let prefs = state
+        .db
+        .get_preferences(user_id)
+        .await
+        .or_warn("keep: get_preferences")
+        .unwrap_or_default();
     let settings = RadioSettings::from_prefs(&prefs);
     let mut play = Play::new(
         title,
@@ -963,13 +978,24 @@ pub async fn keep(
             "Already in your history — the same track from another source".into(),
         ));
     }
-    state
-        .db
-        .air_line(user_id, id)
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| TuneError(404, "No such line".into()))
+    read_air_line(state, user_id, id).await
+}
+
+/// One line of the air log: 404 when there is no such line, 500 (logged) when
+/// it could not be read — never "no such line" for a line that is there.
+async fn read_air_line(
+    state: &Arc<AppState>,
+    user_id: i64,
+    id: i64,
+) -> Result<crate::db::AirLogEntry, TuneError> {
+    match state.db.air_line(user_id, id).await {
+        Ok(Some(line)) => Ok(line),
+        Ok(None) => Err(TuneError(404, "No such line".into())),
+        Err(e) => {
+            warn!("could not read air line {id}: {}", crate::logging::error_chain(&e));
+            Err(TuneError(500, "Could not read that line".into()))
+        }
+    }
 }
 
 /// Drop a line from the review queue. It stays in the log, marked dropped.
@@ -978,13 +1004,7 @@ pub async fn drop_line(
     user_id: i64,
     id: i64,
 ) -> Result<crate::db::AirLogEntry, TuneError> {
-    let line = state
-        .db
-        .air_line(user_id, id)
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| TuneError(404, "No such line".into()))?;
+    let line = read_air_line(state, user_id, id).await?;
     if !matches!(line.status.as_str(), "review" | "held") {
         return Err(TuneError(409, format!("That line is already {}", line.status)));
     }
@@ -993,13 +1013,7 @@ pub async fn drop_line(
         .settle_air_line(user_id, id, &line.kind, "dropped", None, None, None)
         .await
         .map_err(|e| TuneError(500, e.to_string()))?;
-    state
-        .db
-        .air_line(user_id, id)
-        .await
-        .ok()
-        .flatten()
-        .ok_or_else(|| TuneError(404, "No such line".into()))
+    read_air_line(state, user_id, id).await
 }
 
 #[cfg(test)]

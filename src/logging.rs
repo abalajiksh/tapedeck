@@ -159,6 +159,37 @@ pub fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     out
 }
 
+/// A read that is one optional part of a larger answer, such as the trend on
+/// an artist page or the loved flag beside a note.
+///
+/// `Ok(v)` becomes `Some(v)`. An error is logged at WARN, with its cause chain
+/// and `what` naming the part that failed, and becomes `None`, so the caller
+/// still decides what the missing part looks like (`.unwrap_or_default()`,
+/// `.flatten()`, …) while the failure is no longer silent.
+//
+// Since 2026-11-15. 147 handler reads turned an error into an empty section
+// with nothing logged (`.await.unwrap_or_default()` and friends), which is how
+// artist_trend's SQLite-only `strftime` showed every Postgres user an artist
+// page with no trend and no trace of why. A read the response is *about*
+// should answer 500 instead (`server::read_failed`); this is only for the
+// parts a page can honestly do without. Opengrep's
+// `db-read-error-becomes-empty` rule keeps the bare forms out.
+pub trait OrWarn<T> {
+    fn or_warn(self, what: &str) -> Option<T>;
+}
+
+impl<T, E: std::error::Error + 'static> OrWarn<T> for Result<T, E> {
+    fn or_warn(self, what: &str) -> Option<T> {
+        match self {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("{what}: {}", error_chain(&e));
+                None
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +228,17 @@ mod tests {
     fn a_repeated_cause_is_not_restated() {
         let e = Layer("connect error", Some(Box::new(Layer("connect error", None))));
         assert_eq!(error_chain(&e), "connect error");
+    }
+
+    /// `or_warn` keeps the caller's own absence (`Ok(None)` stays `Some(None)`)
+    /// apart from a failure, which is the whole point of not using `.ok()`.
+    #[test]
+    fn or_warn_keeps_an_absence_apart_from_a_failure() {
+        let found: Result<Option<i64>, Layer> = Ok(Some(3));
+        let absent: Result<Option<i64>, Layer> = Ok(None);
+        let failed: Result<Option<i64>, Layer> = Err(Layer("pool timed out", None));
+        assert_eq!(found.or_warn("t"), Some(Some(3)));
+        assert_eq!(absent.or_warn("t"), Some(None));
+        assert_eq!(failed.or_warn("t"), None);
     }
 }

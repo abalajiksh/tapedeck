@@ -9,6 +9,7 @@
 //! of them at once; the one exception is the per-gear list, which needs to be
 //! told which piece of gear.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -300,7 +301,12 @@ pub async fn rediscover(
     let featured = collections.iter().filter(|c| c.count > 0).max_by_key(|c| c.count).cloned();
 
     // Gear the page offers for the per-gear list, so it needs no second trip.
-    let gear = state.db.get_equipment(user.user_id).await.unwrap_or_default();
+    let gear = state
+        .db
+        .get_equipment(user.user_id)
+        .await
+        .or_warn("rediscover: get_equipment")
+        .unwrap_or_default();
     let gear_json: Vec<GearChoice> = gear
         .iter()
         .map(|g| GearChoice { id: g.id, name: g.name.clone(), kind: g.equipment_type.clone() })

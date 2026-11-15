@@ -23,6 +23,7 @@
 //! worse than a clean 404: playlists, `lb-radio`, similar-users/similar-to, and
 //! `search/users` (which would also be a user-enumeration hole here).
 
+use crate::logging::OrWarn;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -329,7 +330,12 @@ async fn user_listens(
         Ok(r) => r,
         Err(e) => return error(500, e.to_string()),
     };
-    let (_, latest) = state.db.listen_count_and_latest(user_id).await.unwrap_or((0, None));
+    let (_, latest) = state
+        .db
+        .listen_count_and_latest(user_id)
+        .await
+        .or_warn("user_listens: listen_count_and_latest")
+        .unwrap_or((0, None));
     let listens: Vec<LbListen> = rows.iter().map(|s| to_lb_listen(s, true)).collect();
 
     (
@@ -528,13 +534,12 @@ async fn get_latest_import(
         Ok(id) => id,
         Err(resp) => return resp,
     };
-    let ts = state
-        .db
-        .get_preferences(user_id)
-        .await
-        .ok()
-        .and_then(|p| p.get("latest_import").and_then(|v| v.as_i64()))
-        .unwrap_or(0);
+    // The timestamp is the answer, and 0 tells an importer to start again from
+    // the beginning of time.
+    let ts = match state.db.get_preferences(user_id).await {
+        Ok(p) => p.get("latest_import").and_then(|v| v.as_i64()).unwrap_or(0),
+        Err(e) => return super::read_failed("the latest import", &e).into_response(),
+    };
     (StatusCode::OK, Json(LbLatestImport { musicbrainz_id: user, latest_import: ts }))
         .into_response()
 }

@@ -25,6 +25,7 @@
 //! quietly expose how much the rest of the household plays. There is no
 //! percentile here and there should not be one.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -757,7 +758,8 @@ pub async fn reports(
     };
     let wanted: Vec<String> = order.iter().skip(offset).take(limit).cloned().collect();
 
-    let chains = state.db.get_chains(user.user_id).await.unwrap_or_default();
+    let chains =
+        state.db.get_chains(user.user_id).await.or_warn("reports: get_chains").unwrap_or_default();
     let chain_name: HashMap<i64, String> =
         chains.iter().filter_map(|c| c.id.map(|id| (id, c.name.clone()))).collect();
     // The chains themselves, for the gear panel — it needs the icon and the
@@ -930,8 +932,12 @@ pub async fn reports(
             }
         };
 
-        let shelf =
-            state.db.physical_plays_in(user.user_id, b.start, b.end + 1).await.unwrap_or_default();
+        let shelf = state
+            .db
+            .physical_plays_in(user.user_id, b.start, b.end + 1)
+            .await
+            .or_warn("reports: physical_plays_in")
+            .unwrap_or_default();
         let sides: i64 = shelf.iter().map(|(_, _, _, n)| *n).sum();
 
         let top_chain = top_by(
@@ -1140,7 +1146,12 @@ pub async fn reports(
     // for a photo that never arrives.
     let top_names: Vec<String> =
         periods.iter().filter_map(|p| p.top_artist.as_ref().map(|a| a.name.clone())).collect();
-    let landscapes = state.db.artist_landscapes(user.user_id, &top_names).await.unwrap_or_default();
+    let landscapes = state
+        .db
+        .artist_landscapes(user.user_id, &top_names)
+        .await
+        .or_warn("reports: artist_landscapes")
+        .unwrap_or_default();
     for p in &mut periods {
         let Some(a) = p.top_artist.as_mut() else {
             continue;

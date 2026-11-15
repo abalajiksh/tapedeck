@@ -15,6 +15,7 @@
 //! no heuristic can re-derive, so `scrobbles.session_id` is the source of truth
 //! and these rewrite it.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -156,7 +157,11 @@ async fn get_session(
         Ok(None) => return err(StatusCode::NOT_FOUND, "Session not found"),
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    let scrobbles = state.db.session_scrobbles(user.user_id, id).await.unwrap_or_default();
+    // A session shown with no listens would be a different session.
+    let scrobbles = match state.db.session_scrobbles(user.user_id, id).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("that session's listens", &e).into_response(),
+    };
     (StatusCode::OK, Json(SessionDetail { session, scrobbles })).into_response()
 }
 
@@ -238,8 +243,18 @@ async fn split(
             "Nothing to split there — that listen isn't in this session, or it's already the first",
         ),
         Ok(Some(new_id)) => {
-            let new = state.db.get_session(user.user_id, new_id).await.ok().flatten();
-            let old = state.db.get_session(user.user_id, id).await.ok().flatten();
+            let new = state
+                .db
+                .get_session(user.user_id, new_id)
+                .await
+                .or_warn("split: get_session")
+                .flatten();
+            let old = state
+                .db
+                .get_session(user.user_id, id)
+                .await
+                .or_warn("split: get_session")
+                .flatten();
             (StatusCode::OK, Json(SplitSessions { session: old, new_session: new })).into_response()
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
@@ -311,8 +326,10 @@ async fn update_session(
     Path(id): Path<i64>,
     Json(body): Json<UpdateSession>,
 ) -> impl IntoResponse {
-    if state.db.get_session(user.user_id, id).await.ok().flatten().is_none() {
-        return err(StatusCode::NOT_FOUND, "Session not found");
+    match state.db.get_session(user.user_id, id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return err(StatusCode::NOT_FOUND, "Session not found"),
+        Err(e) => return super::read_failed("that session", &e).into_response(),
     }
 
     if let Some(chain) = body.chain_id {

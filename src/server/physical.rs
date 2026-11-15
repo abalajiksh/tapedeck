@@ -12,6 +12,7 @@
 //! deliberately separate: a listen is about the music, this is about the object
 //! and the equipment wearing out.
 
+use crate::logging::OrWarn;
 use axum::{
     body::Body,
     extract::{Multipart, Path, Query, State},
@@ -378,8 +379,18 @@ async fn discogs_auth(state: &AppState) -> Option<release_lookup::DiscogsAuth> {
             return Some(release_lookup::DiscogsAuth::Token(t.trim().to_string()));
         }
     }
-    let stored_key = state.db.get_app_setting(DISCOGS_KEY_KEY).await.ok().flatten();
-    let stored_secret = state.db.get_app_setting(DISCOGS_SECRET_KEY).await.ok().flatten();
+    let stored_key = state
+        .db
+        .get_app_setting(DISCOGS_KEY_KEY)
+        .await
+        .or_warn("discogs_auth: get_app_setting")
+        .flatten();
+    let stored_secret = state
+        .db
+        .get_app_setting(DISCOGS_SECRET_KEY)
+        .await
+        .or_warn("discogs_auth: get_app_setting")
+        .flatten();
     if let (Some(k), Some(s)) = (&stored_key, &stored_secret) {
         if !k.trim().is_empty() && !s.trim().is_empty() {
             return Some(release_lookup::DiscogsAuth::KeySecret {
@@ -3040,19 +3051,16 @@ async fn get_discogs(State(state): State<Arc<AppState>>, user: AuthUser) -> impl
         env_nonempty("TAPEDECK_DISCOGS_SECRET").or_else(|| env_nonempty("Consumer_Secret"));
     let pair_env = key_env.is_some() && secret_env.is_some();
 
-    let stored_token = state
-        .db
-        .get_app_setting(DISCOGS_TOKEN_KEY)
-        .await
-        .unwrap_or(None)
-        .is_some_and(|t| !t.trim().is_empty());
-    let stored_pair = matches!(
-        (
-            state.db.get_app_setting(DISCOGS_KEY_KEY).await.unwrap_or(None),
-            state.db.get_app_setting(DISCOGS_SECRET_KEY).await.unwrap_or(None)
-        ),
-        (Some(k), Some(s)) if !k.trim().is_empty() && !s.trim().is_empty()
-    );
+    // What is stored is the answer: unread, it would say "not configured".
+    let mut stored_settings = Vec::with_capacity(3);
+    for key in [DISCOGS_TOKEN_KEY, DISCOGS_KEY_KEY, DISCOGS_SECRET_KEY] {
+        match state.db.get_app_setting(key).await {
+            Ok(v) => stored_settings.push(v.filter(|v| !v.trim().is_empty())),
+            Err(e) => return super::read_failed("the Discogs settings", &e).into_response(),
+        }
+    }
+    let stored_token = stored_settings[0].is_some();
+    let stored_pair = stored_settings[1].is_some() && stored_settings[2].is_some();
 
     let from_env = token_env || pair_env;
     let stored = stored_token || stored_pair;
@@ -3346,8 +3354,16 @@ async fn import_shelf(
         }
     }
 
-    let gear = state.db.get_equipment(user.user_id).await.unwrap_or_default();
-    let chains = state.db.get_chains(user.user_id).await.unwrap_or_default();
+    // Unread, every gear and chain name in the archive would be dropped and
+    // every release restored as new beside the one already on the shelf.
+    let gear = match state.db.get_equipment(user.user_id).await {
+        Ok(g) => g,
+        Err(e) => return super::read_failed("your gear", &e).into_response(),
+    };
+    let chains = match state.db.get_chains(user.user_id).await {
+        Ok(c) => c,
+        Err(e) => return super::read_failed("your signal chains", &e).into_response(),
+    };
     // Chains are **matched, never created** — the same rule `[[gear:…]]`
     // follows. A chain is something you build step by step; conjuring an empty
     // one from a name in a file would produce a chain with no components that
@@ -3359,7 +3375,10 @@ async fn import_shelf(
         n.and_then(|n| gear.iter().find(|g| g.name.eq_ignore_ascii_case(n))).map(|g| g.id)
     };
 
-    let existing = state.db.list_physical(user.user_id, None).await.unwrap_or_default();
+    let existing = match state.db.list_physical(user.user_id, None).await {
+        Ok(r) => r,
+        Err(e) => return super::read_failed("your shelf", &e).into_response(),
+    };
 
     for entry in &shelf {
         let (Some(artist), Some(title), Some(kind)) = (
@@ -3880,6 +3899,7 @@ async fn import_dvinyl(
             .db
             .has_recommendation(user.user_id, "album", &w.artist, Some(&w.title))
             .await
+            .or_warn("import_dvinyl: has_recommendation")
             .unwrap_or(false);
         if held {
             out.wants_already_in_the_crate += 1;
@@ -3996,7 +4016,12 @@ async fn restore_plays<R: std::io::Read + std::io::Seek>(
         return 0;
     }
 
-    let existing = state.db.plays_for_release(user_id, release_id).await.unwrap_or_default();
+    let existing = state
+        .db
+        .plays_for_release(user_id, release_id)
+        .await
+        .or_warn("restore_plays: plays_for_release")
+        .unwrap_or_default();
     let mut written = 0;
     for line in text.lines().skip(1) {
         let cols = parse_csv_row(line);
@@ -4024,13 +4049,22 @@ async fn restore_plays<R: std::io::Read + std::io::Seek>(
         let deck = cols.get(7).filter(|v| !v.is_empty());
         let chain = cols.get(8).filter(|v| !v.is_empty());
         let gear_id = match deck {
-            Some(n) => {
-                state.db.find_equipment_by_name(user_id, n).await.unwrap_or(None).map(|(id, _)| id)
-            }
+            Some(n) => state
+                .db
+                .find_equipment_by_name(user_id, n)
+                .await
+                .or_warn("restore_plays: find_equipment_by_name")
+                .flatten()
+                .map(|(id, _)| id),
             None => None,
         };
         let chain_id = match chain {
-            Some(n) => state.db.get_chain_by_name(user_id, n).await.unwrap_or(None),
+            Some(n) => state
+                .db
+                .get_chain_by_name(user_id, n)
+                .await
+                .or_warn("restore_plays: get_chain_by_name")
+                .flatten(),
             None => None,
         };
         if state
@@ -4106,10 +4140,24 @@ async fn export_shelf(State(state): State<Arc<AppState>>, user: AuthUser) -> imp
         Ok(r) => r,
         Err(e) => return err(500, e.to_string()),
     };
-    let images = state.db.all_physical_images(uid).await.unwrap_or_default();
-    let plays = state.db.all_physical_plays(uid).await.unwrap_or_default();
-    let gear = state.db.get_equipment(uid).await.unwrap_or_default();
-    let chains = state.db.get_chains(uid).await.unwrap_or_default();
+    // An archive missing a part it claims to hold is a backup that fails the
+    // day it is needed: every part is read, or there is no archive.
+    let images = match state.db.all_physical_images(uid).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("the shelf's pictures", &e).into_response(),
+    };
+    let plays = match state.db.all_physical_plays(uid).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("the shelf's plays", &e).into_response(),
+    };
+    let gear = match state.db.get_equipment(uid).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("your gear", &e).into_response(),
+    };
+    let chains = match state.db.get_chains(uid).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("your signal chains", &e).into_response(),
+    };
 
     let mut buf = std::io::Cursor::new(Vec::new());
     {

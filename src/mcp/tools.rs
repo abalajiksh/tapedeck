@@ -24,6 +24,7 @@
 //! conclude things about the 21,190 it did not see — which is the same failure
 //! as a share without its population, one level up.
 
+use crate::logging::OrWarn;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -1070,8 +1071,14 @@ async fn profile(state: &Arc<AppState>, auth: &McpAuth) -> Result<ToolOutcome, T
         .listening_coverage(uid)
         .await
         .map_err(|e| ToolFailure::Execution(e.to_string()))?;
-    let (artists_total, artists_tagged) = state.db.genre_coverage(uid).await.unwrap_or((0, 0));
-    let sources = state.db.source_breakdown(uid).await.unwrap_or_default();
+    let (artists_total, artists_tagged) =
+        state.db.genre_coverage(uid).await.or_warn("profile: genre_coverage").unwrap_or((0, 0));
+    let sources = state
+        .db
+        .source_breakdown(uid)
+        .await
+        .or_warn("profile: source_breakdown")
+        .unwrap_or_default();
     let tz = crate::server::scrobbles::user_tz_for(state, uid).await;
 
     // A share of zero listens is not zero, it is unanswerable — and `0%`
@@ -1189,7 +1196,7 @@ async fn save_playlist(
         .db
         .list_mcp_connections(auth.user.user_id)
         .await
-        .ok()
+        .or_warn("save_playlist: list_mcp_connections")
         .and_then(|c| c.into_iter().find(|c| c.id == auth.connection_id).map(|c| c.name))
         .unwrap_or_else(|| "MCP".to_string());
 
@@ -1314,7 +1321,7 @@ async fn add_to_crate(
         .db
         .list_mcp_connections(auth.user.user_id)
         .await
-        .ok()
+        .or_warn("add_to_crate: list_mcp_connections")
         .and_then(|c| c.into_iter().find(|c| c.id == auth.connection_id).map(|c| c.name))
         .unwrap_or_else(|| "MCP".to_string());
 

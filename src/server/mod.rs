@@ -53,6 +53,31 @@ use crate::logging::LogLevelHandle;
 use crate::musicbrainz::MusicBrainzClient;
 use crate::web_assets;
 
+/// A read the response depends on failed: log it at WARN with its cause
+/// chain and answer 500.
+///
+/// `what` names the thing that could not be read ("that artist", "your
+/// sessions"); the client gets "Could not read <what>", the log gets the
+/// database's own words.
+//
+// Never answer an empty list or a 404 for a read that failed (v0.81.0): the
+// person then believes the data is gone. For a read that is only one part of
+// a composite page, use `crate::logging::OrWarn` and keep the rest.
+pub(crate) fn read_failed(
+    what: &str,
+    e: &(dyn std::error::Error + 'static),
+) -> (axum::http::StatusCode, axum::Json<models::ErrorResponse>) {
+    tracing::warn!("could not read {what}: {}", crate::logging::error_chain(e));
+    let status = axum::http::StatusCode::INTERNAL_SERVER_ERROR;
+    (
+        status,
+        axum::Json(models::ErrorResponse {
+            code: status.as_u16(),
+            error: format!("Could not read {what}"),
+        }),
+    )
+}
+
 /// Shared application state available to all request handlers.
 pub struct AppState {
     pub db: Arc<Database>,

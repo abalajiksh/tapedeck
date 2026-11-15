@@ -15,6 +15,7 @@
 //! are pure. What is here is the impure half: resolving a key over the network,
 //! the cache in front of that, and the shapes of the four responses.
 
+use crate::logging::OrWarn;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
@@ -659,7 +660,7 @@ async fn request(
                         .db
                         .patches_out(user.user_id)
                         .await
-                        .ok()
+                        .or_warn("request: patches_out")
                         .and_then(|v| v.into_iter().find(|p| p.user_id == target))
                         .and_then(|p| p.state)
                         .unwrap_or_else(|| "pending".into()),
@@ -2998,10 +2999,18 @@ async fn get_federation(
     headers: HeaderMap,
 ) -> Response {
     let origin = public_origin(&state, &headers);
-    let on = state.db.discoverable_user_id(&user.username).await.ok().flatten().is_some();
+    // The switch is the answer: unread, it would show "off" for an account
+    // other servers can see, and turning it "on" again would mint nothing new.
+    let on = match state.db.discoverable_user_id(&user.username).await {
+        Ok(id) => id.is_some(),
+        Err(e) => return super::read_failed("your federation switch", &e).into_response(),
+    };
     // Deliberately does **not** mint a keypair: looking at a settings page is
     // not a decision to federate.
-    let actor = state.db.stored_actor(user.user_id).await.ok().flatten();
+    let actor = match state.db.stored_actor(user.user_id).await {
+        Ok(a) => a,
+        Err(e) => return super::read_failed("your federated identity", &e).into_response(),
+    };
     (StatusCode::OK, Json(federation_body(actor.as_ref(), &user.username, &origin, on)))
         .into_response()
 }
@@ -3204,7 +3213,7 @@ async fn put_federation(
         }
     } else {
         info!("📡 {} is no longer discoverable", user.username);
-        state.db.stored_actor(user.user_id).await.ok().flatten()
+        state.db.stored_actor(user.user_id).await.or_warn("put_federation: stored_actor").flatten()
     };
 
     (StatusCode::OK, Json(federation_body(actor.as_ref(), &user.username, &origin, enabled)))
@@ -3762,7 +3771,12 @@ fn as_uri(v: &Value) -> Option<String> {
 /// One helper for all four endpoints, so the discoverability rule is applied in
 /// one place rather than remembered four times.
 async fn resolve_local(state: &Arc<AppState>, name: &str, headers: &HeaderMap) -> Option<Actor> {
-    let user_id = state.db.discoverable_user_id(name).await.ok().flatten()?;
+    let user_id = state
+        .db
+        .discoverable_user_id(name)
+        .await
+        .or_warn("resolve_local: discoverable_user_id")
+        .flatten()?;
     let origin = public_origin(state, headers);
 
     match state.db.actor_for_user(user_id, &origin).await {
@@ -3824,7 +3838,7 @@ async fn resolve_remote_actor(
         .db
         .upsert_remote_actor(uri, handle.as_deref(), name, &inbox, shared.as_deref(), key, icon)
         .await
-        .ok()
+        .or_warn("resolve_remote_actor: upsert_remote_actor")
 }
 
 fn host_of(url: &str) -> Option<String> {

@@ -31,6 +31,7 @@
 //!   or suffix match is an open redirect, which here means handing somebody
 //!   else's page an authorization code for this user's listening.
 
+use crate::logging::OrWarn;
 use std::sync::Arc;
 
 use axum::{
@@ -817,7 +818,7 @@ async fn exchange_code(state: &Arc<AppState>, body: &TokenRequest) -> Response {
         .db
         .get_oauth_client(&stored.client_id)
         .await
-        .ok()
+        .or_warn("exchange_code: get_oauth_client")
         .flatten()
         .map(|c| c.client_name)
         .unwrap_or_else(|| "AI assistant".into());

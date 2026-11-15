@@ -98,6 +98,10 @@ async fn handler(state: State<Arc<AppState>>, uid: i64) {
         Ok(t) => t,
         Err(e) => return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that"),
     };
+    // ok: db-read-error-becomes-empty
+    let loved = state.db.is_loved(uid, id).await.or_warn("artist page: loved").unwrap_or(false);
+    // ok: db-read-error-becomes-empty
+    let entity = state.db.get_entity(id).await.or_warn("note: entity").flatten();
 }
 
 fn logging() {
