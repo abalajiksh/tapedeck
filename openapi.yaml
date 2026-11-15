@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.131.1
+  version: 0.131.2
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -11812,9 +11812,9 @@ paths:
         still decides nothing on its own, since every play arrives as a capture
         you have to accept.
 
-        Only plays through the player's **shared** chains are offered, exactly
-        as for a live sitting, and nothing already offered to you in any
-        sitting is offered twice.
+        Every play of the sitting is offered, whatever chain it ran through,
+        exactly as for a live sitting (since 2026-11-11), and nothing already
+        offered to you in any sitting is offered twice.
       operationId: join_spool
       parameters:
       - name: uuid
@@ -11941,10 +11941,11 @@ paths:
         Declined and never-answered are told apart deliberately: both mean "not
         in my history" and they are not the same decision.
 
-        `withheld` counts plays that happened in this sitting and are not shown,
-        because they ran through chains their owner does not share. Stated
-        rather than dropped — a document with invisible holes misrepresents the
-        evening and the reader could never tell.
+        `withheld` counts plays that happened in this sitting and are not shown
+        to you. Since 2026-11-11 everybody in a sitting sees every play of it,
+        whatever chain it ran through, so it is always 0; it stays so a client
+        that reads it keeps working. Stated rather than dropped while it could
+        be non-zero — a document with invisible holes misrepresents the evening.
       operationId: spool_detail
       parameters:
       - name: uuid
@@ -12209,6 +12210,46 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '404':
           description: No sitting of yours with that id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - sessionCookie: []
+  /api/v1/patch/spools/{uuid}/reoffer:
+    post:
+      tags:
+      - Patch
+      summary: Hand a sitting over again, to everybody who was in the room.
+      description: |-
+        Offers each person in the sitting every play of it they were present
+        for and have **not already been offered** — waiting, accepted or
+        declined — whatever chain it ran through. Pressing it twice offers
+        nothing the second time, and a decline stays a decline.
+
+        For a sitting that handed over less than it should have: before
+        2026-11-11 only plays through a shared chain were offered.
+
+        Anybody who was in the room may ask, not only the host. Nothing enters
+        a history here: every play arrives as a capture to accept or decline.
+      operationId: reoffer_spool
+      parameters:
+      - name: uuid
+        in: path
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Where the plays went.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpoolReoffered'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: No sitting you were in with that id.
           content:
             application/json:
               schema:
@@ -23724,6 +23765,19 @@ components:
             `copies` from the preview. **Required** — this deletes listens, so
             an empty body is refused rather than read as "all of them".
           minimum: 0
+    ReofferedTo:
+      type: object
+      required:
+      - deck
+      - offered
+      properties:
+        deck:
+          type: string
+          description: Their display name, or username when they have none.
+        offered:
+          type: integer
+          format: int64
+          description: Plays newly waiting on them. 0 when they already had everything.
     ReportGraphs:
       type: object
       description: The graphs drawn under one report chapter.
@@ -27158,6 +27212,22 @@ components:
           - integer
           - 'null'
           format: int64
+    SpoolReoffered:
+      type: object
+      description: Where a re-offered sitting's plays went.
+      required:
+      - offered
+      - decks
+      properties:
+        offered:
+          type: integer
+          format: int64
+          description: Plays put in somebody's inbox, across everybody in the room.
+        decks:
+          type: array
+          items:
+            $ref: '#/components/schemas/ReofferedTo'
+          description: One entry per person who was in the room, in username order.
     SpoolStarted:
       type: object
       required:

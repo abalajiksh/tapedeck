@@ -221,6 +221,36 @@
 
 	$: me = (sitting?.members ?? []).find((m) => m.user_id === sitting?.viewer_id);
 	$: arrivedLate = !!me?.present_from && !!sitting && me.present_from > sitting.started_at;
+
+	// ── Handing it over again ────────────────────────────────────────────
+	//
+	// Until 2026-11-11 a sitting offered only plays through a shared chain, and
+	// the rule's reversal reached only plays from then on — nothing re-asked
+	// for an evening somebody had already joined. Those plays show here as
+	// "not offered". Anybody who was in the room may hand the evening over
+	// again: it offers each person only what they have never been offered, so
+	// a second press does nothing and a decline stays a decline.
+	$: notOffered = (sitting?.plays ?? []).filter((p) => p.standing === 'theirs').length;
+	$: inTheRoom = me?.state === 'joined' || me?.state === 'left';
+
+	async function handOverAgain() {
+		if (!sitting) return;
+		busy = 'reoffer';
+		try {
+			const r = await api.reofferSpool(sitting.uuid);
+			const went = r.decks.filter((d) => d.offered > 0);
+			notice = r.offered
+				? `Offered again: ${went
+						.map((d) => `${d.offered} to ${d.deck}`)
+						.join(', ')}. Nothing is kept until it is accepted.`
+				: 'Nothing new to offer — everybody already had everything they were here for.';
+			await load();
+		} catch (e) {
+			error = humanError(e);
+		} finally {
+			busy = '';
+		}
+	}
 </script>
 
 <svelte:head>
@@ -338,6 +368,17 @@
 				</div>
 			{/if}
 		</div>
+
+		{#if notOffered && inTheRoom}
+			<p class="hint">
+				{notOffered}
+				{notOffered === 1 ? 'play' : 'plays'} here never reached you — before 11 November a sitting
+				handed over only plays through a shared chain.
+				<button class="link" on:click={handOverAgain} disabled={busy === 'reoffer'}>
+					Hand the evening over again
+				</button>
+			</p>
+		{/if}
 
 		{#if sitting.plays.length}
 			<div class="tl">

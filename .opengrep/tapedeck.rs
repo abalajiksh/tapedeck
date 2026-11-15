@@ -86,6 +86,20 @@ async fn counting(db: &Db) {
     let mut out = Vec::with_capacity(found.len());
 }
 
+async fn handler(state: State<Arc<AppState>>, uid: i64) {
+    // ruleid: db-read-error-becomes-empty
+    let trend = state.db.artist_trend(uid, &name, tz).await.unwrap_or_default();
+    // ruleid: db-read-error-becomes-empty
+    let total = state.db.total_plays(uid).await.unwrap_or(0);
+    // ruleid: db-read-error-becomes-empty
+    let prefs = state.db.get_preferences(uid).await.ok();
+    // ok: db-read-error-becomes-empty
+    let trend = match state.db.artist_trend(uid, &name, tz).await {
+        Ok(t) => t,
+        Err(e) => return refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not read that"),
+    };
+}
+
 fn logging() {
     // ruleid: log-crate-not-tracing
     log::info!("hi");

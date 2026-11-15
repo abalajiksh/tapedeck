@@ -142,6 +142,24 @@ rules:
           metavariable: $Q
           regex: '(?is)^(?!.*\bLIMIT\b).*\bFROM\s+scrobble(s|_artists)\b'
 
+  # ── Handlers ─────────────────────────────────────────────────────────────
+  # A WARNING, not an ERROR: 147 of these predate the rule (2026-11-15), and
+  # tapedeck-main fails on any ERROR anywhere in the tree. A PR sees only the
+  # ones it adds.
+  - id: db-read-error-becomes-empty
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      A database read whose error is turned into an empty or default answer.
+      The page then says "nothing" when the truth is "could not read", and
+      nothing is logged — how a Postgres-only failure in artist_trend went
+      unseen. Handle the error (a 500 with a warn!), or log it before
+      defaulting if a partial page really is better.
+    pattern-either:
+      - pattern: state.db.$F(...).await.unwrap_or_default()
+      - pattern: state.db.$F(...).await.unwrap_or($D)
+      - pattern: state.db.$F(...).await.ok()
+
   # ── Logging ──────────────────────────────────────────────────────────────
   - id: log-crate-not-tracing
     languages: [rust]

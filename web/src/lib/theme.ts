@@ -1,5 +1,6 @@
 import { writable } from 'svelte/store';
 import { browser } from '$app/environment';
+import { api } from '$lib/api';
 
 export type ThemeMode = 'light' | 'dark' | 'system';
 
@@ -23,11 +24,13 @@ export function initTheme() {
 	matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () =>
 		theme.update((m) => (apply(m), m))
 	);
-	// hydrate from the server (source of truth across devices)
-	fetch('/api/v1/preferences', { credentials: 'same-origin' })
-		.then((r) => (r.ok ? r.json() : null))
+	// hydrate from the server (source of truth across devices). Through
+	// api.ts, which throws on a failed response: signed out (the login page),
+	// that is a 401, and localStorage stays the answer.
+	api
+		.getPreferences()
 		.then((p) => {
-			if (p?.theme) setTheme(p.theme, false);
+			if (typeof p.theme === 'string') setTheme(p.theme as ThemeMode, false);
 		})
 		.catch(() => {});
 }
@@ -38,11 +41,6 @@ export function setTheme(mode: ThemeMode, persist = true) {
 	if (!browser) return;
 	localStorage.setItem('td-theme', mode);
 	if (persist) {
-		fetch('/api/v1/preferences', {
-			method: 'PUT',
-			credentials: 'same-origin',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ theme: mode })
-		}).catch(() => {}); // localStorage remains the offline fallback
+		api.putPreferences({ theme: mode }).catch(() => {}); // localStorage remains the offline fallback
 	}
 }

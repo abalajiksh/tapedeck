@@ -343,24 +343,42 @@ impl Database {
         .fetch_all(&self.pool)
         .await
     }
-    /// Plays per calendar year for the artist trend bars. Years are formatted
-    /// with SQLite's own `strftime` so they follow the stored UTC timestamp;
-    /// this is a shape, not a precise local-time histogram.
+    /// Plays per calendar year for the artist trend bars, in the listener's
+    /// own timezone.
+    ///
+    /// It used to be SQLite's `strftime('%Y', timestamp, 'unixepoch')`, which
+    /// was wrong twice (2026-11-15). The year was UTC's, so a listen at 00:30
+    /// on New Year's Day in Berlin went to the year before — against the rule
+    /// that timestamps bucket in the user's IANA zone. And `strftime` is one of
+    /// the functions `dialect.rs` deliberately does not translate, so on a
+    /// Postgres build the query failed and the artist page, which reads this
+    /// with `unwrap_or_default()`, showed no trend and logged nothing.
+    ///
+    /// Bucketed here instead, the way reports and graphs already do it: SQLite
+    /// has no zone database, so this is the one place both backends agree. One
+    /// artist's timestamps — a column of integers — not their listens.
     pub async fn artist_trend(
         &self,
         user_id: i64,
         artist: &str,
+        tz: chrono_tz::Tz,
     ) -> Result<Vec<(String, i64)>, sqlx::Error> {
-        sqlx::query_as(&crate::sql!(&format!(
-            "SELECT strftime('%Y', timestamp, 'unixepoch') AS year, COUNT(*) AS plays
-             FROM scrobbles s
-             WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}
-             GROUP BY year ORDER BY year ASC"
+        use chrono::{Datelike, TimeZone};
+        let stamps: Vec<i64> = sqlx::query_scalar(&crate::sql!(&format!(
+            "SELECT timestamp FROM scrobbles s
+             WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}"
         )))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        let mut years: std::collections::BTreeMap<i32, i64> = std::collections::BTreeMap::new();
+        for ts in stamps {
+            if let Some(local) = tz.timestamp_opt(ts, 0).single() {
+                *years.entry(local.year()).or_default() += 1;
+            }
+        }
+        Ok(years.into_iter().map(|(y, n)| (y.to_string(), n)).collect())
     }
     /// Total non-skipped listens, for "share of your listening".
     /// How many times this user has played anything by one artist.

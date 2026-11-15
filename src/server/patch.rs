@@ -204,6 +204,23 @@ pub struct PresenceSet {
     pub offered: i64,
 }
 
+/// Where a re-offered sitting's plays went.
+#[derive(Serialize, ToSchema)]
+pub struct SpoolReoffered {
+    /// Plays put in somebody's inbox, across everybody in the room.
+    pub offered: i64,
+    /// One entry per person who was in the room, in username order.
+    pub decks: Vec<ReofferedTo>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ReofferedTo {
+    /// Their display name, or username when they have none.
+    pub deck: String,
+    /// Plays newly waiting on them. 0 when they already had everything.
+    pub offered: i64,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct CapturesSettled {
     pub settled: i64,
@@ -354,6 +371,7 @@ pub struct ShareAll {
     spool_image,
     add_spool_members,
     set_presence,
+    reoffer_spool,
     settle_captures,
     edit_capture,
     get_spool_chain,
@@ -415,6 +433,7 @@ pub fn create_patch_router() -> Router<Arc<AppState>> {
         .route("/api/v1/patch/spools/:uuid/image", get(spool_image))
         .route("/api/v1/patch/spools/:uuid/members", post(add_spool_members))
         .route("/api/v1/patch/spools/:uuid/presence", axum::routing::put(set_presence))
+        .route("/api/v1/patch/spools/:uuid/reoffer", post(reoffer_spool))
         .route("/api/v1/patch/captures", post(settle_captures))
         .route("/api/v1/patch/captures/:id", axum::routing::patch(edit_capture))
         .route("/api/v1/profile/spool-chain", get(get_spool_chain).put(put_spool_chain))
@@ -2063,9 +2082,9 @@ async fn start_spool(
 /// still decides nothing on its own, since every play arrives as a capture
 /// you have to accept.
 ///
-/// Only plays through the player's **shared** chains are offered, exactly
-/// as for a live sitting, and nothing already offered to you in any
-/// sitting is offered twice.
+/// Every play of the sitting is offered, whatever chain it ran through,
+/// exactly as for a live sitting (since 2026-11-11), and nothing already
+/// offered to you in any sitting is offered twice.
 #[utoipa::path(
     post,
     path = "/api/v1/patch/spool/{uuid}/join",
@@ -2205,10 +2224,11 @@ async fn spool_history(
 /// Declined and never-answered are told apart deliberately: both mean "not
 /// in my history" and they are not the same decision.
 ///
-/// `withheld` counts plays that happened in this sitting and are not shown,
-/// because they ran through chains their owner does not share. Stated
-/// rather than dropped — a document with invisible holes misrepresents the
-/// evening and the reader could never tell.
+/// `withheld` counts plays that happened in this sitting and are not shown
+/// to you. Since 2026-11-11 everybody in a sitting sees every play of it,
+/// whatever chain it ran through, so it is always 0; it stays so a client
+/// that reads it keeps working. Stated rather than dropped while it could
+/// be non-zero — a document with invisible holes misrepresents the evening.
 #[utoipa::path(
     get,
     path = "/api/v1/patch/spools/{uuid}",
@@ -2424,6 +2444,56 @@ async fn set_presence(
         Err(e) => {
             warn!("📡 spool presence: {}", crate::logging::error_chain(&e));
             refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not save that")
+        }
+    }
+}
+
+// `POST /api/v1/patch/spools/:uuid/reoffer` — hand a past sitting over again.
+//
+// Added 2026-11-15 for the sittings the old shared-chain rule left short: the
+// rule went on 2026-11-11, but only for plays from then on, and nothing ever
+// re-asked for an evening somebody had already joined. Db::reoffer_spool has
+// the reasoning.
+/// Hand a sitting over again, to everybody who was in the room.
+///
+/// Offers each person in the sitting every play of it they were present
+/// for and have **not already been offered** — waiting, accepted or
+/// declined — whatever chain it ran through. Pressing it twice offers
+/// nothing the second time, and a decline stays a decline.
+///
+/// For a sitting that handed over less than it should have: before
+/// 2026-11-11 only plays through a shared chain were offered.
+///
+/// Anybody who was in the room may ask, not only the host. Nothing enters
+/// a history here: every play arrives as a capture to accept or decline.
+#[utoipa::path(
+    post,
+    path = "/api/v1/patch/spools/{uuid}/reoffer",
+    tag = "Patch",
+    security(("sessionCookie" = [])),
+    params(("uuid" = String, Path)),
+    responses(
+        (status = 200, description = "Where the plays went.", body = SpoolReoffered),
+        (status = 401, response = Unauthorized),
+        (status = 404, description = "No sitting you were in with that id.", body = ErrorResponse),
+    )
+)]
+async fn reoffer_spool(
+    State(state): State<Arc<AppState>>,
+    user: super::auth::AuthUser,
+    Path(uuid): Path<String>,
+) -> Response {
+    match state.db.reoffer_spool(&uuid, user.user_id).await {
+        Ok(Some(decks)) => {
+            let offered = decks.iter().map(|(_, n)| n).sum();
+            let decks =
+                decks.into_iter().map(|(deck, offered)| ReofferedTo { deck, offered }).collect();
+            (StatusCode::OK, Json(SpoolReoffered { offered, decks })).into_response()
+        }
+        Ok(None) => refused(StatusCode::NOT_FOUND, "No sitting you were in with that id"),
+        Err(e) => {
+            warn!("📡 spool reoffer: {}", crate::logging::error_chain(&e));
+            refused(StatusCode::INTERNAL_SERVER_ERROR, "Could not offer that")
         }
     }
 }
@@ -2980,9 +3050,9 @@ async fn get_share_all(
 //
 // It widens what a **patched** deck sees and nothing else. The Instance tab
 // still counts shared-chain listens only, because a patch is consent to one
-// person and there is no patch behind a figure the whole instance reads; and
-// a Shared Spool still captures only through shared chains, because a capture
-// enters somebody's history rather than merely being visible.
+// person and there is no patch behind a figure the whole instance reads. (A
+// Shared Spool used to capture only through shared chains as well; since
+// 2026-11-11 a sitting hands over every play — joining one is the consent.)
 //
 // Session-only, like the other two: a token is held by a scrobble client, and
 // no scrobble client has business widening who may read its owner's listening.

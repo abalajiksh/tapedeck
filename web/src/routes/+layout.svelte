@@ -141,9 +141,9 @@
 
 		(async () => {
 			try {
-				const res = await fetch('/api/v1/auth/status', { credentials: 'same-origin' });
-				if (!res.ok) throw new Error(`HTTP ${res.status}`);
-				const data = await res.json();
+				// Through api.ts like every other call (CLAUDE.md, Frontend), and
+				// typed: this was the one bare fetch of an endpoint api.ts already had.
+				const data = await api.authStatus();
 				if (data.needs_setup) return (window.location.href = '/setup');
 				if (!data.authenticated) return (window.location.href = '/login');
 				isAdmin = !!data.is_admin;
