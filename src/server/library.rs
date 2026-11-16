@@ -475,7 +475,8 @@ pub async fn artist_detail(
         ),
         None => (Vec::new(), Vec::new()),
     };
-    let trend = state.db.artist_trend(user.user_id, &name).await.unwrap_or_default();
+    let tz = super::scrobbles::user_tz_for(&state, user.user_id).await;
+    let trend = state.db.artist_trend(user.user_id, &name, tz).await.unwrap_or_default();
     let (rank, artist_total) = state.db.artist_rank(user.user_id, &name).await.unwrap_or((0, 0));
     let all_plays = state.db.total_plays(user.user_id).await.unwrap_or(0);
     let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);

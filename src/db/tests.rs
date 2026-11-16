@@ -3950,7 +3950,12 @@ async fn a_performer_is_credited_alongside_the_composer() {
     assert_eq!(db.artist_top_tracks(uid, "Hilary Hahn", 10).await.unwrap().len(), 3);
     assert_eq!(db.artist_albums(uid, "Hilary Hahn", None, 10).await.unwrap().len(), 1);
     assert_eq!(
-        db.artist_trend(uid, "Hilary Hahn").await.unwrap().iter().map(|(_, n)| n).sum::<i64>(),
+        db.artist_trend(uid, "Hilary Hahn", chrono_tz::UTC)
+            .await
+            .unwrap()
+            .iter()
+            .map(|(_, n)| n)
+            .sum::<i64>(),
         3
     );
 
@@ -9324,6 +9329,99 @@ async fn somebody_added_late_gets_the_evening_they_were_there_for() {
         db.spool_captures(me).await.unwrap().into_iter().map(|c| c.title).collect();
     waiting.sort();
     assert_eq!(waiting, vec!["Early".to_string(), "Late".to_string()]);
+}
+
+/// An artist's year bars count in the listener's own year, not UTC's.
+///
+/// 23:30 UTC on New Year's Eve is 00:30 on New Year's Day in Berlin, so it is
+/// next year's play there. The query used to bucket with SQLite's `strftime`
+/// in UTC, which also has no Postgres translation and failed there silently.
+#[tokio::test]
+async fn an_artists_years_are_the_listeners_years() {
+    let db = testdb().await;
+    let uid = db.create_user("yearling", None, "pw", "user").await.unwrap();
+    // 2025-12-31T23:30:00Z, and a plain mid-year play.
+    listen(&db, uid, None, "Unfinished Sympathy", "Massive Attack", 1_767_223_800).await;
+    listen(&db, uid, None, "Teardrop", "Massive Attack", 1_750_000_000).await;
+
+    let utc = db.artist_trend(uid, "Massive Attack", chrono_tz::UTC).await.unwrap();
+    assert_eq!(utc, vec![("2025".to_string(), 2)]);
+    let berlin = db.artist_trend(uid, "Massive Attack", chrono_tz::Europe::Berlin).await.unwrap();
+    assert_eq!(berlin, vec![("2025".to_string(), 1), ("2026".to_string(), 1)]);
+}
+
+/// A sitting the old shared-chain rule left short can be handed over again,
+/// and only the gap is offered.
+///
+/// The household case (2026-11-08): the host played through a source that
+/// names no chain, the member had joined, and under the rule before
+/// 2026-11-11 no capture was written — though the listens were stamped with
+/// the sitting. That is reproduced by deleting the captures the new rule
+/// writes. Pins four things: the gap is offered; pressing it again offers
+/// nothing; a decline stays declined; and the person who *played* a record
+/// is never offered it back from somebody else's accepted copy.
+#[tokio::test]
+async fn a_sitting_left_short_by_the_old_rule_can_be_handed_over_again() {
+    let db = testdb().await;
+    let (me, them, _chain) = patched_pair(&db).await;
+    let stranger = db.create_user("noor", None, "pw", "user").await.unwrap();
+    let spool = db.start_spool(them, None, &[me], &[]).await.unwrap();
+    assert_eq!(
+        db.set_spool_membership(&spool, me, true).await.unwrap(),
+        Some(("joined".into(), 0))
+    );
+
+    // Through no chain at all, as the Navidrome plugin sends them.
+    listen(&db, them, None, "Teardrop", "Massive Attack", 1_760_000_000).await;
+    listen(&db, them, None, "Angel", "Massive Attack", 1_760_000_400).await;
+    // What the old rule did: the plays carry the sitting, nobody was offered them.
+    sqlx::query("DELETE FROM spool_captures WHERE user_id = ?")
+        .bind(me)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(db.spool_captures(me).await.unwrap().is_empty());
+    assert!(db.end_spool(&spool, them).await.unwrap());
+
+    // Not in the room: nothing to press.
+    assert_eq!(db.reoffer_spool(&spool, stranger).await.unwrap(), None);
+
+    let to = db.reoffer_spool(&spool, me).await.unwrap().expect("a member may ask");
+    let mine = to.iter().find(|(_, n)| *n > 0).expect("somebody was offered something");
+    assert_eq!(mine.1, 2, "both plays of the gap, to the member who had none");
+    assert_eq!(
+        to.iter().map(|(_, n)| n).sum::<i64>(),
+        2,
+        "and nothing to the host, who played them"
+    );
+
+    // Again: nothing new.
+    let again = db.reoffer_spool(&spool, them).await.unwrap().expect("the host may ask too");
+    assert_eq!(
+        again.iter().map(|(_, n)| n).sum::<i64>(),
+        0,
+        "pressing it twice offers nothing twice"
+    );
+
+    // Decline one, keep the other. A decline stays a decline, and the kept copy
+    // — which carries the sitting's uuid — is not offered back to its player.
+    let caps = db.spool_captures(me).await.unwrap();
+    let angel = caps.iter().find(|c| c.title == "Angel").unwrap().id;
+    let teardrop = caps.iter().find(|c| c.title == "Teardrop").unwrap().id;
+    db.settle_captures(me, &[angel], false).await.unwrap();
+    db.settle_captures(me, &[teardrop], true).await.unwrap();
+    let after = db.reoffer_spool(&spool, me).await.unwrap().unwrap();
+    assert_eq!(
+        after.iter().map(|(_, n)| n).sum::<i64>(),
+        0,
+        "no decline re-offered, and no accepted copy offered back to the host"
+    );
+    let theirs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM spool_captures WHERE user_id = ?")
+        .bind(them)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(theirs, 0, "the host was never offered their own record");
 }
 
 /// Adding somebody to a sitting carries the consent guard `start_spool` has,

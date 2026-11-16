@@ -3181,6 +3181,18 @@ class TapedeckAPI {
 		);
 	}
 
+	/** Hand a past sitting over again, to everybody who was in the room.
+	 *
+	 *  For an evening the old shared-chain rule left short (before 2026-11-11
+	 *  only shared-chain plays were offered). Offers only what each person has
+	 *  never been offered — so pressing it twice offers nothing, and a decline
+	 *  stays a decline. Nothing enters a history until it is accepted. */
+	async reofferSpool(
+		uuid: string
+	): Promise<{ offered: number; decks: { deck: string; offered: number }[] }> {
+		return this.request('POST', `/api/v1/patch/spools/${encodeURIComponent(uuid)}/reoffer`);
+	}
+
 	/** Fix when a capture was played, before it becomes a listen — the cheapest
 	 *  correction there is, because nothing is in a history yet. */
 	async setCaptureTime(id: number, playedAt: number): Promise<{ saved: boolean }> {

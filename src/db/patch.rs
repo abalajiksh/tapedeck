@@ -1451,11 +1451,19 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
 
+        // **Originals only** (`source_name != 'Shared Spool'`), the rule that
+        // keeps one play one row on the sitting's page. An accepted copy carries
+        // the sitting's uuid too, so without it somebody whose play another
+        // member had already accepted was offered that play back — their own
+        // record, from the other deck. A late joiner never saw it, because the
+        // original and the copy collapse into one offer; the person who played
+        // it did, through "I was here all along" or a re-offer.
         let plays: Vec<(i64, String, String, Option<String>, Option<i64>, i64)> =
             sqlx::query_as(&crate::sql!(
                 "SELECT s.user_id, s.title, s.artist, s.album, s.duration, s.timestamp
                FROM scrobbles s
               WHERE s.joint_session_id = ? AND s.user_id != ? AND s.skipped = FALSE
+                AND s.source_name != 'Shared Spool'
                 AND s.timestamp >= COALESCE(?, s.timestamp)
                 AND s.timestamp <= COALESCE(?, s.timestamp)
                 AND s.user_id IN (
@@ -2236,6 +2244,74 @@ impl Database {
             return Ok(Some(0));
         }
         Ok(Some(self.offer_spool_backlog(spool_id, uuid, user_id).await?))
+    }
+    /// Hand a past sitting over again, to everybody who was in the room.
+    ///
+    /// **Why it exists:** until 2026-11-11 a sitting handed over only plays
+    /// through a chain their owner had marked shared. The rule went, but only
+    /// for plays from then on — a capture is written when a play arrives, and
+    /// the backlog is offered only when somebody joins. So an evening that
+    /// fell foul of the old gate stayed short for everybody who had already
+    /// joined it, with nothing that would ever ask again. On the household
+    /// instance that was the 2026-11-08 sitting: Colin's thirty-three plays
+    /// through the Navidrome plugin, which names no chain, never reached
+    /// anybody, and the sitting's page marked every one "not offered".
+    ///
+    /// Ashwin's call (2026-11-15): **every play, private chain or none**, the
+    /// rule a sitting has now, and on a button rather than automatically on
+    /// upgrade. Nothing enters anybody's history here — each play arrives as a
+    /// capture its recipient accepts or declines.
+    ///
+    /// It is `offer_spool_backlog` for each member who was **in the room**
+    /// (`joined`, or `left` — the half of the evening before they went), so
+    /// it inherits that function's two rules rather than restating them: each
+    /// person gets only the part of the evening they were present for, and
+    /// **nothing already offered to them in any sitting** — waiting, accepted
+    /// or declined — is offered twice. That second rule is what makes pressing
+    /// it again harmless, and why a decline stays a decline.
+    ///
+    /// **Anybody who was in the room may press it**, not only the host: it
+    /// writes offers, never listens, and the person it helps is usually the one
+    /// who noticed the gap — somebody looking at their own copy of the evening.
+    /// An invitation nobody answered, or one declined, is not a seat at the
+    /// table, so those people get nothing and cannot press it.
+    ///
+    /// Returns `None` when the caller was not in the sitting, otherwise one
+    /// `(display name, offered)` per member, so the screen can say where the
+    /// plays went.
+    pub async fn reoffer_spool(
+        &self,
+        uuid: &str,
+        user_id: i64,
+    ) -> Result<Option<Vec<(String, i64)>>, sqlx::Error> {
+        let Some(spool_id): Option<i64> = sqlx::query_scalar(&crate::sql!(
+            "SELECT sp.id FROM spools sp
+               JOIN spool_members m ON m.spool_id = sp.id AND m.user_id = ?
+              WHERE sp.uuid = ? AND m.state IN ('joined', 'left')"
+        ))
+        .bind(user_id)
+        .bind(uuid)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        let members: Vec<(i64, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT m.user_id, COALESCE(u.display_name, u.username)
+               FROM spool_members m JOIN users u ON u.id = m.user_id
+              WHERE m.spool_id = ? AND m.state IN ('joined', 'left')
+              ORDER BY u.username"
+        ))
+        .bind(spool_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = Vec::with_capacity(members.len());
+        for (member, name) in members {
+            out.push((name, self.offer_spool_backlog(spool_id, uuid, member).await?));
+        }
+        Ok(Some(out))
     }
     /// Correct when a capture was played, before it becomes a listen.
     ///
