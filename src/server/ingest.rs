@@ -817,6 +817,7 @@ pub async fn submit_listens(
                         &state.listenbrainz_url,
                     )
                     .await
+                    .or_warn("submit_listens: sinks_for_user")
                     .unwrap_or_default();
                     crate::sinks::submit_now_playing(&user_sinks, &play).await;
                 }

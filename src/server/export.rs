@@ -75,10 +75,24 @@ async fn export(
                     Some((Ok::<String, std::io::Error>(chunk), (Phase::Rows(0), first)))
                 }
                 Phase::Rows(off) => {
-                    let page = db
+                    // A page that cannot be read ends the download as a
+                    // failure. An empty page here is how the export knows it
+                    // reached the end, so defaulting one closed the array and
+                    // handed over a well-formed file missing every listen
+                    // after `off`: a backup that looks complete and is not.
+                    let page = match db
                         .get_recent_scrobbles(uid, PAGE, off, None, None, None, None, None, None)
                         .await
-                        .unwrap_or_default();
+                    {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                "export: could not read listens from row {off}: {}",
+                                crate::logging::error_chain(&e)
+                            );
+                            return Some((Err(std::io::Error::other(e)), (Phase::End, first)));
+                        }
+                    };
                     if page.is_empty() {
                         return Some((Ok(String::new()), (Phase::Close, first)));
                     }

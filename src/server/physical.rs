@@ -2734,6 +2734,7 @@ async fn set_now_playing(
         // and is corrected ten seconds later by the next one.
         let sinks = crate::sinks::sinks_for_user(&state.db, user.user_id, &state.listenbrainz_url)
             .await
+            .or_warn("set_now_playing: sinks_for_user")
             .unwrap_or_default();
         crate::sinks::submit_now_playing(&sinks, &play).await;
     }

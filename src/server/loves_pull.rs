@@ -20,6 +20,7 @@
 //! * **Last.fm** returns artist and track *names* (and sometimes an MBID), so it
 //!   matches on the MBID when there is one and falls back to the name.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -253,7 +254,11 @@ pub async fn pull_lastfm(
             // Names are present here, so the MBID is a preference and not a
             // requirement — unlike the ListenBrainz side.
             let matched = match mbid {
-                Some(m) => db.track_by_recording_mbid(user_id, m).await.ok().flatten(),
+                Some(m) => db
+                    .track_by_recording_mbid(user_id, m)
+                    .await
+                    .or_warn("pull_lastfm: track_by_recording_mbid")
+                    .flatten(),
                 None => None,
             };
             let (title, artist) = match matched {
@@ -300,7 +305,8 @@ async fn store_love(
     let Ok(entity) = db.upsert_entity("recording", title, artist, mbid).await else {
         return false;
     };
-    let already = db.is_loved(user_id, entity).await.unwrap_or(false);
+    let already =
+        db.is_loved(user_id, entity).await.or_warn("store_love: is_loved").unwrap_or(false);
     if already {
         return false;
     }

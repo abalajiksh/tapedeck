@@ -12,6 +12,7 @@
 
 use crate::db::Database;
 use crate::language::{script_language, DEFAULT_LANGUAGE};
+use crate::logging::OrWarn;
 use crate::metadata::ArtworkProvider;
 use crate::models::Play;
 use crate::musicbrainz::MusicBrainzClient;
@@ -121,7 +122,11 @@ pub async fn backfill_lyrics(
     // Where each of them sits in the user's own servers: one bounded scan for
     // the whole batch rather than a lookup per track.
     let keys: Vec<String> = candidates.iter().map(|c| c.key.clone()).collect();
-    let refs = db.library_refs_for_tracks(&keys).await.unwrap_or_default();
+    let refs = db
+        .library_refs_for_tracks(&keys)
+        .await
+        .or_warn("backfill_lyrics: library_refs_for_tracks")
+        .unwrap_or_default();
     let mut servers = LibraryClients::default();
 
     let mut spent = 0i64;
@@ -376,7 +381,11 @@ pub async fn lyrics_now(
     album: Option<&str>,
     duration: Option<i64>,
 ) -> LyricOutcome {
-    let lib = db.library_ref_for_track(title, artist).await.ok().flatten();
+    let lib = db
+        .library_ref_for_track(title, artist)
+        .await
+        .or_warn("lyrics_now: library_ref_for_track")
+        .flatten();
     let mut servers = LibraryClients::default();
     resolve_lyrics(db, lyrics, &mut servers, lib.as_ref(), artist, title, album, duration, true)
         .await
@@ -927,7 +936,12 @@ pub async fn backfill_credits(
     // in the household history, a first-come budget starved the two queues
     // behind it for days (2026-11-04). What one queue leaves unused flows on.
     let album_reserve = 2.min(mb_budget);
-    for mbid in db.recordings_needing_credits(batch).await.unwrap_or_default() {
+    for mbid in db
+        .recordings_needing_credits(batch)
+        .await
+        .or_warn("backfill_credits: recordings_needing_credits")
+        .unwrap_or_default()
+    {
         if budget <= mb_budget / 2 {
             break;
         }
@@ -940,7 +954,12 @@ pub async fn backfill_credits(
 
     // The record's own credit and its release group, by release MBID — what an
     // album is filed under on a box set or a soundtrack.
-    for mbid in db.releases_needing_info(batch).await.unwrap_or_default() {
+    for mbid in db
+        .releases_needing_info(batch)
+        .await
+        .or_warn("backfill_credits: releases_needing_info")
+        .unwrap_or_default()
+    {
         if budget <= album_reserve {
             break;
         }
@@ -953,7 +972,12 @@ pub async fn backfill_credits(
     // release that carries the name the source sent. A search, then up to
     // three exact-score editions of that title, keeping the one whose
     // tracklist matches most of the listens; the next pass credits them.
-    for (artist, album) in db.albums_needing_lookup(batch.min(3)).await.unwrap_or_default() {
+    for (artist, album) in db
+        .albums_needing_lookup(batch.min(3))
+        .await
+        .or_warn("backfill_credits: albums_needing_lookup")
+        .unwrap_or_default()
+    {
         if budget < 2 {
             break;
         }
@@ -962,7 +986,11 @@ pub async fn backfill_credits(
         let Ok(hits) = mb.search_releases(crate::db::strip_featuring(&album), &artist).await else {
             continue;
         };
-        let titles = db.album_lookup_titles(&artist, &album).await.unwrap_or_default();
+        let titles = db
+            .album_lookup_titles(&artist, &album)
+            .await
+            .or_warn("backfill_credits: album_lookup_titles")
+            .unwrap_or_default();
         let editions: Vec<_> = hits
             .into_iter()
             .filter(|h| {
@@ -1034,7 +1062,12 @@ pub async fn backfill_credits(
     // Band membership, for the "Member of" / "Members" links on artist pages.
     // Read from the cache by the page; asked for here, never by a page.
     let mut asked = 0;
-    for mbid in db.credited_artist_mbids(200).await.unwrap_or_default() {
+    for mbid in db
+        .credited_artist_mbids(200)
+        .await
+        .or_warn("backfill_credits: credited_artist_mbids")
+        .unwrap_or_default()
+    {
         if budget <= 0 || asked >= 4 {
             break;
         }

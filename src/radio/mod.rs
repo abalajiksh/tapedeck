@@ -797,6 +797,7 @@ async fn publish_now_playing(
     if announce && changed && (heard.tagged || !t.settings.tagged_only) {
         let sinks = crate::sinks::sinks_for_user(&state.db, user_id, &state.listenbrainz_url)
             .await
+            .or_warn("publish_now_playing: sinks_for_user")
             .unwrap_or_default();
         crate::sinks::submit_now_playing(&sinks, &heard.play).await;
     }

@@ -102,6 +102,18 @@ async fn handler(state: State<Arc<AppState>>, uid: i64) {
     let loved = state.db.is_loved(uid, id).await.or_warn("artist page: loved").unwrap_or(false);
     // ok: db-read-error-becomes-empty
     let entity = state.db.get_entity(id).await.or_warn("note: entity").flatten();
+    // ruleid: db-read-error-becomes-empty
+    let page = db.get_recent_scrobbles(uid, 5000, off).await.unwrap_or_default();
+    // ruleid: db-read-error-becomes-empty
+    let thresholds = self.db.scrobble_thresholds().await.unwrap_or_default();
+    // ruleid: db-read-error-becomes-empty
+    let sinks = crate::sinks::sinks_for_user(&state.db, uid, &url).await.unwrap_or_default();
+    // ruleid: db-read-error-becomes-empty
+    let sinks = sinks::sinks_for_user(db, uid, lb_url).await.unwrap_or_default();
+    // ok: db-read-error-becomes-empty
+    let body = resp.text().await.unwrap_or_default();
+    // ok: db-read-error-becomes-empty
+    let n = sock.read(&mut buf).await.unwrap_or(0);
 }
 
 fn logging() {

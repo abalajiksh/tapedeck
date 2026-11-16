@@ -254,7 +254,10 @@ async fn line_ref(db: &Database, user_id: i64, target: &str, ctx: &NoteCtx) -> O
             let n = n.parse::<usize>().ok().filter(|n| *n > 0)?;
             let artist = ctx.artist.as_deref()?;
             let album = ctx.album.as_deref()?;
-            let title = db.shelf_track_title(user_id, artist, album, side, pos).await.ok()??;
+            let title = db
+                .shelf_track_title(user_id, artist, album, side, pos)
+                .await
+                .or_warn("line_ref: shelf_track_title")??;
             Some(LineRef {
                 artist: artist.to_string(),
                 title,
@@ -412,7 +415,11 @@ async fn note_context(db: &Database, user_id: i64, note: &NoteRow) -> NoteCtx {
         }
         // For a track, the album comes from where this user actually heard it.
         _ => {
-            let album = db.album_for_track(user_id, &e.name, &e.artist_name).await.ok().flatten();
+            let album = db
+                .album_for_track(user_id, &e.name, &e.artist_name)
+                .await
+                .or_warn("note_context: album_for_track")
+                .flatten();
             NoteCtx { artist: Some(e.artist_name), album, track: Some(e.name) }
         }
     }
@@ -664,21 +671,25 @@ async fn note_json(
 ) -> NoteView {
     let ctx = note_context(db, user_id, note).await;
     let entity: Option<EntityRow> = match note.entity_id {
-        Some(id) => db.get_entity(id).await.ok().flatten(),
+        Some(id) => db.get_entity(id).await.or_warn("note_json: get_entity").flatten(),
         None => None,
     };
     let listen = match note.scrobble_id {
-        Some(id) => db.get_scrobble(user_id, id).await.ok().flatten().map(|s| NoteListen {
-            id: s.id,
-            title: s.title,
-            artist: s.artist,
-            album: s.album,
-            timestamp: s.timestamp,
-        }),
+        Some(id) => {
+            db.get_scrobble(user_id, id).await.or_warn("note_json: get_scrobble").flatten().map(
+                |s| NoteListen {
+                    id: s.id,
+                    title: s.title,
+                    artist: s.artist,
+                    album: s.album,
+                    timestamp: s.timestamp,
+                },
+            )
+        }
         None => None,
     };
     let loved = match note.entity_id {
-        Some(id) => db.is_loved(user_id, id).await.unwrap_or(false),
+        Some(id) => db.is_loved(user_id, id).await.or_warn("note_json: is_loved").unwrap_or(false),
         None => false,
     };
     let revisions = db.note_revisions(user_id, note.id).await.map(|r| r.len()).unwrap_or(0);
@@ -725,6 +736,7 @@ async fn note_json(
             Some(e) if e.kind == "release" => db
                 .album_track_list(user_id, &e.artist_name, &e.name)
                 .await
+                .or_warn("note_json: album_track_list")
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(title, ..)| (e.artist_name.clone(), title))
@@ -1535,8 +1547,10 @@ pub async fn set_love(
                     // idempotent and re-assertable, so a missed mirror is fixed
                     // by the next toggle. Only the scrobble flush may not
                     // treat this as an empty answer.
-                    let sinks =
-                        crate::sinks::sinks_for_user(&db, uid, &url).await.unwrap_or_default();
+                    let sinks = crate::sinks::sinks_for_user(&db, uid, &url)
+                        .await
+                        .or_warn("set_love: sinks_for_user")
+                        .unwrap_or_default();
                     crate::sinks::submit_love(&sinks, &artist, &title, mbid.as_deref(), loved)
                         .await;
                 });
@@ -1919,7 +1933,7 @@ async fn note_document(db: &Database, user_id: i64, note: &NoteRow, title: &str)
             .await;
 
     let entity = match note.entity_id {
-        Some(id) => db.get_entity(id).await.ok().flatten(),
+        Some(id) => db.get_entity(id).await.or_warn("note_document: get_entity").flatten(),
         None => None,
     };
 
