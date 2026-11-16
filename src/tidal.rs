@@ -29,6 +29,7 @@
 //! * **Adding items is capped at 50 per request** (`maxItems` on the payload),
 //!   so a full push is batched rather than sent in one call.
 
+use crate::logging::OrWarn;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tracing::{debug, warn};
@@ -174,13 +175,17 @@ impl TidalApp {
     /// uses: what somebody typed into this instance's own settings screen is a
     /// more deliberate statement than a variable inherited from a shell.
     pub async fn resolve(db: &crate::db::Database) -> Option<Self> {
-        let stored_id =
-            db.get_app_setting(CLIENT_ID_KEY).await.ok().flatten().filter(|v| !v.trim().is_empty());
+        let stored_id = db
+            .get_app_setting(CLIENT_ID_KEY)
+            .await
+            .or_warn("resolve: get_app_setting")
+            .flatten()
+            .filter(|v| !v.trim().is_empty());
         if let Some(id) = stored_id {
             let secret = db
                 .get_app_setting(CLIENT_SECRET_KEY)
                 .await
-                .ok()
+                .or_warn("resolve: get_app_setting")
                 .flatten()
                 .filter(|v| !v.trim().is_empty());
             return Some(Self { client_id: id.trim().to_string(), client_secret: secret });

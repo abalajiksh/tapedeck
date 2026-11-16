@@ -6,6 +6,7 @@
 //! survives restarts and an interrupted job is recorded (marked `interrupted`
 //! on the next startup) rather than lost.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::{Multipart, Path, State},
     http::StatusCode,
@@ -119,7 +120,11 @@ fn update<F: FnOnce(&mut ImportJob)>(reg: &ImportRegistry, id: &str, f: F) {
 /// Register a fresh running job (persisted to the DB at start) and return its id.
 async fn start(reg: &ImportRegistry, db: &Database, source: &str, user_id: i64) -> String {
     let id = job_id();
-    let db_id = db.create_import_job(user_id, source).await.unwrap_or(0);
+    let db_id = db
+        .create_import_job(user_id, source)
+        .await
+        .or_warn("start: create_import_job")
+        .unwrap_or(0);
     let job = ImportJob {
         job_id: id.clone(),
         user_id,

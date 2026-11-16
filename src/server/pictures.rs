@@ -23,6 +23,7 @@
 //!   than to nothing: a server switched off should not blank a face the
 //!   backfill could still supply.
 
+use crate::logging::OrWarn;
 use axum::{
     body::Body,
     extract::{Multipart, Path, Query, State},
@@ -164,7 +165,11 @@ pub struct PicturePreviewQuery {
 /// The shared picture of `kind` for an artist, or `None` when there is no such
 /// artist. The inner `None` is an artist the backfill found nothing for.
 async fn shared_picture(state: &AppState, artist_id: i64, kind: &str) -> Option<Option<String>> {
-    let (portrait, wide) = state.db.artist_picture_urls(artist_id).await.ok()??;
+    let (portrait, wide) = state
+        .db
+        .artist_picture_urls(artist_id)
+        .await
+        .or_warn("shared_picture: artist_picture_urls")??;
     let url = if kind == "wide" { wide } else { portrait };
     Some(url.filter(|u| !u.trim().is_empty()))
 }
@@ -367,12 +372,18 @@ async fn list_pictures(
         return not_found("No such artist");
     };
     let shared_url = shared_picture(&state, id, &kind).await.flatten();
-    let current_pick = state.db.artist_picture(user.user_id, id, &kind).await.ok().flatten();
+    let current_pick = state
+        .db
+        .artist_picture(user.user_id, id, &kind)
+        .await
+        .or_warn("list_pictures: artist_picture")
+        .flatten();
 
     let sources: Vec<UserSource> = state
         .db
         .list_sources_for_user(user.user_id)
         .await
+        .or_warn("list_pictures: list_sources_for_user")
         .unwrap_or_default()
         .into_iter()
         .filter(|s| s.enabled && LIBRARY_KINDS.contains(&s.kind.as_str()))
@@ -513,8 +524,10 @@ async fn choose_picture(
     if !kind_ok(&kind) {
         return bad_kind();
     }
-    if state.db.artist_by_id(id).await.ok().flatten().is_none() {
-        return not_found("No such artist");
+    match state.db.artist_by_id(id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found("No such artist"),
+        Err(e) => return super::read_failed("that artist", &e).into_response(),
     }
     let key = body.key.trim();
     let now = crate::db::Database::now_secs();
@@ -649,8 +662,10 @@ async fn upload_picture(
     if !kind_ok(&kind) {
         return bad_kind();
     }
-    if state.db.artist_by_id(id).await.ok().flatten().is_none() {
-        return not_found("No such artist");
+    match state.db.artist_by_id(id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return not_found("No such artist"),
+        Err(e) => return super::read_failed("that artist", &e).into_response(),
     }
     let (bytes, ext) = match read_one_image(&mut multipart).await {
         Ok(v) => v,
@@ -745,7 +760,12 @@ async fn serve_picture(
     if !kind_ok(&kind) {
         return bad_kind();
     }
-    let pick = state.db.artist_picture(user.user_id, id, &kind).await.ok().flatten();
+    let pick = state
+        .db
+        .artist_picture(user.user_id, id, &kind)
+        .await
+        .or_warn("serve_picture: artist_picture")
+        .flatten();
     let Some(pick) = pick else {
         return fall_back(&state, user.user_id, id, &kind).await;
     };

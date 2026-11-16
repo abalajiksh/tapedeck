@@ -1,3 +1,4 @@
+use crate::logging::OrWarn;
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
@@ -509,7 +510,7 @@ pub async fn submit_listens(
                                 .db
                                 .sole_source_of_kind(user.user_id, "navidrome")
                                 .await
-                                .ok()
+                                .or_warn("submit_listens: sole_source_of_kind")
                                 .flatten(),
                         );
                     }
@@ -541,7 +542,12 @@ pub async fn submit_listens(
         let device_id = if let Some(td) = info_ref.and_then(|ai| ai.tapedeck_device.as_ref()) {
             if let Some(ref mid) = td.machine_id {
                 if dry_run {
-                    state.db.find_device(user.user_id, mid).await.ok().flatten()
+                    state
+                        .db
+                        .find_device(user.user_id, mid)
+                        .await
+                        .or_warn("submit_listens: find_device")
+                        .flatten()
                 } else {
                     match state
                         .db
@@ -580,8 +586,12 @@ pub async fn submit_listens(
         // The box behind the reporter, when the device or token has been tied
         // to one: its outputs are learned and resolved per box, so two phones
         // that both say "Phone speaker" are two outputs, not one.
-        let source_box =
-            state.db.source_equipment(user.user_id, device_id, token_id).await.ok().flatten();
+        let source_box = state
+            .db
+            .source_equipment(user.user_id, device_id, token_id)
+            .await
+            .or_warn("submit_listens: source_equipment")
+            .flatten();
         if let Some(dev) = output_dev {
             if !dry_run {
                 let iface = output_iface.map(|s| s.as_str());
@@ -630,21 +640,35 @@ pub async fn submit_listens(
                     }
                 }
             } else if let Some((bound, variant)) = match (source_box, output_dev) {
-                (Some(eq), Some(dev)) => {
-                    state.db.resolve_device_binding(user.user_id, eq, dev).await.ok().flatten()
-                }
+                (Some(eq), Some(dev)) => state
+                    .db
+                    .resolve_device_binding(user.user_id, eq, dev)
+                    .await
+                    .or_warn("submit_listens: resolve_device_binding")
+                    .flatten(),
                 _ => None,
             } {
                 (Some(bound), variant, "device_output")
             } else if let Some((bound, variant)) = match output_dev {
-                Some(dev) => state.db.resolve_binding(user.user_id, dev).await.ok().flatten(),
+                Some(dev) => state
+                    .db
+                    .resolve_binding(user.user_id, dev)
+                    .await
+                    .or_warn("submit_listens: resolve_binding")
+                    .flatten(),
                 None => None,
             } {
                 (Some(bound), variant, "output_binding")
             } else if let Some(tc) = token_chain_id {
                 (Some(tc), None, "token_default")
             } else if let Some(dev) = device_id {
-                match state.db.get_device_default_chain(user.user_id, dev).await.ok().flatten() {
+                match state
+                    .db
+                    .get_device_default_chain(user.user_id, dev)
+                    .await
+                    .or_warn("submit_listens: get_device_default_chain")
+                    .flatten()
+                {
                     Some(cid) => (Some(cid), None, "device_default"),
                     None => (None, None, "none"),
                 }
@@ -656,9 +680,12 @@ pub async fn submit_listens(
         // named it. `save_scrobble` applies the same rule on its own; it is
         // looked up here so the dry run reports what will be filed.
         let chain_variant_id = match (chain_id, chain_variant_id) {
-            (Some(c), None) => {
-                state.db.fitted_variant(user.user_id, c, timestamp).await.ok().flatten()
-            }
+            (Some(c), None) => state
+                .db
+                .fitted_variant(user.user_id, c, timestamp)
+                .await
+                .or_warn("submit_listens: fitted_variant")
+                .flatten(),
             (_, v) => v,
         };
 
@@ -666,7 +693,12 @@ pub async fn submit_listens(
         // Fetched once: the context and the chain's name both come off the same
         // row, and the dry run wants the name.
         let chain = match chain_id {
-            Some(cid) => state.db.get_chain(user.user_id, cid).await.ok().flatten(),
+            Some(cid) => state
+                .db
+                .get_chain(user.user_id, cid)
+                .await
+                .or_warn("submit_listens: get_chain")
+                .flatten(),
             None => None,
         };
         let listening_context = chain.as_ref().map(|c| c.listening_context.as_str().to_string());
@@ -785,6 +817,7 @@ pub async fn submit_listens(
                         &state.listenbrainz_url,
                     )
                     .await
+                    .or_warn("submit_listens: sinks_for_user")
                     .unwrap_or_default();
                     crate::sinks::submit_now_playing(&user_sinks, &play).await;
                 }

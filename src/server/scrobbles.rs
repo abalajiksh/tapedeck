@@ -1,3 +1,4 @@
+use crate::logging::OrWarn;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -273,7 +274,12 @@ pub async fn list_skips(
                 .into_response();
         }
     };
-    let most = state.db.most_skipped(user.user_id, 10).await.unwrap_or_default();
+    let most = state
+        .db
+        .most_skipped(user.user_id, 10)
+        .await
+        .or_warn("list_skips: most_skipped")
+        .unwrap_or_default();
 
     let skips: Vec<_> = rows
         .into_iter()
@@ -408,20 +414,35 @@ pub async fn search(
     )
 )]
 async fn sanitize_preview(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
-    let albums = state.db.albums_with_mixed_releases(user.user_id).await.unwrap_or_default();
-    let joined = state.db.joined_artist_credits(user.user_id).await.unwrap_or_default();
+    // Every pass is the answer here: an empty list reads as "nothing to fix",
+    // which is exactly what a failed read must not say.
+    let failed =
+        |e: sqlx::Error| super::read_failed("what the sanitiser would change", &e).into_response();
+    let albums = match state.db.albums_with_mixed_releases(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => return failed(e),
+    };
+    let joined = match state.db.joined_artist_credits(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => return failed(e),
+    };
     // A `feat.` string the joined-credit pass can split is offered there, where
     // the featured artist keeps a credit of their own, not folded here as well.
-    let artists: Vec<_> = state
-        .db
-        .artists_with_featured_credits(user.user_id)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|a| !joined.iter().any(|j| !j.names.is_empty() && j.artist == a.artist))
-        .collect();
-    let variants = state.db.artists_with_spelling_variants(user.user_id).await.unwrap_or_default();
-    let splits = state.db.tracks_with_split_attribution(user.user_id).await.unwrap_or_default();
+    let artists: Vec<_> = match state.db.artists_with_featured_credits(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => return failed(e),
+    }
+    .into_iter()
+    .filter(|a| !joined.iter().any(|j| !j.names.is_empty() && j.artist == a.artist))
+    .collect();
+    let variants = match state.db.artists_with_spelling_variants(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => return failed(e),
+    };
+    let splits = match state.db.tracks_with_split_attribution(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => return failed(e),
+    };
     (
         StatusCode::OK,
         Json(SanitisePreview {
@@ -632,7 +653,11 @@ async fn sanitize_apply(
         };
         // The same filter the preview applies: a string the joined-credit pass
         // can split goes there, where the featured artist keeps a credit.
-        let joined = state.db.joined_artist_credits(user.user_id).await.unwrap_or_default();
+        // Unread, every joined string would be folded here as a featured one.
+        let joined = match state.db.joined_artist_credits(user.user_id).await {
+            Ok(j) => j,
+            Err(e) => return super::read_failed("the joined credits", &e).into_response(),
+        };
         for c in candidates
             .into_iter()
             .filter(|a| !joined.iter().any(|j| !j.names.is_empty() && j.artist == a.artist))
@@ -692,8 +717,10 @@ async fn sanitize_apply(
     let mut split_rows = 0u64;
     let mut splits_merged = 0u64;
     if !body.split_edits.is_empty() || body.splits {
-        let candidates =
-            state.db.tracks_with_split_attribution(user.user_id).await.unwrap_or_default();
+        let candidates = match state.db.tracks_with_split_attribution(user.user_id).await {
+            Ok(c) => c,
+            Err(e) => return super::read_failed("the split attributions", &e).into_response(),
+        };
 
         let apply = |title: &str, album: &str, from: &str, to: &str| {
             (title.to_string(), album.to_string(), from.to_string(), to.to_string())
@@ -1125,7 +1152,7 @@ async fn user_tz(state: &AppState, user_id: i64) -> chrono_tz::Tz {
         .db
         .get_preferences(user_id)
         .await
-        .ok()
+        .or_warn("user_tz: get_preferences")
         .and_then(|p| p.get("timezone").and_then(|v| v.as_str().map(str::to_string)))
         .unwrap_or_default();
     crate::analytics::parse_tz(&name)
@@ -1141,7 +1168,7 @@ pub(crate) async fn user_week_start(state: &AppState, user_id: i64) -> u32 {
         .db
         .get_preferences(user_id)
         .await
-        .ok()
+        .or_warn("user_week_start: get_preferences")
         .and_then(|p| p.get("week_start").and_then(|v| v.as_u64()))
         .map(|d| (d % 7) as u32)
         .unwrap_or(1)
@@ -1201,7 +1228,12 @@ pub async fn ranged_stats(
     // Breadth, when the genre map has been fetched and genres backfilled.
     // Absent rather than zeroed otherwise — "you play 0 genres" would be a lie
     // about the listening rather than a statement about the data.
-    let counts = state.db.genre_play_counts(user.user_id, after).await.unwrap_or_default();
+    let counts = state
+        .db
+        .genre_play_counts(user.user_id, after)
+        .await
+        .or_warn("ranged_stats: genre_play_counts")
+        .unwrap_or_default();
     if !counts.is_empty() {
         let names: Vec<String> = counts.iter().map(|(n, _)| n.clone()).collect();
         let coords = state.everynoise.coordinates_for(&names).await.unwrap_or_default();
@@ -1829,11 +1861,26 @@ async fn lyric_document(
     // words it was pinned to.
     let album = match album_hint.filter(|a| !a.trim().is_empty()) {
         Some(a) => Some(a),
-        None => state.db.album_for_track(user_id, title, artist).await.ok().flatten(),
+        None => state
+            .db
+            .album_for_track(user_id, title, artist)
+            .await
+            .or_warn("lyric_document: album_for_track")
+            .flatten(),
     };
-    let plays = state.db.track_play_count(user_id, artist, title).await.unwrap_or(0);
+    let plays = state
+        .db
+        .track_play_count(user_id, artist, title)
+        .await
+        .or_warn("lyric_document: track_play_count")
+        .unwrap_or(0);
     let rows = match album.as_deref() {
-        Some(a) => state.db.album_track_list(user_id, artist, a).await.unwrap_or_default(),
+        Some(a) => state
+            .db
+            .album_track_list(user_id, artist, a)
+            .await
+            .or_warn("lyric_document: album_track_list")
+            .unwrap_or_default(),
         None => Vec::new(),
     };
     // What each sibling track has, so the sidebar can mark the instrumentals and
@@ -1861,7 +1908,13 @@ async fn lyric_document(
     // Pins, keyed by the line they hang off. One query for the whole reader
     // rather than one per line — a lyric is a couple of hundred lines.
     let mut pins: std::collections::HashMap<usize, LinePin> = std::collections::HashMap::new();
-    for note in state.db.pins_for_track(user_id, artist, title).await.unwrap_or_default() {
+    for note in state
+        .db
+        .pins_for_track(user_id, artist, title)
+        .await
+        .or_warn("lyric_document: pins_for_track")
+        .unwrap_or_default()
+    {
         let Some(n) = note.line_key.as_deref().and_then(crate::db::NoteTarget::line_number) else {
             continue;
         };
@@ -2100,7 +2153,12 @@ pub(crate) async fn romanize_options(
     state: &Arc<AppState>,
     user_id: i64,
 ) -> crate::romanize::Options {
-    let prefs = state.db.get_preferences(user_id).await.unwrap_or_default();
+    let prefs = state
+        .db
+        .get_preferences(user_id)
+        .await
+        .or_warn("romanize_options: get_preferences")
+        .unwrap_or_default();
     crate::romanize::Options {
         indic: crate::romanize::IndicStyle::parse(
             prefs.get("lyrics_indic_style").and_then(|v| v.as_str()).unwrap_or("readable"),
@@ -3221,7 +3279,12 @@ async fn lyrics_status(State(state): State<Arc<AppState>>, user: AuthUser) -> im
     // running times, fetched to be counted and dropped. That query was also
     // quadratic at the time, so this endpoint could hold a pool connection for
     // twelve minutes; the card that reads it made a page load do that.
-    let unresolved = state.db.count_tracks_wanting_language().await.unwrap_or(0);
+    let unresolved = state
+        .db
+        .count_tracks_wanting_language()
+        .await
+        .or_warn("lyrics_status: count_tracks_wanting_language")
+        .unwrap_or(0);
     let Some(lyrics) = state.lyrics.clone() else {
         return (
             StatusCode::OK,

@@ -17,6 +17,7 @@
 //!   segments; matchit prefers static siblings, but the order is kept explicit
 //!   the same way `sources.rs` does it.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -253,7 +254,10 @@ async fn line_ref(db: &Database, user_id: i64, target: &str, ctx: &NoteCtx) -> O
             let n = n.parse::<usize>().ok().filter(|n| *n > 0)?;
             let artist = ctx.artist.as_deref()?;
             let album = ctx.album.as_deref()?;
-            let title = db.shelf_track_title(user_id, artist, album, side, pos).await.ok()??;
+            let title = db
+                .shelf_track_title(user_id, artist, album, side, pos)
+                .await
+                .or_warn("line_ref: shelf_track_title")??;
             Some(LineRef {
                 artist: artist.to_string(),
                 title,
@@ -411,7 +415,11 @@ async fn note_context(db: &Database, user_id: i64, note: &NoteRow) -> NoteCtx {
         }
         // For a track, the album comes from where this user actually heard it.
         _ => {
-            let album = db.album_for_track(user_id, &e.name, &e.artist_name).await.ok().flatten();
+            let album = db
+                .album_for_track(user_id, &e.name, &e.artist_name)
+                .await
+                .or_warn("note_context: album_for_track")
+                .flatten();
             NoteCtx { artist: Some(e.artist_name), album, track: Some(e.name) }
         }
     }
@@ -663,21 +671,25 @@ async fn note_json(
 ) -> NoteView {
     let ctx = note_context(db, user_id, note).await;
     let entity: Option<EntityRow> = match note.entity_id {
-        Some(id) => db.get_entity(id).await.ok().flatten(),
+        Some(id) => db.get_entity(id).await.or_warn("note_json: get_entity").flatten(),
         None => None,
     };
     let listen = match note.scrobble_id {
-        Some(id) => db.get_scrobble(user_id, id).await.ok().flatten().map(|s| NoteListen {
-            id: s.id,
-            title: s.title,
-            artist: s.artist,
-            album: s.album,
-            timestamp: s.timestamp,
-        }),
+        Some(id) => {
+            db.get_scrobble(user_id, id).await.or_warn("note_json: get_scrobble").flatten().map(
+                |s| NoteListen {
+                    id: s.id,
+                    title: s.title,
+                    artist: s.artist,
+                    album: s.album,
+                    timestamp: s.timestamp,
+                },
+            )
+        }
         None => None,
     };
     let loved = match note.entity_id {
-        Some(id) => db.is_loved(user_id, id).await.unwrap_or(false),
+        Some(id) => db.is_loved(user_id, id).await.or_warn("note_json: is_loved").unwrap_or(false),
         None => false,
     };
     let revisions = db.note_revisions(user_id, note.id).await.map(|r| r.len()).unwrap_or(0);
@@ -724,6 +736,7 @@ async fn note_json(
             Some(e) if e.kind == "release" => db
                 .album_track_list(user_id, &e.artist_name, &e.name)
                 .await
+                .or_warn("note_json: album_track_list")
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(title, ..)| (e.artist_name.clone(), title))
@@ -1304,13 +1317,23 @@ async fn note_for(
 
     let (note, target_json, loved) = match target {
         NoteTarget::Entity(id) => {
-            let entity = state.db.get_entity(id).await.ok().flatten();
-            let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
+            let entity = state.db.get_entity(id).await.or_warn("note_for: get_entity").flatten();
+            let loved = state
+                .db
+                .is_loved(user.user_id, id)
+                .await
+                .or_warn("note_for: is_loved")
+                .unwrap_or(false);
             (state.db.note_for_entity(user.user_id, id).await, TargetView::Entity { entity }, loved)
         }
         NoteTarget::Listen(id) => {
-            let listen =
-                state.db.get_scrobble(user.user_id, id).await.ok().flatten().map(|s| NoteListen {
+            let listen = state
+                .db
+                .get_scrobble(user.user_id, id)
+                .await
+                .or_warn("note_for: get_scrobble")
+                .flatten()
+                .map(|s| NoteListen {
                     id: s.id,
                     title: s.title,
                     artist: s.artist,
@@ -1508,7 +1531,8 @@ pub async fn set_love(
     let loved = body.loved.unwrap_or(true);
     match state.db.set_love(user.user_id, entity_id, loved).await {
         Ok(()) => {
-            let entity = state.db.get_entity(entity_id).await.ok().flatten();
+            let entity =
+                state.db.get_entity(entity_id).await.or_warn("set_love: get_entity").flatten();
 
             // Mirror it outward, but only for recordings — see `set_loved` on
             // the sink trait. Spawned rather than awaited: the love is already
@@ -1523,8 +1547,10 @@ pub async fn set_love(
                     // idempotent and re-assertable, so a missed mirror is fixed
                     // by the next toggle. Only the scrobble flush may not
                     // treat this as an empty answer.
-                    let sinks =
-                        crate::sinks::sinks_for_user(&db, uid, &url).await.unwrap_or_default();
+                    let sinks = crate::sinks::sinks_for_user(&db, uid, &url)
+                        .await
+                        .or_warn("set_love: sinks_for_user")
+                        .unwrap_or_default();
                     crate::sinks::submit_love(&sinks, &artist, &title, mbid.as_deref(), loved)
                         .await;
                 });
@@ -1676,7 +1702,7 @@ async fn listen_annotations(
             .db
             .note_for_scrobble(user.user_id, id)
             .await
-            .ok()
+            .or_warn("listen_annotations: note_for_scrobble")
             .flatten()
             .map(|n| n.id),
         track: None,
@@ -1695,7 +1721,12 @@ async fn listen_annotations(
             None
         } else {
             let artist = if kind == "artist" { None } else { Some(listen.artist.as_str()) };
-            let entity = state.db.find_entity(kind, name, artist).await.ok().flatten();
+            let entity = state
+                .db
+                .find_entity(kind, name, artist)
+                .await
+                .or_warn("listen_annotations: find_entity")
+                .flatten();
             Some(match entity {
                 Some(e) => AnnotationTarget {
                     name: name.to_string(),
@@ -1704,10 +1735,15 @@ async fn listen_annotations(
                         .db
                         .note_for_entity(user.user_id, e.id)
                         .await
-                        .ok()
+                        .or_warn("listen_annotations: note_for_entity")
                         .flatten()
                         .map(|n| n.id),
-                    loved: state.db.is_loved(user.user_id, e.id).await.unwrap_or(false),
+                    loved: state
+                        .db
+                        .is_loved(user.user_id, e.id)
+                        .await
+                        .or_warn("listen_annotations: is_loved")
+                        .unwrap_or(false),
                 },
                 None => AnnotationTarget {
                     name: name.to_string(),
@@ -1749,8 +1785,18 @@ async fn get_entity(
 ) -> impl IntoResponse {
     match state.db.get_entity(id).await {
         Ok(Some(entity)) => {
-            let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
-            let note = state.db.note_for_entity(user.user_id, id).await.ok().flatten();
+            let loved = state
+                .db
+                .is_loved(user.user_id, id)
+                .await
+                .or_warn("get_entity: is_loved")
+                .unwrap_or(false);
+            let note = state
+                .db
+                .note_for_entity(user.user_id, id)
+                .await
+                .or_warn("get_entity: note_for_entity")
+                .flatten();
             let note = match note {
                 Some(n) => Some(
                     note_json(&state.db, state.lyrics.as_deref(), user.user_id, &n, true).await,
@@ -1887,7 +1933,7 @@ async fn note_document(db: &Database, user_id: i64, note: &NoteRow, title: &str)
             .await;
 
     let entity = match note.entity_id {
-        Some(id) => db.get_entity(id).await.ok().flatten(),
+        Some(id) => db.get_entity(id).await.or_warn("note_document: get_entity").flatten(),
         None => None,
     };
 

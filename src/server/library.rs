@@ -13,6 +13,7 @@
 //! trade `resolve_reference` already makes — without it every link from the
 //! history would be dead until you happened to annotate the thing first.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -295,25 +296,53 @@ pub async fn album_detail(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
-    let tracks = state.db.album_tracks(user.user_id, &artist, &album).await.unwrap_or_default();
-    let credited =
-        state.db.album_credits(user.user_id, &artist, &album, 12).await.unwrap_or_default();
-    let more =
-        state.db.artist_albums(user.user_id, &artist, Some(&album), 4).await.unwrap_or_default();
+    let tracks = state
+        .db
+        .album_tracks(user.user_id, &artist, &album)
+        .await
+        .or_warn("album_detail: album_tracks")
+        .unwrap_or_default();
+    let credited = state
+        .db
+        .album_credits(user.user_id, &artist, &album, 12)
+        .await
+        .or_warn("album_detail: album_credits")
+        .unwrap_or_default();
+    let more = state
+        .db
+        .artist_albums(user.user_id, &artist, Some(&album), 4)
+        .await
+        .or_warn("album_detail: artist_albums")
+        .unwrap_or_default();
     // A hand-set cover beats the derived one outright, including its CAA id —
     // leaving those in place would have `CoverArt` fall back to the release the
     // listens claim the moment the chosen URL fails to load, which is exactly
     // the picture the operator said no to.
-    let override_url = state.db.entity_image(id).await.ok().flatten();
+    let override_url =
+        state.db.entity_image(id).await.or_warn("album_detail: entity_image").flatten();
     let artwork = match &override_url {
         Some(_) => None,
-        None => state.db.album_artwork(user.user_id, &artist, &album).await.ok().flatten(),
+        None => state
+            .db
+            .album_artwork(user.user_id, &artist, &album)
+            .await
+            .or_warn("album_detail: album_artwork")
+            .flatten(),
     };
 
     // The artist gets an entity too, so the header link has somewhere to go.
-    let artist_entity_id = state.db.upsert_entity("artist", &artist, "", None).await.ok();
+    let artist_entity_id = state
+        .db
+        .upsert_entity("artist", &artist, "", None)
+        .await
+        .or_warn("album_detail: upsert_entity");
 
-    let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
+    let loved = state
+        .db
+        .is_loved(user.user_id, id)
+        .await
+        .or_warn("album_detail: is_loved")
+        .unwrap_or(false);
     let bio = bio_for(
         &state,
         id,
@@ -338,7 +367,12 @@ pub async fn album_detail(
     // Share of the *artist*, mirroring the artist page's share of all
     // listening: the dark card on both entity pages is now "how much of the
     // thing one level up is this?".
-    let artist_plays = state.db.artist_plays(user.user_id, &artist).await.unwrap_or(0);
+    let artist_plays = state
+        .db
+        .artist_plays(user.user_id, &artist)
+        .await
+        .or_warn("album_detail: artist_plays")
+        .unwrap_or(0);
 
     let stats = match &summary {
         Some(s) => {
@@ -443,13 +477,28 @@ pub async fn artist_detail(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
 
-    let albums = state.db.artist_albums(user.user_id, &name, None, 6).await.unwrap_or_default();
-    let top_tracks = state.db.artist_top_tracks(user.user_id, &name, 10).await.unwrap_or_default();
+    let albums = state
+        .db
+        .artist_albums(user.user_id, &name, None, 6)
+        .await
+        .or_warn("artist_detail: artist_albums")
+        .unwrap_or_default();
+    let top_tracks = state
+        .db
+        .artist_top_tracks(user.user_id, &name, 10)
+        .await
+        .or_warn("artist_detail: artist_top_tracks")
+        .unwrap_or_default();
     // Membership from the cache the credits backfill fills — a page never
     // waits on a rate-limited service. Empty until it has been asked.
     let artist_mbid = match entity.mbid.clone() {
         Some(m) => Some(m),
-        None => state.db.artist_mbid_for(user.user_id, &name).await.ok().flatten(),
+        None => state
+            .db
+            .artist_mbid_for(user.user_id, &name)
+            .await
+            .or_warn("artist_detail: artist_mbid_for")
+            .flatten(),
     };
     let band = match artist_mbid.as_deref() {
         // Only if MusicBrainz's artist is this page's: a credit's MBID can be
@@ -470,22 +519,45 @@ pub async fn artist_detail(
                 .db
                 .artists_in_history(user.user_id, &names(&b.member_of))
                 .await
+                .or_warn("artist_detail: artists_in_history")
                 .unwrap_or_default(),
-            state.db.artists_in_history(user.user_id, &names(&b.members)).await.unwrap_or_default(),
+            state
+                .db
+                .artists_in_history(user.user_id, &names(&b.members))
+                .await
+                .or_warn("artist_detail: artists_in_history")
+                .unwrap_or_default(),
         ),
         None => (Vec::new(), Vec::new()),
     };
     let tz = super::scrobbles::user_tz_for(&state, user.user_id).await;
-    let trend = state.db.artist_trend(user.user_id, &name, tz).await.unwrap_or_default();
-    let (rank, artist_total) = state.db.artist_rank(user.user_id, &name).await.unwrap_or((0, 0));
-    let all_plays = state.db.total_plays(user.user_id).await.unwrap_or(0);
-    let loved = state.db.is_loved(user.user_id, id).await.unwrap_or(false);
+    let trend = state
+        .db
+        .artist_trend(user.user_id, &name, tz)
+        .await
+        .or_warn("artist_detail: artist_trend")
+        .unwrap_or_default();
+    let (rank, artist_total) = state
+        .db
+        .artist_rank(user.user_id, &name)
+        .await
+        .or_warn("artist_detail: artist_rank")
+        .unwrap_or((0, 0));
+    let all_plays =
+        state.db.total_plays(user.user_id).await.or_warn("artist_detail: total_plays").unwrap_or(0);
+    let loved = state
+        .db
+        .is_loved(user.user_id, id)
+        .await
+        .or_warn("artist_detail: is_loved")
+        .unwrap_or(false);
     // Same portrait the top-artist charts use — the enrichment chain already
     // stores it on the artist row, it just had nowhere to be shown here.
     let image_url = state
         .db
         .artist_images(user.user_id, std::slice::from_ref(&name))
         .await
+        .or_warn("artist_detail: artist_images")
         .unwrap_or_default()
         .into_values()
         .next();
@@ -495,6 +567,7 @@ pub async fn artist_detail(
         .db
         .artist_landscapes(user.user_id, std::slice::from_ref(&name))
         .await
+        .or_warn("artist_detail: artist_landscapes")
         .unwrap_or_default()
         .into_values()
         .next();
@@ -502,7 +575,8 @@ pub async fn artist_detail(
     // name and shared across users — and it is what the portrait proxy and the
     // manual override address. Created on demand so the override is always
     // available, even for an artist the backfill hasn't reached.
-    let artist_row_id = state.db.artist_row_id(&name).await.unwrap_or(None);
+    let artist_row_id =
+        state.db.artist_row_id(&name).await.or_warn("artist_detail: artist_row_id").flatten();
     let bio = bio_for(
         &state,
         id,
@@ -762,7 +836,12 @@ pub async fn resolve(
     let artist = if kind == "artist" { "" } else { q.artist.as_deref().unwrap_or("").trim() };
     // A spelling folded onto another opens the one its credits are under.
     let folded = match kind {
-        "artist" => state.db.credited_spelling(user.user_id, name).await.ok().flatten(),
+        "artist" => state
+            .db
+            .credited_spelling(user.user_id, name)
+            .await
+            .or_warn("resolve: credited_spelling")
+            .flatten(),
         _ => None,
     };
     let name = folded.as_deref().unwrap_or(name);
@@ -841,7 +920,12 @@ async fn album_tracklist(
     // tagged library gives for free. Only then a search, which is a guess.
     let mbid = match entity.mbid.clone() {
         Some(m) if !m.trim().is_empty() => Some(m),
-        _ => state.db.album_release_mbid(user.user_id, &artist, &album).await.unwrap_or(None),
+        _ => state
+            .db
+            .album_release_mbid(user.user_id, &artist, &album)
+            .await
+            .or_warn("album_tracklist: album_release_mbid")
+            .flatten(),
     };
 
     let candidate = match mbid {

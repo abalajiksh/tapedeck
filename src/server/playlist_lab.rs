@@ -19,6 +19,7 @@
 //! are about the music and four are about the listener, and every track by one
 //! artist shares its six Sound coordinates.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -191,7 +192,11 @@ async fn space(
     // Every genre name in play, joined to the map in one go. `coordinates_for`
     // keys on `genre_key`, which folds punctuation and accents — the difference
     // between "dance-pop" and "dance pop", and worth 10% more tags.
-    let counts = state.db.genre_play_counts(user.user_id, None).await.unwrap_or_default();
+    // Unread, every track would land in the space with no Sound half.
+    let counts = match state.db.genre_play_counts(user.user_id, None).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("your genres", &e).into_response(),
+    };
     let names: Vec<String> = counts.into_iter().map(|(n, _)| n).collect();
     let coords = match state.everynoise.coordinates_for(&names).await {
         Ok(c) => c,
@@ -208,6 +213,7 @@ async fn space(
         .db
         .loved_keys(user.user_id)
         .await
+        .or_warn("space: loved_keys")
         .unwrap_or_default()
         .iter()
         .filter_map(|k| k.strip_prefix("recording|"))

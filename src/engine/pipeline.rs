@@ -1,3 +1,4 @@
+use crate::logging::OrWarn;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -349,7 +350,12 @@ impl ScrobbleEngine {
         if due.is_empty() {
             return;
         }
-        let thresholds = self.db.scrobble_thresholds().await.unwrap_or_default();
+        let thresholds = self
+            .db
+            .scrobble_thresholds()
+            .await
+            .or_warn("resolve_pending_skips: scrobble_thresholds")
+            .unwrap_or_default();
         for (user_id, pending) in due {
             let threshold = thresholds.get(&user_id).copied().unwrap_or_default();
             if threshold.reached(pending.bound_secs, pending.duration) {
@@ -690,8 +696,10 @@ impl ScrobbleEngine {
                     if changed {
                         let album = play.album.clone();
                         enrich_play(mb_client, &mut play, album.as_deref()).await;
-                        let sinks =
-                            sinks::sinks_for_user(db, user_id, lb_url).await.unwrap_or_default();
+                        let sinks = sinks::sinks_for_user(db, user_id, lb_url)
+                            .await
+                            .or_warn("poll_navidrome: sinks_for_user")
+                            .unwrap_or_default();
                         sinks::submit_now_playing(&sinks, &play).await;
                     }
                 }
@@ -834,7 +842,11 @@ impl ScrobbleEngine {
             // a device row is right once per banked listen and wrong every five
             // seconds for something still playing.
             np.chain_id = match &track.player {
-                Some(p) => db.device_chain_by_key(user_id, &p.machine_id).await.ok().flatten(),
+                Some(p) => db
+                    .device_chain_by_key(user_id, &p.machine_id)
+                    .await
+                    .or_warn("poll_media_browser: device_chain_by_key")
+                    .flatten(),
                 None => None,
             };
             let changed = now_playing.set(user_id, np);
@@ -843,7 +855,10 @@ impl ScrobbleEngine {
                     let album = play.album.clone();
                     enrich_play(mb_client, &mut play, album.as_deref()).await;
                 }
-                let sinks = sinks::sinks_for_user(db, user_id, lb_url).await.unwrap_or_default();
+                let sinks = sinks::sinks_for_user(db, user_id, lb_url)
+                    .await
+                    .or_warn("poll_media_browser: sinks_for_user")
+                    .unwrap_or_default();
                 sinks::submit_now_playing(&sinks, &play).await;
             }
         }
@@ -882,7 +897,11 @@ impl ScrobbleEngine {
                     .await
                 {
                     Ok(dev) => {
-                        let chain = db.get_device_default_chain(user_id, dev).await.ok().flatten();
+                        let chain = db
+                            .get_device_default_chain(user_id, dev)
+                            .await
+                            .or_warn("poll_media_browser: get_device_default_chain")
+                            .flatten();
                         (Some(dev), chain)
                     }
                     Err(e) => {
@@ -897,7 +916,7 @@ impl ScrobbleEngine {
                 Some(cid) => db
                     .get_chain(user_id, cid)
                     .await
-                    .ok()
+                    .or_warn("poll_media_browser: get_chain")
                     .flatten()
                     .map(|c| c.listening_context.as_str().to_string()),
                 None => None,
@@ -955,7 +974,11 @@ impl ScrobbleEngine {
                     .await
                 {
                     Ok(dev) => {
-                        let chain = db.get_device_default_chain(user_id, dev).await.ok().flatten();
+                        let chain = db
+                            .get_device_default_chain(user_id, dev)
+                            .await
+                            .or_warn("poll_media_browser: get_device_default_chain")
+                            .flatten();
                         (Some(dev), chain)
                     }
                     Err(_) => (None, None),
@@ -966,7 +989,7 @@ impl ScrobbleEngine {
                 Some(cid) => db
                     .get_chain(user_id, cid)
                     .await
-                    .ok()
+                    .or_warn("poll_media_browser: get_chain")
                     .flatten()
                     .map(|c| c.listening_context.as_str().to_string()),
                 None => None,
@@ -1061,7 +1084,11 @@ impl ScrobbleEngine {
             // Roon's endpoint is the device — the only rung of the ladder a
             // Roon listen ever reaches.
             np.chain_id = match &track.output {
-                Some(o) => db.device_chain_by_key(user_id, &o.machine_id).await.ok().flatten(),
+                Some(o) => db
+                    .device_chain_by_key(user_id, &o.machine_id)
+                    .await
+                    .or_warn("poll_roon: device_chain_by_key")
+                    .flatten(),
                 None => None,
             };
             let changed = now_playing.set(user_id, np);
@@ -1070,7 +1097,10 @@ impl ScrobbleEngine {
                     let album = play.album.clone();
                     enrich_play(mb_client, &mut play, album.as_deref()).await;
                 }
-                let sinks = sinks::sinks_for_user(db, user_id, lb_url).await.unwrap_or_default();
+                let sinks = sinks::sinks_for_user(db, user_id, lb_url)
+                    .await
+                    .or_warn("poll_roon: sinks_for_user")
+                    .unwrap_or_default();
                 sinks::submit_now_playing(&sinks, &play).await;
             }
         }
@@ -1105,7 +1135,11 @@ impl ScrobbleEngine {
                     .await
                 {
                     Ok(dev) => {
-                        let chain = db.get_device_default_chain(user_id, dev).await.ok().flatten();
+                        let chain = db
+                            .get_device_default_chain(user_id, dev)
+                            .await
+                            .or_warn("poll_roon: get_device_default_chain")
+                            .flatten();
                         (Some(dev), chain)
                     }
                     Err(e) => {
@@ -1120,7 +1154,7 @@ impl ScrobbleEngine {
                 Some(cid) => db
                     .get_chain(user_id, cid)
                     .await
-                    .ok()
+                    .or_warn("poll_roon: get_chain")
                     .flatten()
                     .map(|c| c.listening_context.as_str().to_string()),
                 None => None,
@@ -1163,7 +1197,11 @@ impl ScrobbleEngine {
                     .await
                 {
                     Ok(dev) => {
-                        let chain = db.get_device_default_chain(user_id, dev).await.ok().flatten();
+                        let chain = db
+                            .get_device_default_chain(user_id, dev)
+                            .await
+                            .or_warn("poll_roon: get_device_default_chain")
+                            .flatten();
                         (Some(dev), chain)
                     }
                     Err(_) => (None, None),
@@ -1174,7 +1212,7 @@ impl ScrobbleEngine {
                 Some(cid) => db
                     .get_chain(user_id, cid)
                     .await
-                    .ok()
+                    .or_warn("poll_roon: get_chain")
                     .flatten()
                     .map(|c| c.listening_context.as_str().to_string()),
                 None => None,
@@ -1315,15 +1353,21 @@ impl ScrobbleEngine {
                 // read-only, so Patch can apply one sharing rule rather than
                 // two.
                 np.chain_id = match &plex_track.player {
-                    Some(p) => db.device_chain_by_key(user_id, &p.machine_id).await.ok().flatten(),
+                    Some(p) => db
+                        .device_chain_by_key(user_id, &p.machine_id)
+                        .await
+                        .or_warn("run_tick: device_chain_by_key")
+                        .flatten(),
                     None => None,
                 };
                 let changed = now_playing.set(user_id, np);
 
                 if changed {
                     enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
-                    let user_sinks =
-                        sinks::sinks_for_user(&db, user_id, &lb_url).await.unwrap_or_default();
+                    let user_sinks = sinks::sinks_for_user(&db, user_id, &lb_url)
+                        .await
+                        .or_warn("run_tick: sinks_for_user")
+                        .unwrap_or_default();
                     sinks::submit_now_playing(&user_sinks, &play).await;
                 }
             }
@@ -1415,8 +1459,11 @@ impl ScrobbleEngine {
                             .await
                         {
                             Ok(dev) => {
-                                let chain =
-                                    db.get_device_default_chain(user_id, dev).await.ok().flatten();
+                                let chain = db
+                                    .get_device_default_chain(user_id, dev)
+                                    .await
+                                    .or_warn("run_tick: get_device_default_chain")
+                                    .flatten();
                                 (Some(dev), chain)
                             }
                             Err(e) => {
@@ -1433,7 +1480,7 @@ impl ScrobbleEngine {
                     Some(cid) => db
                         .get_chain(user_id, cid)
                         .await
-                        .ok()
+                        .or_warn("run_tick: get_chain")
                         .flatten()
                         .map(|c| c.listening_context.as_str().to_string()),
                     None => None,
@@ -1485,8 +1532,11 @@ impl ScrobbleEngine {
                         .await
                     {
                         Ok(dev) => {
-                            let chain =
-                                db.get_device_default_chain(user_id, dev).await.ok().flatten();
+                            let chain = db
+                                .get_device_default_chain(user_id, dev)
+                                .await
+                                .or_warn("run_tick: get_device_default_chain")
+                                .flatten();
                             (Some(dev), chain)
                         }
                         Err(_) => (None, None),
@@ -1497,7 +1547,7 @@ impl ScrobbleEngine {
                     Some(cid) => db
                         .get_chain(user_id, cid)
                         .await
-                        .ok()
+                        .or_warn("run_tick: get_chain")
                         .flatten()
                         .map(|c| c.listening_context.as_str().to_string()),
                     None => None,

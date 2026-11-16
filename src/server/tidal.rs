@@ -11,6 +11,7 @@
 //! deliberately does not cross. A scrobble client has no business connecting a
 //! TIDAL account.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
@@ -352,7 +353,11 @@ pub async fn store(
 
 /// This user's stored TIDAL credentials, if they have connected one.
 pub async fn credentials(state: &AppState, user_id: i64) -> Option<TidalCredentials> {
-    let rows = state.db.get_connections_for_forwarding(user_id).await.ok()?;
+    let rows = state
+        .db
+        .get_connections_for_forwarding(user_id)
+        .await
+        .or_warn("credentials: get_connections_for_forwarding")?;
     rows.into_iter()
         .find(|(service, _)| service == tidal::SERVICE)
         .and_then(|(_, blob)| serde_json::from_str(&blob).ok())
@@ -398,18 +403,15 @@ async fn get_settings(
         return err(403, "Admin only");
     }
     let from_env = TidalApp::from_env().is_some();
-    let stored = state
-        .db
-        .get_app_setting(tidal::CLIENT_ID_KEY)
-        .await
-        .unwrap_or(None)
-        .is_some_and(|v| !v.trim().is_empty());
-    let has_secret = state
-        .db
-        .get_app_setting(tidal::CLIENT_SECRET_KEY)
-        .await
-        .unwrap_or(None)
-        .is_some_and(|v| !v.trim().is_empty());
+    // What is stored is the answer: unread, it would say "not configured".
+    let mut set = [false; 2];
+    for (i, key) in [tidal::CLIENT_ID_KEY, tidal::CLIENT_SECRET_KEY].into_iter().enumerate() {
+        match state.db.get_app_setting(key).await {
+            Ok(v) => set[i] = v.is_some_and(|v| !v.trim().is_empty()),
+            Err(e) => return super::read_failed("the TIDAL settings", &e).into_response(),
+        }
+    }
+    let [stored, has_secret] = set;
     (
         StatusCode::OK,
         Json(TidalSettings {
@@ -478,7 +480,13 @@ async fn set_settings(
     if !user.is_admin {
         return err(403, "Admin only");
     }
-    let before = state.db.get_app_setting(tidal::CLIENT_ID_KEY).await.unwrap_or(None);
+    // Both sides of the comparison are read, or nothing is compared: a failed
+    // read reads as `None`, which differs from any stored id and would drop
+    // every TIDAL connection for a registration that never changed.
+    let before = match state.db.get_app_setting(tidal::CLIENT_ID_KEY).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("the TIDAL settings", &e).into_response(),
+    };
 
     for (key, value) in
         [(tidal::CLIENT_ID_KEY, &body.client_id), (tidal::CLIENT_SECRET_KEY, &body.client_secret)]
@@ -490,7 +498,13 @@ async fn set_settings(
         }
     }
 
-    let after = state.db.get_app_setting(tidal::CLIENT_ID_KEY).await.unwrap_or(None);
+    let after = match state.db.get_app_setting(tidal::CLIENT_ID_KEY).await {
+        Ok(v) => v,
+        Err(e) => {
+            return super::read_failed("the TIDAL settings back after saving them", &e)
+                .into_response()
+        }
+    };
     if before != after {
         match state.db.delete_connections_for_service(tidal::SERVICE).await {
             Ok(n) if n > 0 => {

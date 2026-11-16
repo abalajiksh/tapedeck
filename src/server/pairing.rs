@@ -24,6 +24,7 @@
 //! * approval requires a **logged-in session**, so guessing a code gets you
 //!   nothing without an account.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -389,8 +390,13 @@ pub async fn poll(
             // The name a client shows as "paired as …". Looked up from the
             // token rather than stored on the request: the token is the thing
             // that now says whose it is.
-            let user_name =
-                state.db.validate_token(&token).await.ok().flatten().map(|t| t.user.username);
+            let user_name = state
+                .db
+                .validate_token(&token)
+                .await
+                .or_warn("poll: validate_token")
+                .flatten()
+                .map(|t| t.user.username);
             (
                 StatusCode::OK,
                 [("cache-control", "no-store")],

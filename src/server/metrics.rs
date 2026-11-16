@@ -11,6 +11,7 @@
 //! user's business, and this instance is reachable from the internet whenever
 //! it's behind a tunnel. Set the variable to scrape it.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
@@ -93,9 +94,13 @@ async fn metrics(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Resp
         // household instance that is one member reading the others' totals.
         let session = extract_session_cookie_from(&headers);
         let is_admin = match session {
-            Some(t) => {
-                state.db.validate_session(&t).await.ok().flatten().is_some_and(|u| u.is_admin)
-            }
+            Some(t) => state
+                .db
+                .validate_session(&t)
+                .await
+                .or_warn("metrics: validate_session")
+                .flatten()
+                .is_some_and(|u| u.is_admin),
             None => false,
         };
         if !is_admin {

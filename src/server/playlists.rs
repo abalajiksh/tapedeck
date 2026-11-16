@@ -25,6 +25,7 @@
 //!   thing this must never do is put something on a playlist that isn't what was
 //!   asked for.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -444,7 +445,12 @@ pub async fn push_tracks(
     let isrcs = {
         let pairs: Vec<(String, String)> =
             tracks.iter().map(|t| (t.title.clone(), t.artist.clone())).collect();
-        state.db.isrc_map(user_id, &pairs).await.unwrap_or_default()
+        state
+            .db
+            .isrc_map(user_id, &pairs)
+            .await
+            .or_warn("push_tracks: isrc_map")
+            .unwrap_or_default()
     };
     let with_isrc: Vec<PlaylistTrack> = tracks
         .iter()
@@ -560,7 +566,15 @@ pub async fn push_tracks(
     // **not** papered over by creating a second playlist: the list was found and
     // the rewrite went wrong, so there is a playlist out there in a state the
     // user needs told about rather than a duplicate sitting beside it.
-    let remembered = state.db.pushed_playlist(user_id, source_id, &name).await.unwrap_or(None);
+    // Unread, "remembered" would be "never pushed", and a second playlist would
+    // be made beside the first — the duplicate this lookup exists to prevent.
+    let remembered = match state.db.pushed_playlist(user_id, source_id, &name).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("could not read the pushed playlist: {}", crate::logging::error_chain(&e));
+            return Err(fail(500, "Could not read which playlist was pushed before".into()));
+        }
+    };
     let rewritten: Option<Result<String, String>> = match remembered.as_deref() {
         Some(existing) => match target.replace_playlist(existing, &ids).await {
             Ok(true) => Some(Ok(existing.to_string())),

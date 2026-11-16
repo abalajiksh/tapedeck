@@ -14,6 +14,7 @@
 //! share. What it does cost is CPU, which is why one render runs at a time
 //! and each user has one in flight.
 
+use crate::logging::OrWarn;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -116,14 +117,25 @@ async fn album_cover(
     // has no entity, so the artist is checked: another artist's hand-set
     // cover is not this record's.
     let chosen = match state.db.find_entity("release", album, Some(artist)).await {
-        Ok(Some(e)) if e.artist_name.trim().eq_ignore_ascii_case(artist.trim()) => {
-            state.db.entity_image(e.id).await.ok().flatten().filter(|u| !u.is_empty())
-        }
+        Ok(Some(e)) if e.artist_name.trim().eq_ignore_ascii_case(artist.trim()) => state
+            .db
+            .entity_image(e.id)
+            .await
+            .or_warn("album_cover: entity_image")
+            .flatten()
+            .filter(|u| !u.is_empty()),
         _ => None,
     };
     match chosen {
         Some(url) => Some(url),
-        None => cover(state.db.album_artwork(user_id, artist, album).await.ok().flatten()),
+        None => cover(
+            state
+                .db
+                .album_artwork(user_id, artist, album)
+                .await
+                .or_warn("album_cover: album_artwork")
+                .flatten(),
+        ),
     }
 }
 
@@ -150,6 +162,7 @@ async fn resolve_art(state: &Arc<AppState>, user_id: i64, period: &serde_json::V
             .db
             .artist_images(user_id, std::slice::from_ref(&name))
             .await
+            .or_warn("resolve_art: artist_images")
             .unwrap_or_default()
             .into_values()
             .next()

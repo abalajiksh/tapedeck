@@ -16,6 +16,7 @@
 //! * **Cached hard.** Library art never changes for a given item, so a long
 //!   `Cache-Control` keeps a scrolling history from re-proxying every row.
 
+use crate::logging::OrWarn;
 use axum::{
     body::Body,
     extract::{Multipart, Path, Query, State},
@@ -174,7 +175,11 @@ pub(super) async fn artist_image_from_library(
     user_id: i64,
     name: &str,
 ) -> Option<(Vec<u8>, String)> {
-    let sources = state.db.list_sources_for_user(user_id).await.ok()?;
+    let sources = state
+        .db
+        .list_sources_for_user(user_id)
+        .await
+        .or_warn("artist_image_from_library: list_sources_for_user")?;
     for source in sources.iter().filter(|s| s.enabled) {
         let egress = source.egress();
         if egress.check_url(&source.url).is_err() {
@@ -328,7 +333,8 @@ async fn set_album_cover(
     let Some(value) = validate_image_url(&body.url) else {
         return not_an_image_url();
     };
-    let previous = state.db.entity_image(id).await.ok().flatten();
+    let previous =
+        state.db.entity_image(id).await.or_warn("set_album_cover: entity_image").flatten();
     match state.db.set_entity_image(id, value).await {
         Ok(true) => {
             forget_previous(&state, previous.as_deref()).await;
@@ -569,7 +575,8 @@ async fn upload_album_cover(
     mut multipart: Multipart,
 ) -> Response {
     let _ = &user;
-    let previous = state.db.entity_image(id).await.ok().flatten();
+    let previous =
+        state.db.entity_image(id).await.or_warn("upload_album_cover: entity_image").flatten();
     let (bytes, ext) = match read_one_image(&mut multipart).await {
         Ok(v) => v,
         Err(r) => return r,

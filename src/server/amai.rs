@@ -31,6 +31,7 @@
 //! one the ISRC work skipped: that shipped a matcher whose ceiling was 43% and
 //! whose ceiling did not cover the tracks that were failing.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -174,14 +175,14 @@ async fn configured(state: &AppState) -> Option<Amai> {
         .db
         .get_app_setting(amai::TOKEN_KEY)
         .await
-        .ok()
+        .or_warn("configured: get_app_setting")
         .flatten()
         .or_else(|| env_nonempty("TAPEDECK_AMAI_TOKEN"));
     let server = state
         .db
         .get_app_setting(amai::SERVER_KEY)
         .await
-        .ok()
+        .or_warn("configured: get_app_setting")
         .flatten()
         .or_else(|| env_nonempty("TAPEDECK_AMAI_SERVER"));
 
@@ -216,9 +217,14 @@ async fn get_settings(State(state): State<Arc<AppState>>, user: AuthUser) -> imp
     if !user.is_admin {
         return err(403, "Admin only");
     }
-    let stored_url = state.db.get_app_setting(amai::URL_KEY).await.unwrap_or(None);
-    let stored_token = state.db.get_app_setting(amai::TOKEN_KEY).await.unwrap_or(None);
-    let stored_server = state.db.get_app_setting(amai::SERVER_KEY).await.unwrap_or(None);
+    // What is stored is the answer: unread, it would say "nothing stored".
+    let mut stored = false;
+    for key in [amai::URL_KEY, amai::TOKEN_KEY, amai::SERVER_KEY] {
+        match state.db.get_app_setting(key).await {
+            Ok(v) => stored |= v.is_some(),
+            Err(e) => return super::read_failed("the amai settings", &e).into_response(),
+        }
+    }
     let env_url = env_nonempty("TAPEDECK_AMAI_URL");
 
     let client = configured(&state).await;
@@ -231,7 +237,7 @@ async fn get_settings(State(state): State<Arc<AppState>>, user: AuthUser) -> imp
             url: client.as_ref().map(|c| c.base_url().to_string()),
             has_token: client.as_ref().is_some_and(Amai::has_token),
             server: client.as_ref().and_then(|c| c.server().map(str::to_string)),
-            stored: stored_url.is_some() || stored_token.is_some() || stored_server.is_some(),
+            stored,
             from_env: env_url.is_some(),
         }),
     )

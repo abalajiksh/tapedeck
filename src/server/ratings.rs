@@ -31,6 +31,7 @@
 //! threshold is a knob the user is expected to try at several settings, and
 //! every setting would otherwise be a broadcast.
 
+use crate::logging::OrWarn;
 use axum::{
     extract::State,
     http::StatusCode,
@@ -308,7 +309,11 @@ struct RatingSample {
     )
 )]
 async fn get_ratings(State(state): State<Arc<AppState>>, user: AuthUser) -> impl IntoResponse {
-    let prefs = state.db.get_preferences(user.user_id).await.unwrap_or_default();
+    // The rule and the scale are the answer: unread, the defaults would be shown as yours.
+    let prefs = match state.db.get_preferences(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("your rating settings", &e).into_response(),
+    };
     let scale = display_scale_from_prefs(&prefs);
     let rule = LoveRule::from_prefs(&prefs);
 
@@ -316,7 +321,12 @@ async fn get_ratings(State(state): State<Arc<AppState>>, user: AuthUser) -> impl
         Ok(s) => s,
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     };
-    let rows = state.db.list_library_ratings(user.user_id, 60).await.unwrap_or_default();
+    let rows = state
+        .db
+        .list_library_ratings(user.user_id, 60)
+        .await
+        .or_warn("get_ratings: list_library_ratings")
+        .unwrap_or_default();
     let sample: Vec<RatingSample> = rows
         .iter()
         .map(|r| RatingSample {
@@ -429,7 +439,11 @@ async fn apply_ratings(
         );
     };
 
-    let prefs = state.db.get_preferences(user.user_id).await.unwrap_or_default();
+    // Unread, the stored rule would be the default one, and a dry run would preview the wrong loves.
+    let prefs = match state.db.get_preferences(user.user_id).await {
+        Ok(v) => v,
+        Err(e) => return super::read_failed("your rating settings", &e).into_response(),
+    };
     let stored = LoveRule::from_prefs(&prefs);
     let scale = match req.scale.as_deref() {
         Some(s) => DisplayScale::from_id(s),

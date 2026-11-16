@@ -143,22 +143,39 @@ rules:
           regex: '(?is)^(?!.*\bLIMIT\b).*\bFROM\s+scrobble(s|_artists)\b'
 
   # ── Handlers ─────────────────────────────────────────────────────────────
-  # A WARNING, not an ERROR: 147 of these predate the rule (2026-11-15), and
-  # tapedeck-main fails on any ERROR anywhere in the tree. A PR sees only the
-  # ones it adds.
+  # An ERROR since v0.131.3: the 147 `state.db` reads that predated the rule
+  # (2026-11-15), and the 44 through a bare `db`, `self.db` or
+  # `sinks_for_user` that widening it found, were each turned into a failure
+  # or a logged default, so the tree is clean. Reads inside `impl Database`
+  # (`self.artist_images(…)`, the migrations) are not matched: there `self`
+  # is the database, and so is every other method call.
   - id: db-read-error-becomes-empty
     languages: [rust]
-    severity: WARNING
+    severity: ERROR
     message: >-
       A database read whose error is turned into an empty or default answer.
       The page then says "nothing" when the truth is "could not read", and
       nothing is logged — how a Postgres-only failure in artist_trend went
-      unseen. Handle the error (a 500 with a warn!), or log it before
-      defaulting if a partial page really is better.
+      unseen. If the response is about this read, answer 500 with
+      `server::read_failed`. If it is one optional part of a larger page, log
+      it before defaulting: `.await.or_warn("what").unwrap_or_default()`
+      (`crate::logging::OrWarn`).
+    # Every handle on the database a handler or a background pass holds:
+    # `state.db`, a bare `db` (a parameter, a clone moved into a task) and
+    # `self.db`, plus `sinks_for_user`, which reads the person's connections.
     pattern-either:
-      - pattern: state.db.$F(...).await.unwrap_or_default()
-      - pattern: state.db.$F(...).await.unwrap_or($D)
-      - pattern: state.db.$F(...).await.ok()
+      - patterns:
+          - pattern-either:
+              - pattern: $R.$F(...).await.unwrap_or_default()
+              - pattern: $R.$F(...).await.unwrap_or($D)
+              - pattern: $R.$F(...).await.ok()
+          - metavariable-regex:
+              metavariable: $R
+              regex: ^(state\.db|db|self\.db)$
+      # Outside the branch above: it binds no $R, and a regex on an unbound
+      # metavariable drops the match.
+      - pattern: crate::sinks::sinks_for_user(...).await.unwrap_or_default()
+      - pattern: sinks::sinks_for_user(...).await.unwrap_or_default()
 
   # ── Logging ──────────────────────────────────────────────────────────────
   - id: log-crate-not-tracing
