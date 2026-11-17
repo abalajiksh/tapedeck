@@ -615,6 +615,132 @@ mod tests {
             .unwrap_or_else(die("Database::new, second start"));
     }
 
+    /// `COLLATE NOCASE` — Patch's username lookups and the Shelf's sort —
+    /// which Postgres has no collation for. The dialect rewrites it to
+    /// `LOWER(x COLLATE "C")`, and this holds it to SQLite's answers: ASCII
+    /// case folds, nothing else does (`ünal` is not `Ünal`), and the Shelf
+    /// sorts by the folded bytes.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn nocase_lookups_and_sorts_answer_as_sqlite_does() {
+        let url = fresh("nocase").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new"));
+        let me = db
+            .setup_admin("tester", None, "not-a-real-hash")
+            .await
+            .unwrap_or_else(die("setup_admin"));
+        let bob =
+            db.create_user("Bob", None, "x", "member").await.unwrap_or_else(die("create_user Bob"));
+        let unal = db
+            .create_user("Ünal", None, "x", "member")
+            .await
+            .unwrap_or_else(die("create_user Ünal"));
+
+        assert_eq!(db.patchable_user_id("TESTER").await.unwrap_or_else(die("patchable")), Some(me));
+        assert_eq!(db.patchable_user_id("bob").await.unwrap_or_else(die("patchable")), Some(bob));
+        assert_eq!(db.patchable_user_id("Ünal").await.unwrap_or_else(die("patchable")), Some(unal));
+        assert_eq!(
+            db.patchable_user_id("ünal").await.unwrap_or_else(die("patchable")),
+            None,
+            "SQLite's NOCASE folds ASCII only, and so must this"
+        );
+        db.discoverable_user_id("BOB").await.unwrap_or_else(die("discoverable_user_id"));
+        db.patches_out(me).await.unwrap_or_else(die("patches_out"));
+        db.patchable_decks(me).await.unwrap_or_else(die("patchable_decks"));
+        db.deck_view(me, "BOB").await.unwrap_or_else(die("deck_view"));
+        db.deck_i_am_patched_into(me, "bob").await.unwrap_or_else(die("deck_i_am_patched_into"));
+
+        for (artist, title) in
+            [("beta", "b"), ("Ångström", "c"), ("Alpha", "Zed"), ("alpha", "apple")]
+        {
+            db.create_physical(
+                me, "vinyl", artist, title, None, None, None, None, None, None, "[]", None, None,
+                None, None,
+            )
+            .await
+            .unwrap_or_else(die("create_physical"));
+        }
+        let shelf = db.list_physical(me, None).await.unwrap_or_else(die("list_physical"));
+        let order: Vec<(&str, &str)> =
+            shelf.iter().map(|r| (r.artist.as_str(), r.title.as_str())).collect();
+        // Folded bytes: "alpha" twice (then by title, folded), "beta", then
+        // "Å", whose UTF-8 sorts after every ASCII letter.
+        assert_eq!(order, [("alpha", "apple"), ("Alpha", "Zed"), ("beta", "b"), ("Ångström", "c")]);
+    }
+
+    /// The genre trajectory's periods on Postgres, which has no `strftime`:
+    /// the same answers `db::tests::trajectory_periods_follow_the_listeners_offset`
+    /// pins for SQLite.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn trajectory_periods_answer_as_sqlite_does() {
+        let url = fresh("periods").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new"));
+        let me = db.setup_admin("tester", None, "x").await.unwrap_or_else(die("setup_admin"));
+        for (i, ts) in [1_735_687_800u64, 1_749_988_800, 1_677_664_800].into_iter().enumerate() {
+            let play = crate::models::Play::new(
+                format!("t{i}"),
+                "Artist".into(),
+                ts,
+                format!("src-{ts}"),
+                "test".into(),
+            );
+            db.save_scrobble(
+                me,
+                &play,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap_or_else(die("save_scrobble"));
+        }
+        sqlx::query("UPDATE scrobbles SET genres = '[\"Ambient\",\"idm\"]' WHERE user_id = $1")
+            .bind(me)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(die("genres"));
+
+        let years =
+            db.listens_by_period(me, 1.0, false).await.unwrap_or_else(die("listens_by_period"));
+        assert_eq!(years, [("2023".to_string(), 1, 1), ("2025".to_string(), 2, 2)]);
+        let utc = db.listens_by_period(me, 0.0, false).await.unwrap_or_else(die("utc"));
+        assert_eq!(utc.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["2023", "2024", "2025"]);
+        let months = db.listens_by_period(me, 1.0, true).await.unwrap_or_else(die("months"));
+        assert_eq!(
+            months.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["2023-03", "2025-01", "2025-06"]
+        );
+        let behind = db.listens_by_period(me, -5.5, true).await.unwrap_or_else(die("behind"));
+        assert_eq!(
+            behind.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["2023-03", "2024-12", "2025-06"]
+        );
+
+        let genres = db
+            .genre_plays_by_period(me, 1.0, false)
+            .await
+            .unwrap_or_else(die("genre_plays_by_period"));
+        assert_eq!(
+            genres,
+            [
+                ("2023".to_string(), "Ambient".to_string(), 1),
+                ("2023".to_string(), "idm".to_string(), 1),
+                ("2025".to_string(), "Ambient".to_string(), 2),
+                ("2025".to_string(), "idm".to_string(), 2),
+            ]
+        );
+    }
+
     /// `chain_bindings`' columns (name, type, nullability) and foreign keys
     /// (name, definition), both sorted — column order differs after an
     /// `ADD COLUMN` and means nothing.
@@ -1356,19 +1482,6 @@ mod tests {
         let gear = db.get_equipment(uid).await.unwrap_or_else(die("get_equipment"));
         assert_eq!(gear.len(), 1);
 
-        // The Shelf's list still sorts with SQLite's `COLLATE NOCASE` — a gap
-        // that is not about sums. That one error is tolerated, and named.
-        fn nocase_gap<T>(what: &str, r: Result<T, sqlx::Error>) -> Option<T> {
-            match r {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    let m = crate::logging::error_chain(&e);
-                    assert!(m.contains("collation \"nocase\""), "{what}: {m}");
-                    println!("{what}: known gap — {m}");
-                    None
-                }
-            }
-        }
         let release = db
             .create_physical(
                 uid,
@@ -1401,7 +1514,7 @@ mod tests {
         )
         .await
         .unwrap_or_else(die("record_physical_play"));
-        nocase_gap("list_physical", db.list_physical(uid, None).await);
+        db.list_physical(uid, None).await.unwrap_or_else(die("list_physical"));
         db.get_physical(uid, release).await.unwrap_or_else(die("get_physical"));
         let sides = db.side_plays(uid, release).await.unwrap_or_else(die("side_plays"));
         assert_eq!(sides.len(), 1);
