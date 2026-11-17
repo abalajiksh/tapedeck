@@ -60,8 +60,9 @@
 //!   BIGINT)` — wherever the sum is read into an integer. `SUM(CASE … THEN 1
 //!   ELSE 0 END)` is fine as it is: the literals are `int4`, whose sum is
 //!   `bigint`. `AVG` of a `REAL` is `double precision` and decodes into `f64`.
-//!   The same goes for a bare integer literal read as `i64`: `0 AS n` is
-//!   `int4`, so write `CAST(0 AS BIGINT)`.
+//!   The same goes for a bare literal: `0 AS n` is `int4`, so write
+//!   `CAST(0 AS BIGINT)` for an `i64`; `0.0 AS x` is NUMERIC, so write
+//!   `CAST(0.0 AS DOUBLE PRECISION)` for an `f64`.
 //! * **DDL**: `AUTOINCREMENT` (56), partial-index and CHECK-rebuild guards read
 //!   out of `sqlite_master` (7), `PRAGMA` (10). All of `schema.rs` and
 //!   `migrate.rs` — the reason those were split out first.
@@ -277,6 +278,13 @@ const DDL_PHRASES: &[(&[&str], &str)] = &[
     (&["WITHOUT", "ROWID"], ""),
     (&["INTEGER"], "BIGINT"),
     (&["REAL"], "DOUBLE PRECISION"),
+    // `settings`, `components` and `overrides` are written and read as strings
+    // everywhere — Rust holds them as `String` and serialises with serde. A
+    // Postgres `json` column refuses a text bind and will not decode into a
+    // `String`, so it is `TEXT` here; the one place that walks one as JSON,
+    // `json_each`, casts for itself. `migrate_postgres` converts databases
+    // created before this (v0.132.0).
+    (&["JSON"], "TEXT"),
 ];
 
 /// The tokeniser. Walks `sql` once, copying through string literals, quoted
@@ -577,6 +585,16 @@ mod tests {
             "SELECT unlike, likeness FROM t"
         );
         assert_eq!(to_postgres("WHERE s = 'LIKE'", Mode::Query), "WHERE s = 'LIKE'");
+    }
+
+    #[test]
+    fn a_json_column_is_text_on_postgres() {
+        assert_eq!(
+            to_postgres("components JSON NOT NULL DEFAULT '[]',", Mode::Ddl),
+            "components TEXT NOT NULL DEFAULT '[]',"
+        );
+        // Only the type word: a function name is not touched.
+        assert_eq!(to_postgres("CHECK (json_valid(x))", Mode::Ddl), "CHECK (json_valid(x))");
     }
 
     #[test]

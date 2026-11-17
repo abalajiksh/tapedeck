@@ -853,7 +853,7 @@ impl Database {
         let (seconds, split) = self.equipment_seconds(user_id).await?;
         let mut rows: Vec<EquipmentRow> = sqlx::query_as(&crate::sql!(
             "SELECT e.id, e.user_id, e.name, e.type, e.brand, e.model,
-                    0.0 AS total_hours,
+                    CAST(0.0 AS DOUBLE PRECISION) AS total_hours,
                     e.first_used, e.last_used, e.notes, e.purchased_at, e.status, e.aliases
                FROM equipment e
               WHERE e.user_id = ?"

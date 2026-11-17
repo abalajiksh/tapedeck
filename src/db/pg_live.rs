@@ -129,12 +129,11 @@ mod tests {
         move |e| panic!("{what}: {}", crate::logging::error_chain(&e))
     }
 
-    /// A row written straight to its table, returning its id.
-    ///
-    /// For `signal_chains` and `chain_variants`: `create_chain` and
-    /// `create_variant` bind their JSON columns as text, which Postgres refuses
-    /// (`column "components" is of type json but expression is of type
-    /// text`). A gap of its own, recorded in the PR rather than fixed here.
+    /// A row written straight to its table, returning its id — for fixtures
+    /// whose own writer would drag in more than the check is about.
+    /// (`create_chain` / `create_variant` work on Postgres since v0.132.0,
+    /// when the JSON columns became TEXT; `duration_sums_decode_on_postgres`
+    /// goes through them.)
     async fn insert_returning_id(db: &Database, sql: &str) -> i64 {
         sqlx::query_scalar(sql).fetch_one(&db.pool).await.unwrap_or_else(die(sql))
     }
@@ -453,6 +452,167 @@ mod tests {
             upgraded.0
         );
         assert_eq!(upgraded, reference, "an upgraded chain_bindings differs from a fresh one");
+    }
+
+    /// A v0.131 Postgres database — no facet columns on `scrobbles` — opened
+    /// by v0.132.0 gains them, shaped exactly as a fresh install's, with its
+    /// listens intact and the classifier's work list reading them. Fresh
+    /// schemas never see this, which is how the first PR for the facets
+    /// shipped without a Postgres arm.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn a_v0_131_postgres_database_gains_the_facet_columns() {
+        let url = fresh("facets_upgrade").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new"));
+        let me = db.setup_admin("tester", None, "not-a-real-hash").await.unwrap();
+        let play = crate::models::Play::new(
+            "Xtal".into(),
+            "Aphex Twin".into(),
+            1_700_000_000,
+            "pg-upgrade-1".into(),
+            "test".into(),
+        );
+        db.save_scrobble(me, &play, None, None, None, None, None, None, None, Default::default())
+            .await
+            .unwrap_or_else(die("save_scrobble"));
+        drop(db);
+
+        let columns = |schema: &'static str| async move {
+            let pool = PgPoolOptions::new().max_connections(1).connect(&base_url()).await.unwrap();
+            let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+                "SELECT column_name::text, data_type::text, is_nullable::text, column_default::text
+                   FROM information_schema.columns
+                  WHERE table_schema = $1 AND table_name = 'scrobbles'
+                    AND column_name IN ('facets', 'facets_version', 'fact_key')
+                  ORDER BY column_name",
+            )
+            .bind(schema)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_else(die("read columns"));
+            pool.close().await;
+            rows
+        };
+        let reference = columns("tapedeck_pg_check_facets_upgrade").await;
+        assert_eq!(reference.len(), 3, "a fresh install has all three: {reference:?}");
+
+        // Back to v0.131.3's scrobbles: the indexes on the columns go with them.
+        let pool = PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        for sql in [
+            "DROP INDEX IF EXISTS idx_scrobbles_fact_key",
+            "DROP INDEX IF EXISTS idx_scrobbles_facets_version",
+            "ALTER TABLE scrobbles DROP COLUMN facets, DROP COLUMN facets_version, DROP COLUMN fact_key",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap_or_else(die("build v0.131.3 shape"));
+        }
+        pool.close().await;
+        assert!(columns("tapedeck_pg_check_facets_upgrade").await.is_empty());
+
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new over a v0.131.3 database"));
+        assert_eq!(
+            columns("tapedeck_pg_check_facets_upgrade").await,
+            reference,
+            "upgraded differs from fresh"
+        );
+        let todo = db
+            .listens_needing_facets(crate::classify::VERSION, Some(me), 10)
+            .await
+            .unwrap_or_else(die("listens_needing_facets"));
+        assert_eq!(todo.len(), 1, "the old listen is on the work list");
+
+        // A second start is a no-op.
+        drop(db);
+        Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new, second start"));
+    }
+
+    /// A Postgres database made before v0.132.0 has `json` columns for
+    /// `users.settings`, `signal_chains.components` and
+    /// `chain_variants.overrides`, which refused every text bind and would not
+    /// decode into a `String`. Opened by v0.132.0 they become TEXT — shaped as
+    /// a fresh install's, defaults included — and keep what they held.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn json_columns_become_text_on_an_older_postgres_database() {
+        let url = fresh("json_upgrade").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new"));
+        let me = db.setup_admin("tester", None, "not-a-real-hash").await.unwrap();
+        drop(db);
+
+        let shape = |schema: &'static str| async move {
+            let pool = PgPoolOptions::new().max_connections(1).connect(&base_url()).await.unwrap();
+            let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+                "SELECT table_name::text, column_name::text, data_type::text, is_nullable::text,
+                        column_default::text
+                   FROM information_schema.columns
+                  WHERE table_schema = $1
+                    AND (table_name, column_name) IN (('users', 'settings'),
+                         ('signal_chains', 'components'), ('chain_variants', 'overrides'))
+                  ORDER BY 1, 2",
+            )
+            .bind(schema)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_else(die("read columns"));
+            pool.close().await;
+            rows
+        };
+        let reference = shape("tapedeck_pg_check_json_upgrade").await;
+        assert_eq!(reference.len(), 3);
+        assert!(reference.iter().all(|r| r.2 == "text"), "a fresh install is TEXT: {reference:?}");
+
+        // Back to the shape `JSON` used to translate to, with a chain in it.
+        let pool = PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        for sql in [
+            "ALTER TABLE users ALTER COLUMN settings DROP DEFAULT".to_string(),
+            "ALTER TABLE users ALTER COLUMN settings TYPE JSON USING settings::json".to_string(),
+            "ALTER TABLE users ALTER COLUMN settings SET DEFAULT '{}'".to_string(),
+            "ALTER TABLE signal_chains ALTER COLUMN components DROP DEFAULT".to_string(),
+            "ALTER TABLE signal_chains ALTER COLUMN components TYPE JSON USING components::json"
+                .to_string(),
+            "ALTER TABLE signal_chains ALTER COLUMN components SET DEFAULT '[]'".to_string(),
+            "ALTER TABLE chain_variants ALTER COLUMN overrides DROP DEFAULT".to_string(),
+            "ALTER TABLE chain_variants ALTER COLUMN overrides TYPE JSON USING overrides::json"
+                .to_string(),
+            "ALTER TABLE chain_variants ALTER COLUMN overrides SET DEFAULT '[]'".to_string(),
+            format!(
+                "INSERT INTO signal_chains (user_id, name, components, created_at)
+                 VALUES ({me}, 'Desk', '[{{\"type\":\"dac\",\"name\":\"E30\",\"detail\":null}}]', 0)"
+            ),
+        ] {
+            sqlx::query(&sql).execute(&pool).await.unwrap_or_else(die("build the json shape"));
+        }
+        pool.close().await;
+        assert!(shape("tapedeck_pg_check_json_upgrade").await.iter().all(|r| r.2 == "json"));
+
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new over the json shape"));
+        assert_eq!(
+            shape("tapedeck_pg_check_json_upgrade").await,
+            reference,
+            "upgraded differs from fresh"
+        );
+        let chains = db.get_chains(me).await.unwrap_or_else(die("get_chains"));
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].components.len(), 1, "the chain kept its components");
+        assert_eq!(chains[0].components[0].name, "E30");
+        db.create_variant(me, chains[0].id.expect("an id"), "Other", &[])
+            .await
+            .unwrap_or_else(die("create_variant"));
+
+        // A second start is a no-op.
+        drop(db);
+        Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new, second start"));
     }
 
     /// `chain_bindings`' columns (name, type, nullability) and foreign keys
@@ -1083,6 +1243,25 @@ mod tests {
             .unwrap_or_else(die("setup_admin"));
         let chain = insert_chain(&db, uid, "Desk").await;
         let now = chrono::Utc::now().timestamp();
+        // The app's own writers bind `components` and `overrides` as text,
+        // which a Postgres `json` column refused before v0.132.0.
+        let equipment = insert_returning_id(
+            &db,
+            &format!("INSERT INTO equipment (user_id, name, type) VALUES ({uid}, 'Stylus', 'cartridge') RETURNING id"),
+        )
+        .await;
+        let components: Vec<crate::models::ChainComponent> = serde_json::from_str(&format!(
+            r#"[{{"type":"source","name":"Turntable","detail":null}},
+                {{"type":"transducer","name":"Stylus","detail":null,"equipment_id":{equipment}}}]"#
+        ))
+        .expect("components parse");
+        assert!(db
+            .update_chain(uid, chain, "Desk", None, &components, "unknown", None)
+            .await
+            .unwrap_or_else(die("update_chain")));
+        db.create_variant(uid, chain, "Other stylus", &[])
+            .await
+            .unwrap_or_else(die("create_variant"));
 
         for (i, title) in ["Xtal", "Tha", "Xtal", "Pulsewidth"].iter().enumerate() {
             let mut play = crate::models::Play::new(
@@ -1162,42 +1341,34 @@ mod tests {
         db.recording_mbid_coverage(uid).await.unwrap_or_else(die("recording_mbid_coverage"));
 
         // ── Chains, gear and the Shelf ──
-        //
-        // These also hit two Postgres gaps that are not about sums: JSON
-        // columns (`signal_chains.components`, `chain_variants.overrides`) are
-        // `json` on Postgres and decoded into `String` — the gap
-        // `insert_returning_id` describes — and the Shelf sorts with SQLite's
-        // `COLLATE NOCASE`. Those two errors are tolerated, and named; anything
-        // else (a NUMERIC sum above all) fails. The chain and gear readers stop
-        // at their first query on the JSON gap, so their sums go unchecked here
-        // until it is closed.
-        fn known_gap<T>(what: &str, r: Result<T, sqlx::Error>) -> Option<T> {
+        let chains = db.get_chains(uid).await.unwrap_or_else(die("get_chains"));
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].components.len(), 2, "components read back through TEXT");
+        assert!(
+            (chains[0].total_hours - 960.0 / 3_600.0).abs() < 1e-9,
+            "{}",
+            chains[0].total_hours
+        );
+        let variants = db.list_variants(uid).await.unwrap_or_else(die("list_variants"));
+        assert_eq!(variants.len(), 1);
+        db.near_duplicate_chains(uid).await.unwrap_or_else(die("near_duplicate_chains"));
+        db.equipment_seconds(uid).await.unwrap_or_else(die("equipment_seconds"));
+        let gear = db.get_equipment(uid).await.unwrap_or_else(die("get_equipment"));
+        assert_eq!(gear.len(), 1);
+
+        // The Shelf's list still sorts with SQLite's `COLLATE NOCASE` — a gap
+        // that is not about sums. That one error is tolerated, and named.
+        fn nocase_gap<T>(what: &str, r: Result<T, sqlx::Error>) -> Option<T> {
             match r {
                 Ok(v) => Some(v),
                 Err(e) => {
                     let m = crate::logging::error_chain(&e);
-                    assert!(
-                        m.contains("SQL type `JSON`") || m.contains("collation \"nocase\""),
-                        "{what}: {m}"
-                    );
+                    assert!(m.contains("collation \"nocase\""), "{what}: {m}");
                     println!("{what}: known gap — {m}");
                     None
                 }
             }
         }
-        if let Some(chains) = known_gap("get_chains", db.get_chains(uid).await) {
-            println!("chain hours: {:?}", chains.iter().map(|c| c.total_hours).collect::<Vec<_>>());
-        }
-        known_gap("list_variants", db.list_variants(uid).await);
-        known_gap("near_duplicate_chains", db.near_duplicate_chains(uid).await);
-        known_gap("equipment_seconds", db.equipment_seconds(uid).await);
-        let equipment = insert_returning_id(
-            &db,
-            &format!("INSERT INTO equipment (user_id, name, type) VALUES ({uid}, 'Stylus', 'cartridge') RETURNING id"),
-        )
-        .await;
-        known_gap("get_equipment", db.get_equipment(uid).await);
-
         let release = db
             .create_physical(
                 uid,
@@ -1230,8 +1401,8 @@ mod tests {
         )
         .await
         .unwrap_or_else(die("record_physical_play"));
-        known_gap("list_physical", db.list_physical(uid, None).await);
-        known_gap("get_physical", db.get_physical(uid, release).await);
+        nocase_gap("list_physical", db.list_physical(uid, None).await);
+        db.get_physical(uid, release).await.unwrap_or_else(die("get_physical"));
         let sides = db.side_plays(uid, release).await.unwrap_or_else(die("side_plays"));
         assert_eq!(sides.len(), 1);
         let (hours, n) = db
