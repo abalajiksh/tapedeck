@@ -39,8 +39,9 @@
 //!   other fold — hearts stop filling, `Cœur de pirate` splits into two chart
 //!   rows, and nothing errors. [`lower`] emits `LOWER(x COLLATE "C")` under
 //!   Postgres to reproduce SQLite byte for byte, because a *migrated* database
-//!   must keep answering the way it did. **Not yet verified against a live
-//!   Postgres** — it is the first thing to check when one exists.
+//!   must keep answering the way it did. Verified on Postgres 16.15 by
+//!   `pg_live::nocase_lookups_and_sorts_answer_as_sqlite_does` (v0.132.1):
+//!   ASCII folds, `Ü` does not, and the sort matches SQLite's.
 //!
 //!   Worth knowing while you are in here: SQL and Rust already disagree on
 //!   SQLite. `Database::artist_key` uses Rust's `to_lowercase`, which is full
@@ -66,6 +67,10 @@
 //! * **DDL**: `AUTOINCREMENT` (56), partial-index and CHECK-rebuild guards read
 //!   out of `sqlite_master` (7), `PRAGMA` (10). All of `schema.rs` and
 //!   `migrate.rs` — the reason those were split out first.
+//! * **`COLLATE NOCASE`** has no Postgres collation. [`to_postgres`] rewrites
+//!   its two shapes — `a = b COLLATE NOCASE` and an `ORDER BY` item — to
+//!   `LOWER(x COLLATE "C")`, SQLite's ASCII-only fold, on both sides of a
+//!   comparison (v0.132.1).
 //! * **`json_each`** (13) → `jsonb_array_elements`. Over a column holding a
 //!   JSON array (`scrobbles.genres`) [`to_postgres`] now writes
 //!   `json_array_elements_text(CAST(col AS JSON))`; an object column such as
@@ -374,6 +379,14 @@ fn to_postgres(sql: &str, mode: Mode) -> String {
                         continue;
                     }
                 }
+                if mode == Mode::Query {
+                    if let Some(rest) = collate_nocase_at(sql, i) {
+                        if nocase_rewrite(&mut out) {
+                            i = rest;
+                            continue;
+                        }
+                    }
+                }
                 // Keyword substitutions, only on a word boundary.
                 if let Some(rest) = word_at(sql, i, "LIKE") {
                     out.push_str("ILIKE");
@@ -458,6 +471,73 @@ fn word_at(sql: &str, i: usize, word: &str) -> Option<usize> {
 fn call_at(sql: &str, i: usize, word: &str) -> Option<usize> {
     let end = word_at(sql, i, word)?;
     (sql.as_bytes().get(end) == Some(&b'(')).then_some(end)
+}
+
+/// `COLLATE NOCASE` at `i`, as the end of the phrase.
+fn collate_nocase_at(sql: &str, i: usize) -> Option<usize> {
+    let after = word_at(sql, i, "COLLATE")?;
+    let skipped = sql[after..].len() - sql[after..].trim_start().len();
+    if skipped == 0 {
+        return None;
+    }
+    word_at(sql, after + skipped, "NOCASE")
+}
+
+/// Rewrite the operand(s) `COLLATE NOCASE` applies to, at the end of `out`.
+///
+/// Postgres has no `NOCASE`. SQLite's folds **ASCII only**, so it becomes
+/// `LOWER(x COLLATE "C")` — which folds exactly that under Postgres — rather
+/// than a case-insensitive ICU collation, which would also make `Ä` equal `ä`
+/// and `ß` equal `ss` and could match a username to a different account.
+/// Two shapes, the only two in the tree:
+///
+/// * `a = b COLLATE NOCASE` — SQLite compares *both* sides with the collation,
+///   so both are lowered.
+/// * an `ORDER BY` item, `… BY x COLLATE NOCASE` or `…, x COLLATE NOCASE`.
+///
+/// Anything else is left as it was, for Postgres to refuse loudly. `false`
+/// when nothing was rewritten.
+fn nocase_rewrite(out: &mut String) -> bool {
+    fn operand_start(s: &str) -> usize {
+        let b = s.as_bytes();
+        let mut j = s.len();
+        while j > 0 && (is_word_byte(b[j - 1]) || b[j - 1] == b'.' || b[j - 1] == b'$') {
+            j -= 1;
+        }
+        j
+    }
+    let fold = |x: &str| format!("LOWER({x} COLLATE \"C\")");
+    let body = out.trim_end();
+    let rhs_at = operand_start(body);
+    if rhs_at == body.len() {
+        return false;
+    }
+    let rhs = body[rhs_at..].to_string();
+    let before = body[..rhs_at].trim_end();
+    if let Some(left) = before.strip_suffix('=') {
+        if left.ends_with(['<', '>', '!']) {
+            return false;
+        }
+        let left = left.trim_end();
+        let lhs_at = operand_start(left);
+        if lhs_at == left.len() {
+            return false;
+        }
+        let rewritten = format!("{}{} = {}", &left[..lhs_at], fold(&left[lhs_at..]), fold(&rhs));
+        *out = rewritten;
+        return true;
+    }
+    let ordered = before.ends_with(',')
+        || (before.len() >= 2
+            && before[before.len() - 2..].eq_ignore_ascii_case("BY")
+            && !before[..before.len() - 2]
+                .ends_with(|c: char| c.is_ascii_alphanumeric() || c == '_'));
+    if !ordered {
+        return false;
+    }
+    let rewritten = format!("{}{}", &body[..rhs_at], fold(&rhs));
+    *out = rewritten;
+    true
 }
 
 /// `json_each(<column>)` at `i`, as `(end, column)`: a JSON **array** held in
@@ -585,6 +665,46 @@ mod tests {
             "SELECT unlike, likeness FROM t"
         );
         assert_eq!(to_postgres("WHERE s = 'LIKE'", Mode::Query), "WHERE s = 'LIKE'");
+    }
+
+    #[test]
+    fn collate_nocase_folds_ascii_on_both_sides() {
+        assert_eq!(
+            to_postgres("SELECT id FROM users WHERE username = ? COLLATE NOCASE AND disabled = 0", Mode::Query),
+            "SELECT id FROM users WHERE LOWER(username COLLATE \"C\") = LOWER($1 COLLATE \"C\") AND disabled = 0"
+        );
+        assert_eq!(
+            to_postgres("WHERE u.username = ? COLLATE NOCASE\n AND x = ?", Mode::Query),
+            "WHERE LOWER(u.username COLLATE \"C\") = LOWER($1 COLLATE \"C\")\n AND x = $2"
+        );
+        assert_eq!(
+            to_postgres("ORDER BY r.artist COLLATE NOCASE, r.title COLLATE NOCASE", Mode::Query),
+            "ORDER BY LOWER(r.artist COLLATE \"C\"), LOWER(r.title COLLATE \"C\")"
+        );
+        assert_eq!(
+            to_postgres("ORDER BY u.username COLLATE NOCASE", Mode::Query),
+            "ORDER BY LOWER(u.username COLLATE \"C\")"
+        );
+        // A shape it does not know is left for Postgres to refuse.
+        assert_eq!(
+            to_postgres("WHERE a < b COLLATE NOCASE", Mode::Query),
+            "WHERE a < b COLLATE NOCASE"
+        );
+        assert_eq!(
+            to_postgres("WHERE a <= b COLLATE NOCASE", Mode::Query),
+            "WHERE a <= b COLLATE NOCASE"
+        );
+        // Every site in the tree is one of the two shapes.
+        for (file, src) in
+            [("patch.rs", include_str!("patch.rs")), ("physical.rs", include_str!("physical.rs"))]
+        {
+            for (_, _, lit) in super::super::guards::literals(src) {
+                if lit.to_uppercase().contains("COLLATE NOCASE") {
+                    let pg = to_postgres(&lit, Mode::Query);
+                    assert!(!pg.to_uppercase().contains("NOCASE"), "{file}: {lit}\n→ {pg}");
+                }
+            }
+        }
     }
 
     #[test]
