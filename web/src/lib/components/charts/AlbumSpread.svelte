@@ -21,6 +21,10 @@
 		no_album: number;
 	}[] = [];
 
+	/** One artist's own page: the name is the page's heading, so the row
+	 *  drops its name column and the bar takes the full width. */
+	export let single = false;
+
 	const SHADES = [100, 78, 60, 44, 30];
 	const share = (n: number, of: number) => (of > 0 ? (n / of) * 100 : 0);
 </script>
@@ -28,11 +32,15 @@
 {#if artists.length}
 	<div class="rows">
 		{#each artists as a}
-			<div class="row">
-				<button class="who" on:click={() => openArtist(a.name)} title="Open {a.name}">
-					<span class="nm">{a.name}</span>
-					<span class="sub">{nf(a.plays)} plays · {nf(a.album_count)} record{a.album_count === 1 ? '' : 's'}</span>
-				</button>
+			<div class="row" class:single>
+				{#if single}
+					<span class="sub">{nf(a.plays)} plays across {nf(a.album_count)} record{a.album_count === 1 ? '' : 's'}</span>
+				{:else}
+					<button class="who" on:click={() => openArtist(a.name)} title="Open {a.name}">
+						<span class="nm">{a.name}</span>
+						<span class="sub">{nf(a.plays)} plays · {nf(a.album_count)} record{a.album_count === 1 ? '' : 's'}</span>
+					</button>
+				{/if}
 				<div class="bar">
 					{#each a.albums as al, i}
 						{@const p = share(al.plays, a.plays)}
@@ -70,6 +78,7 @@
 <style>
 	.rows { display: flex; flex-direction: column; gap: 10px; }
 	.row { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 14px; align-items: center; }
+	.row.single { grid-template-columns: 1fr; gap: 8px; }
 	@media (max-width: 640px) { .row { grid-template-columns: 1fr; gap: 4px; } }
 	.who { display: flex; flex-direction: column; align-items: flex-end; text-align: right; background: none; border: 0; padding: 0; cursor: pointer; font-family: inherit; color: var(--td-text); min-width: 0; }
 	@media (max-width: 640px) { .who { align-items: flex-start; text-align: left; } }

@@ -132,6 +132,14 @@ impl Mixdown {
         scenes::build(c, unit, theme, art)
     }
 
+    /// A season — Christmas, Halloween, Easter — told with the year's scenes
+    /// and the season's name. `c.sub` is plays per month of the season, and
+    /// `rank`, `avg_daily` and `new_artists` stay zero, so the lines about a
+    /// period's place among others are left out rather than misworded.
+    pub fn build_season(c: &Card, theme: Theme, art: &Art) -> Mixdown {
+        scenes::build_named(c, Unit::Year, theme, art, Some("SEASON"))
+    }
+
     pub fn duration_ms(&self) -> u32 {
         self.scenes.iter().map(|s| s.duration_ms).sum()
     }

@@ -1622,7 +1622,7 @@ impl ScrobbleEngine {
 
         // Named so a skipped round can say what it skipped. The order is the
         // one they were written in; `backfill_cursor` decides where it starts.
-        const PASSES: usize = 9;
+        const PASSES: usize = 10;
         let mut ran = 0usize;
 
         for step in 0..PASSES {
@@ -1728,6 +1728,16 @@ impl ScrobbleEngine {
                     // of — applied to every listen that knows its recording.
                     7 => {
                         crate::enrich::backfill_credits(&self.db, &self.mb_client, 25, 8).await;
+                    }
+
+                    // What kind of listen each listen is — classical, score,
+                    // ambient, seasonal. Most of a pass is copying decisions
+                    // already made onto further listens of the same recording,
+                    // which costs nothing; the budget bounds only API requests,
+                    // and the mirror (when configured) answers without one.
+                    8 => {
+                        crate::classify::backfill::backfill(&self.db, &self.mb_client, 200, 8)
+                            .await;
                     }
 
                     _ => self.backfill_artist_images().await,

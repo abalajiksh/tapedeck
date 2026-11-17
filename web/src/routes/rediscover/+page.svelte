@@ -1,4 +1,5 @@
 <script lang="ts">
+	import Anniversaries from '$lib/components/Anniversaries.svelte';
 	import { onMount, tick } from 'svelte';
 	import { api, type Rediscovery, type RediscoveryCollection, type RediscoveryRow } from '$lib/api';
 	import { openAlbum, openArtist } from '$lib/entities';
@@ -235,6 +236,8 @@
 			{/each}
 		</div>
 	{/each}
+
+	<div style="margin-top:30px;"><Anniversaries mode="revisit" limit={10} /></div>
 
 	<!-- Gear needs a choice made, so it can't be a card like the rest. -->
 	<div style="margin-top:30px;">

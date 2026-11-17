@@ -457,7 +457,7 @@ impl Database {
         let agg: Option<(i64, Option<i64>, Option<i64>, Option<i64>, Option<f64>)> =
             sqlx::query_as(&crate::sql!(
                 "SELECT COUNT(*), MIN(timestamp), MAX(timestamp + COALESCE(duration, 0)),
-                        SUM(COALESCE(duration, 0)), AVG(quality_score)
+                        CAST(SUM(COALESCE(duration, 0)) AS BIGINT), AVG(quality_score)
                  FROM scrobbles WHERE session_id = ?",
             ))
             .bind(session_id)
@@ -1294,6 +1294,28 @@ impl Database {
         limit: i64,
         by_hours: bool,
     ) -> Result<Vec<ChartRow>, sqlx::Error> {
+        self.chart_filtered(user_id, kind, after, None, limit, by_hours, 0, 0).await
+    }
+
+    /// [`Self::chart`] over a window with an end, and by what kind of listen.
+    ///
+    /// `exclude` drops listens carrying any of those `classify` flags — Top
+    /// Charts passes the listener's splits (classical, score/ambient) here.
+    /// `require` keeps only listens carrying at least one — the Scores tab and
+    /// the seasonal lenses chart that way. Zero means "no condition", so
+    /// `chart` is this with both off.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn chart_filtered(
+        &self,
+        user_id: i64,
+        kind: &str,
+        after: Option<i64>,
+        before: Option<i64>,
+        limit: i64,
+        by_hours: bool,
+        exclude: i64,
+        require: i64,
+    ) -> Result<Vec<ChartRow>, sqlx::Error> {
         // Same reasoning as `get_ranged_stats`: the chart is cut to `limit`
         // rows, so ranking by the chosen metric has to happen in SQL. It also
         // has to agree with Statistics — "See more" hands off from there
@@ -1302,15 +1324,19 @@ impl Database {
         let order = if by_hours { "seconds DESC, plays DESC" } else { "plays DESC" };
         // Every branch selects the same shape so the caller doesn't care which
         // ran. `sub` is the secondary line (an album's artist), null for artists.
+        // `seconds` is cast because Postgres widens `SUM(bigint)` to NUMERIC,
+        // which will not decode into an i64; SQLite reads the cast as a no-op.
         let sql: String = match kind {
             "albums" => {
                 format!(
                     "SELECT MAX(album) AS name, MAX(COALESCE(album_filed_under, artist)) AS sub,
                         NULL AS album, COUNT(*) AS plays,
-                        COALESCE(SUM(duration), 0) AS seconds,
+                        CAST(COALESCE(SUM(duration), 0) AS BIGINT) AS seconds,
                         {COVER_PICK} AS cover_pick
                  FROM scrobbles
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
+                   AND (? IS NULL OR timestamp < ?)
+                   AND (facets & ?) = 0 AND (? = 0 OR (facets & ?) != 0)
                    AND album IS NOT NULL AND TRIM(album) != ''
                  GROUP BY LOWER(TRIM(album)), LOWER(TRIM(COALESCE(album_filed_under, artist)))
                  ORDER BY {order} LIMIT ?"
@@ -1318,13 +1344,15 @@ impl Database {
             }
             "tracks" => {
                 format!(
-                    "SELECT title AS name, artist AS sub, MAX(album) AS album,
+                    "SELECT MAX(title) AS name, MAX(artist) AS sub, MAX(album) AS album,
                         MAX(COALESCE(album_filed_under, artist)) AS album_artist,
                         MAX(artist_credit) AS artist_credit, COUNT(*) AS plays,
-                        COALESCE(SUM(duration), 0) AS seconds,
+                        CAST(COALESCE(SUM(duration), 0) AS BIGINT) AS seconds,
                         {COVER_PICK} AS cover_pick
                  FROM scrobbles
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
+                   AND (? IS NULL OR timestamp < ?)
+                   AND (facets & ?) = 0 AND (? = 0 OR (facets & ?) != 0)
                  GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
                  ORDER BY {order} LIMIT ?"
                 )
@@ -1338,12 +1366,14 @@ impl Database {
                 // folded — the same trade every other grouping here makes.
                 format!(
                     "SELECT MAX(sa.name) AS name, NULL AS sub, NULL AS album, COUNT(*) AS plays,
-                        COALESCE(SUM(s.duration), 0) AS seconds,
+                        CAST(COALESCE(SUM(s.duration), 0) AS BIGINT) AS seconds,
                         NULL AS cover_pick
                  FROM scrobble_artists sa
                  JOIN scrobbles s ON s.id = sa.scrobble_id
                  WHERE s.user_id = ? AND s.skipped = FALSE
                    AND (? IS NULL OR s.timestamp >= ?)
+                   AND (? IS NULL OR s.timestamp < ?)
+                   AND (s.facets & ?) = 0 AND (? = 0 OR (s.facets & ?) != 0)
                  GROUP BY sa.artist_key
                  ORDER BY {order} LIMIT ?"
                 )
@@ -1353,6 +1383,11 @@ impl Database {
             .bind(user_id)
             .bind(after)
             .bind(after)
+            .bind(before)
+            .bind(before)
+            .bind(exclude)
+            .bind(require)
+            .bind(require)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?;

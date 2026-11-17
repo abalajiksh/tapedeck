@@ -16,6 +16,7 @@
 	import BarChart from '$lib/components/BarChart.svelte';
 	import ArtistDossier from '$lib/components/ArtistDossier.svelte';
 	import AlbumCard from '$lib/components/AlbumCard.svelte';
+	import AlbumSpread from '$lib/components/charts/AlbumSpread.svelte';
 
 	let artist: ArtistView | null = null;
 	let picsOpen = false;
@@ -114,6 +115,59 @@
 		}
 	}
 
+	// Where this artist's listens are ranked: Tapedeck's call, or yours. For
+	// the artists no rule can place — neoclassical piano with no work data,
+	// a composer MusicBrainz knows little about — one switch covers every
+	// record, and a single piece can still be moved back from its own tab.
+	type Routing = 'auto' | 'top' | 'classical' | 'scores';
+	const ROUTES: { k: Routing; label: string }[] = [
+		{ k: 'auto', label: 'Automatic' },
+		{ k: 'top', label: 'Top Charts' },
+		{ k: 'classical', label: 'Classical' },
+		{ k: 'scores', label: 'Scores & Ambient' }
+	];
+	let routing: Routing = 'auto';
+	let routingBusy = false;
+	let routingNote = '';
+
+	async function loadRouting(name: string) {
+		try {
+			const o = (await api.getFacetOverrides('artist', name)).overrides;
+			const v = (f: string) => o.find((x) => x.facet === f)?.value;
+			routing = v('classical') === true ? 'classical'
+				: v('score') === true ? 'scores'
+				: v('classical') === false && v('score') === false ? 'top'
+				: 'auto';
+		} catch {
+			routing = 'auto';
+		}
+	}
+
+	async function setRouting(r: Routing) {
+		if (!artist || r === routing) return;
+		const name = artist.name;
+		const set = (f: 'classical' | 'score' | 'ambient', v: boolean | null) => api.setFacetOverride('artist', name, f, v);
+		routingBusy = true;
+		routingNote = '';
+		try {
+			const plan: Record<Routing, [boolean | null, boolean | null, boolean | null]> = {
+				auto: [null, null, null],
+				top: [false, false, false],
+				classical: [true, false, false],
+				scores: [false, true, null]
+			};
+			const [c, sc, am] = plan[r];
+			await set('classical', c);
+			await set('score', sc);
+			const res = await set('ambient', am);
+			routing = r;
+			routingNote = `${res.listens.toLocaleString()} listens moved.`;
+		} catch (e) {
+			routingNote = e instanceof Error ? e.message : 'That could not be changed';
+		}
+		routingBusy = false;
+	}
+
 	async function load() {
 		loading = true;
 		error = '';
@@ -122,6 +176,7 @@
 			artist = await api.getArtist(id);
 			void loadPatchContext(artist.name);
 			void loadDossier(id);
+			void loadRouting(artist.name);
 		} catch (e) {
 			error = e instanceof Error ? e.message : 'Could not load this artist';
 		}
@@ -186,6 +241,11 @@
 				{artist.album_count} album{artist.album_count === 1 ? '' : 's'} ·
 				{artist.track_count} track{artist.track_count === 1 ? '' : 's'} in your history
 			</p>
+			{#if artist.anniversaries?.length}
+				<div class="anniv">
+					{#each artist.anniversaries as a}<span>{a}</span>{/each}
+				</div>
+			{/if}
 			{#if artist.member_of?.length || artist.members?.length}
 				<!-- Linked, never counted: a group's listens are the group's and a
 				     member's are theirs. Only artists already in your history. -->
@@ -317,6 +377,31 @@
 					{/each}
 				</div>
 			{/if}
+		</div>
+	{/if}
+
+	<div class="panel route">
+		<div style="min-width:0;flex:1;">
+			<div class="route-title">Where their listens are ranked</div>
+			<div class="route-sub">
+				{#if routing === 'auto'}Tapedeck decides, piece by piece.{:else}Your choice, for everything they're credited on. A single piece can still be moved from its tab.{/if}
+				{#if routingNote}<span class="route-done">{routingNote}</span>{/if}
+			</div>
+		</div>
+		<div class="route-seg">
+			{#each ROUTES as o}
+				<button class="seg-btn" class:on={routing === o.k} disabled={routingBusy} on:click={() => setRouting(o.k)}>{o.label}</button>
+			{/each}
+		</div>
+	</div>
+
+	{#if artist.album_spread && artist.album_spread.album_count > 1}
+		<h3 class="h-display" style="font-size:20px;margin:0 0 4px;">Album spread</h3>
+		<p style="margin:0 0 12px;font-size:13px;color:var(--td-muted);">
+			How your listening to them splits across their records — many slices is a catalogue explorer, one long one an album you can't leave alone.
+		</p>
+		<div class="panel" style="border-radius:22px;padding:18px 20px;margin-bottom:30px;">
+			<AlbumSpread artists={[artist.album_spread]} single />
 		</div>
 	{/if}
 
@@ -497,4 +582,14 @@
 		font-size: 12px; color: var(--td-muted-3); width: 46px;
 		text-align: right; flex: none; font-variant-numeric: tabular-nums;
 	}
+	.anniv { display: flex; flex-wrap: wrap; gap: 8px; margin: -6px 0 14px; }
+	.anniv span { font-size: 12.5px; padding: 4px 12px; border-radius: 999px; background: var(--td-surface); border: 1px solid var(--td-accent); color: var(--td-text); }
+	.route { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; border-radius: 18px; padding: 14px 18px; margin-bottom: 26px; }
+	.route-title { font-size: 14px; font-weight: 600; }
+	.route-sub { font-size: 12.5px; color: var(--td-muted); margin-top: 2px; }
+	.route-done { color: var(--td-good-fg); margin-left: 6px; }
+	.route-seg { display: inline-flex; flex-wrap: wrap; background: var(--td-sidebar); border-radius: 999px; padding: 3px; gap: 2px; }
+	.route-seg .seg-btn { border: none; background: transparent; cursor: pointer; color: var(--td-nav-fg); font-size: 12.5px; padding: 6px 12px; border-radius: 999px; font-family: inherit; }
+	.route-seg .seg-btn.on { background: var(--td-accent); color: var(--td-on-accent); }
+	.route-seg .seg-btn:disabled { opacity: 0.5; }
 </style>

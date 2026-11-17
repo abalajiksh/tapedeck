@@ -24,6 +24,7 @@ pub mod fonts;
 pub mod layout;
 pub mod mixdown;
 pub mod month;
+pub mod season;
 pub mod sitting;
 pub mod svg;
 pub mod theme;
@@ -32,6 +33,7 @@ pub mod year;
 
 pub use card::Card;
 pub use layout::{Size, Unit};
+pub use season::SeasonCard;
 pub use sitting::SittingCard;
 pub use theme::Theme;
 
@@ -101,6 +103,13 @@ pub fn render(c: &Card, unit: Unit, size: Size, theme: Theme) -> Result<Rendered
 /// failure modes.
 pub fn render_sitting(c: &SittingCard, size: Size, theme: Theme) -> Result<Rendered, RenderError> {
     let drawn = sitting::render_measured(c, size, theme);
+    rasterise(drawn, size)
+}
+
+/// Draw a season and rasterise it — the Christmas, Halloween and Easter tabs'
+/// share card.
+pub fn render_season(c: &SeasonCard, size: Size, theme: Theme) -> Result<Rendered, RenderError> {
+    let drawn = season::render_measured(c, size, theme);
     rasterise(drawn, size)
 }
 

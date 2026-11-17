@@ -14,6 +14,7 @@
 	import FirstListensChart from '$lib/components/charts/FirstListensChart.svelte';
 	import HabitsScatter from '$lib/components/charts/HabitsScatter.svelte';
 	import AlbumSpread from '$lib/components/charts/AlbumSpread.svelte';
+	import CompositionChart from '$lib/components/charts/CompositionChart.svelte';
 	import AnchorSongs from '$lib/components/charts/AnchorSongs.svelte';
 
 	const ranges: { v: StatsRange; label: string }[] = [
@@ -117,9 +118,23 @@
 	}
 	$: graphsStale = graphsFor !== range;
 
+	/** What the listening is made of — classical, score & ambient, the rest.
+	 *  Monthly, so a range shorter than a year shows the last twelve months. */
+	let composition: import('$lib/api').CompositionMonth[] = [];
+	let compositionFor = '';
+	function loadComposition(r: StatsRange) {
+		const want = r === 'all' ? 'all' : 'year';
+		if (compositionFor === want) return;
+		compositionFor = want;
+		api.getComposition(want)
+			.then((c) => { if (compositionFor === want) composition = c.months; })
+			.catch((e) => console.warn('composition', e));
+	}
+
 	async function load() {
 		loading = true;
 		if (graphsFor !== range) loadGraphs(range);
+		loadComposition(range);
 		try {
 			[stats, persona] = await Promise.all([
 				api.getRangedStats(range, metric),
@@ -546,6 +561,11 @@
 			{#if g.first_listens.length}
 				<h3 class="h-display g-h">When they arrived</h3>
 				<div class="panel g-panel"><FirstListensChart artists={g.first_listens} /></div>
+			{/if}
+
+			{#if composition.some((m) => m.classical > 0 || m.score > 0)}
+				<h3 class="h-display g-h">What your listening is made of</h3>
+				<div class="panel g-panel"><CompositionChart months={composition} /></div>
 			{/if}
 
 			{#if g.albums.length}

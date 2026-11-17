@@ -1,0 +1,81 @@
+# The classical canon: composers whose pieces leave Top Charts for the
+# Classical tab. Keyed by MusicBrainz artist MBID, never by name — MusicBrainz
+# names Tchaikovsky in Cyrillic, Chopin "Fryderyk", Bartók "Bartók Béla", and
+# writes Saint‐Saëns with U+2010, so a name list matches a third of them.
+#
+# Columns (tab-separated): mbid, display name, birth year, aliases, born, died,
+# gender, country (ISO 3166-1) — the last four from the MusicBrainz mirror
+# (export 20261114), so anniversaries and the period, living and country charts
+# need no lookup for these 66.
+# Aliases are the spellings sources actually send (Spotify, Plex, scrobblers),
+# pipe-separated, matched against a whole credited name — never a substring, so
+# "Bach" is J.S. Bach and "Sebastian Bach" (Skid Row) is not.
+#
+# Beyond this list, a piece is still classical when MusicBrainz types its work
+# as a symphony, concerto, mass and so on — see `classify::CLASSICAL_WORK_TYPES`.
+4daeb526-6c4c-4f77-bdf5-4a0fcb714bfe	Giovanni Pierluigi da Palestrina	1525	Palestrina|G.P. da Palestrina|Giovanni Pierluigi Da Palestrina	1525	1594-02-02	male	IT
+d1cf7a39-f268-45e8-bbc0-6cea5c0272cf	William Byrd	1540	Byrd|W. Byrd	1540	1623-07-04	male	GB
+9a33a7ad-f725-473a-b50a-1d1796183af1	Claudio Monteverdi	1567	Monteverdi|C. Monteverdi	1567-05-15	1643-11-29	male	IT
+7f9989b0-8f5e-41dd-bbab-1fff052609e3	Jean-Baptiste Lully	1632	Lully|J.-B. Lully|Jean‐Baptiste Lully|Giovanni Battista Lulli	1632-11-28	1687-03-22	male	FR
+ddea5540-2c7d-4266-8507-b367c2635d35	Henry Purcell	1659	Purcell|H. Purcell	1659-09-10	1695-11-21	male	GB
+a3546087-fe59-47d3-a3a8-42d58e2573c7	Arcangelo Corelli	1653	Corelli|A. Corelli	1653-02-17	1713-01-08	male	IT
+24f1766e-9635-4d58-a4d4-9413f9f98a4c	Johann Sebastian Bach	1685	Bach|J.S. Bach|J. S. Bach|JS Bach|Johann Sebastian Bach|Jean-Sébastien Bach	1685-03-21	1750-07-28	male	DE
+27870d47-bb98-42d1-bf2b-c7e972e6befc	George Frideric Handel	1685	Handel|Händel|G.F. Handel|G. F. Handel|Georg Friedrich Händel|Georg Friedrich Handel|George Friedrich Handel	1685-02-23	1759-04-14	male	GB
+ad79836d-9849-44df-8789-180bbc823f3c	Antonio Vivaldi	1678	Vivaldi|A. Vivaldi	1678-03-04	1741-07-28	male	IT
+8f831f50-e409-47c3-8598-71a61bc8cfb3	Georg Philipp Telemann	1681	Telemann|G.P. Telemann|G. P. Telemann	1681-03-14	1767-06-25	male	DE
+95c7a1d1-5cfd-41d5-99f9-0611262de8e1	Domenico Scarlatti	1685	D. Scarlatti	1685-10-26	1757-07-23	male	IT
+f6486fc7-90ef-48ad-8ca3-905af1354afe	Carl Philipp Emanuel Bach	1714	C.P.E. Bach|C. P. E. Bach|CPE Bach	1714-03-08	1788-12-14	male	DE
+c130b0fb-5dce-449d-9f40-1437f889f7fe	Joseph Haydn	1732	Haydn|J. Haydn|Franz Joseph Haydn	1732-03-31	1809-05-31	male	AT
+5c1a3f8f-d5e5-4dcd-9e44-9443f06bb77d	Luigi Boccherini	1743	Boccherini|L. Boccherini	1743-02-19	1805-05-28	male	IT
+b972f589-fb0e-474e-b64a-803b0364fa75	Wolfgang Amadeus Mozart	1756	Mozart|W.A. Mozart|W. A. Mozart|Wolfgang Amadeus Mozart	1756-01-27	1791-12-05	male	AT
+1f9df192-a621-4f54-8850-2c5373b7eac9	Ludwig van Beethoven	1770	Beethoven|L. van Beethoven|L. v. Beethoven	1770-12-17	1827-03-26	male	DE
+25f46ed2-ac8a-4428-ad09-5a3fa5162086	Muzio Clementi	1752	Clementi|M. Clementi	1752-01-24	1832-03-10	male	GB
+c2d17829-1424-435b-9386-c77d3a920abe	Carl Maria von Weber	1786	C.M. von Weber|C. M. von Weber	1786-11-19	1826-06-05	male	DE
+846be3c9-5f94-46ab-97b9-531335dd3658	Gioachino Rossini	1792	Rossini|G. Rossini|Gioacchino Rossini	1792-02-29	1868-11-13	male	IT
+f91e3a88-24ee-4563-8963-fab73d2765ed	Franz Schubert	1797	Schubert|F. Schubert	1797-01-31	1828-11-19	male	AT
+fb1c27b3-a54c-4c23-b554-9e989a955b39	Carl Czerny	1791	Czerny|C. Czerny	1791-02-21	1857-07-15	male	AT
+274774a7-1cde-486a-bc3d-375ec54d552d	Hector Berlioz	1803	Berlioz|H. Berlioz	1803-12-11	1869-03-08	male	FR
+0e85eb79-1c05-44ba-827c-7b259a3d941a	Felix Mendelssohn	1809	Mendelssohn|F. Mendelssohn|Felix Mendelssohn Bartholdy|Felix Mendelssohn-Bartholdy	1809-02-03	1847-11-04	male	DE
+2cd475bb-1abd-40c4-9904-6d4b691c752c	Franz Liszt	1811	Liszt|F. Liszt|Liszt Ferenc	1811-10-22	1886-07-31	male	HU
+09ff1fe8-d61c-4b98-bb82-18487c74d7b7	Frédéric Chopin	1810	Chopin|F. Chopin|Frederic Chopin|Fryderyk Chopin	1810-02-22	1849-10-17	male	PL
+eefd7c1e-abcf-4ccc-ba60-0fd435c9061f	Richard Wagner	1813	Wagner|R. Wagner	1813-05-22	1883-02-13	male	DE
+3cd3882c-00f8-4362-a0c2-ad89ed248533	Robert Schumann	1810	Schumann|R. Schumann	1810-06-08	1856-07-29	male	DE
+9debb4c3-dc10-440f-9c96-b777d51ea998	Anton Bruckner	1824	Bruckner|A. Bruckner	1824-09-04	1896-10-11	male	AT
+c70d12a2-24fe-4f83-a6e6-57d84f8efb51	Johannes Brahms	1833	Brahms|J. Brahms	1833-05-07	1897-04-03	male	DE
+69802473-e361-4e15-bbd8-53fe83cd1587	César Franck	1822	Franck|C. Franck|Cesar Franck	1822-12-10	1890-11-08	male	FR
+f1bedf1f-4445-4651-9c35-f4a3f3860a13	Giuseppe Verdi	1813	Verdi|G. Verdi	1813-10-10	1901-01-27	male	IT
+560b5e65-8d53-41b4-9913-83368f4721a0	Alexander Borodin	1833	Borodin|A. Borodin|Alexander Porfiryevich Borodin|Александр Порфирьевич Бородин	1833-11-12	1887-02-27	male	RU
+9bd20e6a-b41d-4983-a5b6-c0ff849fa235	Georges Bizet	1838	Bizet|G. Bizet	1838-10-25	1875-06-03	male	FR
+c1380b12-3909-47d8-a5fd-d20e76123310	Modest Mussorgsky	1839	Mussorgsky|M. Mussorgsky|Modest Petrovich Mussorgsky|Moussorgsky|Модест Петрович Мусоргский	1839-03-21	1881-03-28	male	RU
+4137c070-15b2-4d00-a9f0-3517d02a9ba8	Camille Saint-Saëns	1835	Saint-Saëns|Saint-Saens|C. Saint-Saëns|Camille Saint‐Saëns|Camille Saint-Saens	1835-10-09	1921-12-16	male	FR
+819eaeb2-8dd8-48a5-ad07-0bcd137985ef	Antonín Dvořák	1841	Dvořák|Dvorak|A. Dvořák|A. Dvorak|Antonin Dvorak	1841-09-08	1904-05-01	male	CZ
+6eb5695e-cf7b-4b94-b441-a09901127ef9	Bedřich Smetana	1824	Smetana|B. Smetana|Bedrich Smetana	1824-03-02	1884-05-12	male	CZ
+4cfe7051-f649-4d07-83b3-7a732abe7249	Nikolai Rimsky-Korsakov	1844	Rimsky-Korsakov|N. Rimsky-Korsakov|Nikolay Rimsky-Korsakov|Николай Андреевич Римский‐Корсаков	1844-03-18	1908-06-21	male	RU
+013c8e5b-d72a-4cd3-8dee-6c64d6125823	Edvard Grieg	1843	Grieg|E. Grieg	1843-06-15	1907-09-04	male	NO
+fa19a8b6-e7f4-40d4-af15-7a7c41ac7d8f	Gabriel Fauré	1845	Fauré|Faure|G. Fauré|Gabriel Faure	1845-05-12	1924-11-04	male	FR
+9ddd7abc-9e1b-471d-8031-583bc6bc8be9	Pyotr Ilyich Tchaikovsky	1840	Tchaikovsky|P.I. Tchaikovsky|P. I. Tchaikovsky|Peter Ilyich Tchaikovsky|Pyotr Tchaikovsky|Piotr Ilyich Tchaikovsky|Tschaikowsky|Пётр Ильич Чайковский	1840-05-07	1893-11-06	male	RU
+4cb43d82-824e-4034-b03d-1a98f36f6e16	Richard Strauss	1864	R. Strauss	1864-06-11	1949-09-08	male	DE
+a693df4a-8762-4a45-b7fd-6695b558385e	Giacomo Puccini	1858	Puccini|G. Puccini	1858-12-22	1924-11-29	male	IT
+8d610e51-64b4-4654-b8df-064b0fb7a9d9	Gustav Mahler	1860	Mahler|G. Mahler	1860-07-07	1911-05-18	male	AT
+691b0e9d-9e57-41cf-932d-a3d21b068e75	Jean Sibelius	1865	Sibelius|J. Sibelius	1865-12-08	1957-09-20	male	FI
+edfced8a-01bc-4c22-96b2-da58edd6b8af	Leoš Janáček	1854	Janáček|Janacek|L. Janáček|Leos Janacek	1854-07-03	1928-08-12	male	CZ
+be50643c-0377-4968-b48c-47e06b2e2a3b	Claude Debussy	1862	Debussy|C. Debussy	1862-08-22	1918-03-25	male	FR
+a4eba7b5-aceb-4acf-b297-3c0a3cd42757	Alexander Scriabin	1872	Scriabin|A. Scriabin|Alexander Skryabin|Александр Николаевич Скрябин	1872-01-06	1915-04-27	male	RU
+44b16e44-da77-4580-b851-0d765904573e	Sergei Rachmaninoff	1873	Rachmaninoff|Rachmaninov|S. Rachmaninoff|S. Rachmaninov|Sergei Rachmaninov|Sergey Rachmaninoff|Сергей Васильевич Рахманинов	1873-04-01	1943-03-28	male	RU
+e1d521ea-5b97-4981-987c-ba988b2a87d7	Erik Satie	1866	Satie|E. Satie	1866-05-17	1925-07-01	male	FR
+6fdd3b3e-1ea6-4da9-8d6f-8f8de01c133a	Maurice Ravel	1875	Ravel|M. Ravel	1875-03-07	1937-12-28	male	FR
+4e60a56a-514a-4a19-a3cc-49927c96b3cb	Edward Elgar	1857	Elgar|E. Elgar|Sir Edward Elgar	1857-06-02	1934-02-23	male	GB
+1be1367d-119f-4b08-bdfe-50b95043e544	Carl Nielsen	1865	C. Nielsen	1865-06-09	1931-10-03	male	DK
+fd14da1b-3c2d-4cc8-9ca6-fc8c62ce6988	Béla Bartók	1881	Bartók|Bartok|B. Bartók|Bela Bartok|Bartók Béla	1881-03-25	1945-09-26	male	HU
+c278de2c-9696-4fdf-a919-0781cd945e2c	Igor Stravinsky	1882	Stravinsky|I. Stravinsky|Igor Strawinsky|Игорь Фёдорович Стравинский	1882-06-17	1971-04-06	male	RU
+9b490b96-ad82-4d7b-9055-f0a196ad64cc	Arnold Schoenberg	1874	Schoenberg|Schönberg|A. Schoenberg|Arnold Schönberg	1874-09-13	1951-07-13	male	AT
+7be0b588-030c-4904-836f-71ff43a2dfec	Anton Webern	1883	Webern|A. Webern|Anton von Webern	1883-12-03	1945-09-15	male	AT
+f61c909a-db95-4a61-bc23-65a86e0d2907	Alban Berg	1885	A. Berg	1885-02-09	1935-12-24	male	AT
+4f3b96ed-f1f1-4a68-be73-0e0657837096	Ralph Vaughan Williams	1872	Vaughan Williams|R. Vaughan Williams	1872-10-12	1958-08-26	male	GB
+0e43fe9d-c472-4b62-be9e-55f971a023e1	Sergei Prokofiev	1891	Prokofiev|S. Prokofiev|Sergey Prokofiev|Сергей Сергеевич Прокофьев	1891-04-27	1953-03-05	male	RU
+a8dbf22f-9788-4cf6-a0df-c9244384f295	Heitor Villa-Lobos	1887	Villa-Lobos|H. Villa-Lobos|Heitor Villa‐Lobos	1887-03-05	1959-11-17	male	BR
+519dd32e-8f30-4380-8826-7aa99169e1bb	Dmitri Shostakovich	1906	Shostakovich|D. Shostakovich|Dmitry Shostakovich|Дмитрий Дмитриевич Шостакович	1906-09-25	1975-08-09	male	RU
+c6e5c5f4-984e-432a-87b8-b6afa288bca1	Olivier Messiaen	1908	Messiaen|O. Messiaen	1908-12-10	1992-04-27	male	FR
+5e1ef22b-310a-46ad-885b-4897b8c9c85a	Francis Poulenc	1899	Poulenc|F. Poulenc	1899-01-07	1963-01-30	male	FR
+aad3af83-5b59-4b86-a569-1a8409149b09	Aaron Copland	1900	Copland|A. Copland	1900-11-14	1990-12-02	male	US
+49ae5227-605a-47a8-9b8e-cd89bf01a97c	Benjamin Britten	1913	Britten|B. Britten	1913-11-22	1976-12-04	male	GB

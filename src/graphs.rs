@@ -208,6 +208,41 @@ pub struct AlbumSpread {
     pub no_album: i64,
 }
 
+/// One artist's album spread from their plays per record — the artist page's
+/// version of the Statistics panel, built by the same rule: the five
+/// most-played records named, every other one folded into `rest_plays`, and
+/// plays whose source named no record kept apart as `no_album` rather than
+/// hidden. `rows` is `(album, filed under, plays)`, `None` for no record.
+pub fn album_spread_of(
+    name: &str,
+    rows: Vec<(Option<String>, Option<String>, i64)>,
+) -> AlbumSpread {
+    let mut named: Vec<(String, String, i64)> = Vec::new();
+    let mut no_album = 0;
+    for (album, filed, plays) in rows {
+        match album {
+            Some(a) => named.push((a, filed.unwrap_or_default(), plays)),
+            None => no_album += plays,
+        }
+    }
+    named.sort_by(|x, y| y.2.cmp(&x.2).then_with(|| x.0.cmp(&y.0)));
+    let on_records: i64 = named.iter().map(|s| s.2).sum();
+    let albums: Vec<AlbumSlice> = named
+        .iter()
+        .take(ALBUM_SLICES)
+        .map(|(n, f, p)| AlbumSlice { name: n.clone(), album_artist: f.clone(), plays: *p })
+        .collect();
+    let shown: i64 = albums.iter().map(|s| s.plays).sum();
+    AlbumSpread {
+        name: name.to_string(),
+        plays: on_records + no_album,
+        album_count: named.len() as i64,
+        albums,
+        rest_plays: on_records - shown,
+        no_album,
+    }
+}
+
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct AlbumSlice {
     pub name: String,
@@ -940,6 +975,21 @@ mod tests {
         assert_eq!(g.anchors.len(), 1, "{:?}", g.anchors);
         assert_eq!(g.anchors[0].title, "The One");
         assert_eq!((g.anchors[0].title_plays, g.anchors[0].tracks), (18, 2));
+    }
+
+    #[test]
+    fn one_artists_spread_names_five_records_and_folds_the_rest() {
+        let rows: Vec<(Option<String>, Option<String>, i64)> = (1..=7)
+            .map(|i| (Some(format!("Record {i}")), Some("Artist".to_string()), i * 10))
+            .chain(std::iter::once((None, Some("Artist".to_string()), 4)))
+            .collect();
+        let s = album_spread_of("Artist", rows);
+        assert_eq!(s.album_count, 7);
+        assert_eq!(s.albums.len(), 5);
+        assert_eq!(s.albums[0].name, "Record 7");
+        assert_eq!(s.rest_plays, 10 + 20);
+        assert_eq!(s.no_album, 4);
+        assert_eq!(s.plays, 280 + 4);
     }
 
     #[test]

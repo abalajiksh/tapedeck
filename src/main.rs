@@ -1,5 +1,6 @@
 mod amai;
 mod analytics;
+mod classify;
 mod config;
 mod crypto;
 mod db;

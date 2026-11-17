@@ -3794,7 +3794,12 @@ mod chains;
 mod connections;
 mod crate_shelf;
 mod credits;
+mod facets;
 pub use credits::{credit_extends, same_spelling, tracks_matched};
+pub use facets::{
+    ClassicalStatRow, DatedArtist, FacetListen, FacetOverride, InsightFilter, InsightRow,
+    PerformerStatRow, RoleCoverage, TimelineRow,
+};
 pub mod dialect;
 mod gear;
 #[cfg(test)]

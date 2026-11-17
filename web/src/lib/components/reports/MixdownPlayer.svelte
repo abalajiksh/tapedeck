@@ -22,6 +22,11 @@
 	export let offset = 0;
 	export let label = '';
 	export let open = false;
+	/** A season instead of a report period: `christmas`, `halloween` or
+	 *  `easter`, with the year the season began. The same player and the same
+	 *  video job — only where the mixdown comes from differs. */
+	export let lens: string | null = null;
+	export let season = 0;
 
 	type Theme = 'dark' | 'light';
 	const THEMES: { k: Theme; label: string }[] = [
@@ -53,18 +58,18 @@
 	let saving = false;
 	let poll: ReturnType<typeof setTimeout> | null = null;
 
-	$: if (open) void load(unit, offset, theme);
+	$: if (open) void load(unit, offset, theme, lens, season);
 	$: if (!open) stop();
 
-	async function load(u: typeof unit, o: number, th: Theme) {
+	async function load(u: typeof unit, o: number, th: Theme, ln: string | null = null, sn = 0) {
 		stop();
 		loading = true;
 		error = '';
 		mixdown = null;
 		try {
-			const s = await api.getReportMixdown(u, o, th);
+			const s = ln ? await api.getLensMixdown(ln, sn, th) : await api.getReportMixdown(u, o, th);
 			// A slower answer for a look that is no longer selected is dropped.
-			if (!open || u !== unit || o !== offset || th !== theme) return;
+			if (!open || u !== unit || o !== offset || th !== theme || ln !== lens || sn !== season) return;
 			mixdown = s;
 			await tick();
 			if (ground) ground.innerHTML = s.background;
@@ -176,7 +181,9 @@
 	async function makeVideo() {
 		videoError = '';
 		try {
-			video = await api.startMixdownVideo(unit, offset, theme);
+			video = lens
+				? await api.startLensMixdownVideo(lens, season, theme)
+				: await api.startMixdownVideo(unit, offset, theme);
 			watch();
 		} catch (e) {
 			videoError = humanError(e, 'The video could not be started');

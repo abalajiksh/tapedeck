@@ -13284,3 +13284,114 @@ async fn spool_plays_on_no_chain_are_asked_about_and_filed_at_a_friends() {
     assert!(db.slot_questions(uid).await.unwrap().iter().all(|q| q.kind != "spool"));
     assert!(db.file_spool_plays(uid, Some(99_999)).await.unwrap().is_err());
 }
+
+/// Classical, score and Christmas, end to end over listens that carry names
+/// only — the Pano Scrobbler and Starling case, which needs no lookup at all.
+#[tokio::test]
+async fn kinds_of_listen_leave_top_charts_and_fill_their_own_tabs() {
+    use crate::classify::{self, CHRISTMAS, CLASSICAL, SCORE};
+    let db = testdb().await;
+    let uid = db.create_user("ines", None, "x", "user").await.unwrap();
+    let mut t = 1_700_000_000;
+    let mut save = |title: &str, artist: &str, album: Option<&str>| {
+        t += 600;
+        let mut p = play(title, artist, t);
+        p.album = album.map(str::to_string);
+        p
+    };
+    for p in [
+        save(
+            "Swan Lake",
+            "London Symphony Orchestra, Pyotr Ilyich Tchaikovsky",
+            Some("Classical Chillout"),
+        ),
+        save(
+            "Swan Lake",
+            "London Symphony Orchestra, Pyotr Ilyich Tchaikovsky",
+            Some("Classical Chillout"),
+        ),
+        save("Last Christmas", "Wham!", Some("Last Christmas")),
+        save("Toxic", "Britney Spears", Some("In the Zone")),
+        save("Main Title", "Hans Zimmer", Some("Interstellar (Original Motion Picture Score)")),
+    ] {
+        db.save_scrobble(
+            uid,
+            &p,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ListenDisposition::LIVE,
+        )
+        .await
+        .unwrap();
+    }
+
+    // A client that may not ask the API: a placeholder contact refuses.
+    let mb = crate::musicbrainz::MusicBrainzClient::new(Default::default(), db.pool.clone())
+        .await
+        .unwrap();
+    mb.initialize_schema().await.unwrap();
+    assert_eq!(classify::backfill::backfill(&db, &mb, 100, 8).await, 5);
+    assert_eq!(db.facets_pending(uid, classify::VERSION).await.unwrap(), 0);
+
+    // Top Charts without classical and score; everything with them.
+    let top = db.top_chart(uid, "tracks", None, 10, false, CLASSICAL | SCORE).await.unwrap();
+    let names: Vec<&str> = top.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.contains(&"Toxic") && names.contains(&"Last Christmas"), "{names:?}");
+    assert!(!names.contains(&"Swan Lake") && !names.contains(&"Main Title"), "{names:?}");
+    assert_eq!(db.split_out(uid, None, CLASSICAL | SCORE).await.unwrap(), 3);
+    assert_eq!(
+        db.chart(uid, "tracks", None, 10, false).await.unwrap().len(),
+        4,
+        "the collective view keeps all"
+    );
+
+    // The composer's dates come from the canon list, without a lookup.
+    let rows = db.classical_stat_rows(uid, &InsightFilter::default()).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(
+        rows.iter().all(|r| r.born.as_deref().is_some_and(|b| b.starts_with("1840"))),
+        "{rows:?}"
+    );
+    assert!(rows.iter().all(|r| r.country.as_deref() == Some("RU")));
+
+    // Classical: the piece, its composer, and the orchestra inferred from its name.
+    let f = InsightFilter::default();
+    let pieces = db.classical_chart(uid, "pieces", &f, false, 10).await.unwrap();
+    assert_eq!(pieces.len(), 1);
+    assert_eq!((pieces[0].name.as_str(), pieces[0].plays), ("Swan Lake", 2));
+    assert_eq!(pieces[0].sub.as_deref(), Some("Pyotr Ilyich Tchaikovsky"));
+    let orchestras = db.classical_chart(uid, "orchestra", &f, false, 10).await.unwrap();
+    assert_eq!(orchestras[0].name, "London Symphony Orchestra");
+    assert_eq!(orchestras[0].inferred, Some(1));
+
+    // The Christmas lens counts it; an override takes it back out, at once.
+    let songs = db.lens_songs(uid, CHRISTMAS, &f, false, 10).await.unwrap();
+    assert_eq!(songs[0].name, "Last Christmas");
+    let key = songs[0].key.clone();
+    db.set_facet_override(uid, "work", &key, CHRISTMAS, Some(false)).await.unwrap();
+    classify::backfill::refresh_user(&db, &mb, uid).await;
+    assert!(db.lens_songs(uid, CHRISTMAS, &f, false, 10).await.unwrap().is_empty());
+    // Removing the override returns to what Tapedeck decided.
+    db.set_facet_override(uid, "work", &key, CHRISTMAS, None).await.unwrap();
+    classify::backfill::refresh_user(&db, &mb, uid).await;
+    assert_eq!(db.lens_songs(uid, CHRISTMAS, &f, false, 10).await.unwrap().len(), 1);
+
+    // An artist override moves everything they are credited on — the
+    // neoclassical-pianist case no rule can place.
+    db.set_facet_override(uid, "artist", "britney spears", CLASSICAL, Some(true)).await.unwrap();
+    classify::backfill::refresh_user(&db, &mb, uid).await;
+    let top = db.top_chart(uid, "tracks", None, 10, false, CLASSICAL | SCORE).await.unwrap();
+    assert!(!top.iter().any(|r| r.name == "Toxic"), "moved to Classical");
+    assert_eq!(
+        db.facet_overrides_on(uid, "artist", "britney spears").await.unwrap(),
+        vec![(CLASSICAL, true)]
+    );
+
+    // A member's overrides go with them.
+    db.delete_user(uid).await.unwrap();
+}

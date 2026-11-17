@@ -50,12 +50,26 @@
 //!   side — arguably more correct, and still a behaviour change, which is why
 //!   it is not being taken by accident.
 //! * **`printf('%012d', …)`** in `COVER_PICK` is SQLite's. Postgres wants
-//!   `lpad(x::text, 12, '0')`. One site, and it decides whether a grouped cover
-//!   comes from one listen.
+//!   `lpad(x::text, 12, '0')`, which [`to_postgres`] now writes for that exact
+//!   shape (found by the v0.132.0 live checks). One site, and it decides
+//!   whether a grouped cover comes from one listen.
+//! * **`SUM` over an integer column is NUMERIC** on Postgres (`SUM(bigint)`
+//!   widens so it cannot overflow), and sqlx will not decode NUMERIC into an
+//!   `i64`. SQLite hands back an integer, so nothing on that side notices.
+//!   Write `CAST(SUM(x) AS BIGINT)` — or `CAST(COALESCE(SUM(x), 0) AS
+//!   BIGINT)` — wherever the sum is read into an integer. `SUM(CASE … THEN 1
+//!   ELSE 0 END)` is fine as it is: the literals are `int4`, whose sum is
+//!   `bigint`. `AVG` of a `REAL` is `double precision` and decodes into `f64`.
+//!   The same goes for a bare literal: `0 AS n` is `int4`, so write
+//!   `CAST(0 AS BIGINT)` for an `i64`; `0.0 AS x` is NUMERIC, so write
+//!   `CAST(0.0 AS DOUBLE PRECISION)` for an `f64`.
 //! * **DDL**: `AUTOINCREMENT` (56), partial-index and CHECK-rebuild guards read
 //!   out of `sqlite_master` (7), `PRAGMA` (10). All of `schema.rs` and
 //!   `migrate.rs` — the reason those were split out first.
-//! * **`json_each`** (13) → `jsonb_array_elements`.
+//! * **`json_each`** (13) → `jsonb_array_elements`. Over a column holding a
+//!   JSON array (`scrobbles.genres`) [`to_postgres`] now writes
+//!   `json_array_elements_text(CAST(col AS JSON))`; an object column such as
+//!   `signal_chains.components` still needs its own rewrite.
 //! * **`last_insert_rowid()`** (17) → `RETURNING`.
 //! * **`INSERT OR IGNORE` / `OR REPLACE`** (16) → `ON CONFLICT`.
 //! * **`GROUP_CONCAT`** (2) → `string_agg`, **`strftime`** (6), **`datetime(`** (6).
@@ -264,6 +278,13 @@ const DDL_PHRASES: &[(&[&str], &str)] = &[
     (&["WITHOUT", "ROWID"], ""),
     (&["INTEGER"], "BIGINT"),
     (&["REAL"], "DOUBLE PRECISION"),
+    // `settings`, `components` and `overrides` are written and read as strings
+    // everywhere — Rust holds them as `String` and serialises with serde. A
+    // Postgres `json` column refuses a text bind and will not decode into a
+    // `String`, so it is `TEXT` here; the one place that walks one as JSON,
+    // `json_each`, casts for itself. `migrate_postgres` converts databases
+    // created before this (v0.132.0).
+    (&["JSON"], "TEXT"),
 ];
 
 /// The tokeniser. Walks `sql` once, copying through string literals, quoted
@@ -364,6 +385,20 @@ fn to_postgres(sql: &str, mode: Mode) -> String {
                     i = rest;
                     continue;
                 }
+                if let Some((rest, column)) = json_array_at(sql, i) {
+                    out.push_str("json_array_elements_text(CAST(");
+                    out.push_str(column);
+                    out.push_str(" AS JSON))");
+                    i = rest;
+                    continue;
+                }
+                if let Some((rest, column)) = zero_pad_at(sql, i) {
+                    out.push_str("LPAD(CAST(");
+                    out.push_str(column);
+                    out.push_str(" AS TEXT), 12, '0')");
+                    i = rest;
+                    continue;
+                }
                 let c = sql[i..].chars().next().unwrap();
                 out.push(c);
                 i += c.len_utf8();
@@ -423,6 +458,41 @@ fn word_at(sql: &str, i: usize, word: &str) -> Option<usize> {
 fn call_at(sql: &str, i: usize, word: &str) -> Option<usize> {
     let end = word_at(sql, i, word)?;
     (sql.as_bytes().get(end) == Some(&b'(')).then_some(end)
+}
+
+/// `json_each(<column>)` at `i`, as `(end, column)`: a JSON **array** held in
+/// a column, fanned out one row per element. Postgres's
+/// `json_array_elements_text(CAST(x AS JSON))` gives the same rows, and names
+/// its column `value` too, so `g.value` reads the same on both. Only a plain
+/// column argument — anything else is left for Postgres to refuse. SQLite's
+/// `json_each` also walks objects and has `key`/`type` columns; this
+/// translation does neither, and an object column (`signal_chains.components`)
+/// needs a rewrite of its own.
+fn json_array_at(sql: &str, i: usize) -> Option<(usize, &str)> {
+    let open = call_at(sql, i, "json_each")?;
+    let args = &sql[open + 1..];
+    let len = args.bytes().take_while(|c| is_word_byte(*c) || *c == b'.').count();
+    if len == 0 || args.as_bytes().get(len) != Some(&b')') {
+        return None;
+    }
+    Some((open + 1 + len + 1, &args[..len]))
+}
+
+/// `printf('%012d', <column>)` at `i` — [`COVER_PICK`](super::COVER_PICK)'s
+/// zero-padded timestamp, the one `printf` in the tree — as `(end, column)`.
+/// Postgres has no `printf`; `LPAD(CAST(x AS TEXT), 12, '0')` is the same
+/// string. Only that exact shape: any other format would need its own
+/// translation, and guessing one is how a cover silently comes from the wrong
+/// listen.
+fn zero_pad_at(sql: &str, i: usize) -> Option<(usize, &str)> {
+    let open = call_at(sql, i, "printf")?;
+    let args = sql[open..].strip_prefix("('%012d', ")?;
+    let len = args.bytes().take_while(|c| is_word_byte(*c) || *c == b'.').count();
+    if len == 0 || args.as_bytes().get(len) != Some(&b')') {
+        return None;
+    }
+    let start = sql.len() - args.len();
+    Some((start + len + 1, &args[..len]))
 }
 
 #[cfg(test)]
@@ -515,6 +585,44 @@ mod tests {
             "SELECT unlike, likeness FROM t"
         );
         assert_eq!(to_postgres("WHERE s = 'LIKE'", Mode::Query), "WHERE s = 'LIKE'");
+    }
+
+    #[test]
+    fn a_json_column_is_text_on_postgres() {
+        assert_eq!(
+            to_postgres("components JSON NOT NULL DEFAULT '[]',", Mode::Ddl),
+            "components TEXT NOT NULL DEFAULT '[]',"
+        );
+        // Only the type word: a function name is not touched.
+        assert_eq!(to_postgres("CHECK (json_valid(x))", Mode::Ddl), "CHECK (json_valid(x))");
+    }
+
+    #[test]
+    fn json_each_over_an_array_column_becomes_json_array_elements_text() {
+        assert_eq!(
+            to_postgres("SELECT g.value FROM t, json_each(t.genres) g WHERE x = ?", Mode::Query),
+            "SELECT g.value FROM t, json_array_elements_text(CAST(t.genres AS JSON)) g WHERE x = $1"
+        );
+        // Not a plain column: left alone.
+        assert_eq!(to_postgres("json_each('[1]')", Mode::Query), "json_each('[1]')");
+    }
+
+    #[test]
+    fn the_cover_pick_zero_pad_becomes_lpad() {
+        assert_eq!(
+            to_postgres("SELECT printf('%012d', timestamp) || CHAR(31) || x", Mode::Query),
+            "SELECT LPAD(CAST(timestamp AS TEXT), 12, '0') || CHR(31) || x"
+        );
+        assert_eq!(
+            to_postgres("SELECT printf('%012d', s.timestamp)", Mode::Query),
+            "SELECT LPAD(CAST(s.timestamp AS TEXT), 12, '0')"
+        );
+        // Any other format is left for Postgres to refuse, loudly.
+        assert_eq!(to_postgres("SELECT printf('%5d', n)", Mode::Query), "SELECT printf('%5d', n)");
+        // The translated pick must sort the way SQLite's does.
+        let pick = to_postgres(crate::db::COVER_PICK, Mode::Query);
+        assert!(pick.contains("LPAD(CAST(timestamp AS TEXT), 12, '0')"), "{pick}");
+        assert!(!pick.contains("printf"), "{pick}");
     }
 
     #[test]

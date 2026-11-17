@@ -145,6 +145,13 @@ pub struct ArtistPage {
     pub stats: Vec<StatCard>,
     /// Up to six records.
     pub albums: Vec<AlbumAggregate>,
+    /// How their plays split across their records — a catalogue explorer is
+    /// many slices, a one-album fan one long one. The same figure as the
+    /// Statistics page's album spread, for this artist alone and all time.
+    pub album_spread: crate::graphs::AlbumSpread,
+    /// Their round anniversaries this year, and a birthday or deathday that
+    /// falls today: "Maurice Ravel was born 150 years ago".
+    pub anniversaries: Vec<String>,
     /// The ten most-played tracks.
     pub top_tracks: Vec<TrackAggregate>,
     pub trend: Vec<TrendPoint>,
@@ -617,6 +624,41 @@ pub async fn artist_detail(
 
     let trend: Vec<_> =
         trend.into_iter().map(|(label, value)| TrendPoint { label, value }).collect();
+    let anniversaries = {
+        let tz = super::scrobbles::user_tz_for(&state, user.user_id).await;
+        let today = chrono::Utc::now().with_timezone(&tz).date_naive();
+        match state
+            .db
+            .artist_dates_for(entity.mbid.as_deref(), &name)
+            .await
+            .or_warn("artist dates")
+            .flatten()
+        {
+            Some(d) => crate::classify::anniversary::of_artist(
+                &d.name,
+                d.kind.as_deref(),
+                d.begin.as_deref(),
+                d.end_date.as_deref(),
+                d.ended != 0,
+                0,
+                chrono::Datelike::year(&today),
+                today,
+            )
+            .into_iter()
+            .map(|a| a.label)
+            .collect(),
+            None => Vec::new(),
+        }
+    };
+    let album_spread = crate::graphs::album_spread_of(
+        &name,
+        state
+            .db
+            .artist_album_plays(user.user_id, &name)
+            .await
+            .or_warn("artist_detail: artist_album_plays")
+            .unwrap_or_default(),
+    );
 
     (
         StatusCode::OK,
@@ -639,6 +681,8 @@ pub async fn artist_detail(
             bio,
             stats,
             albums,
+            album_spread,
+            anniversaries,
             top_tracks,
             trend,
         }),
@@ -727,6 +771,10 @@ pub struct Chart {
     /// The window, as asked.
     pub range: String,
     pub rows: Vec<ChartRow>,
+    /// Listens in the window left out because they are classical or score
+    /// and you keep those in their own tabs (preferences `split_classical`,
+    /// `split_scores`). Zero when you do not.
+    pub split_out: i64,
 }
 
 /// Top charts.
@@ -762,10 +810,17 @@ pub async fn charts(
     let after = crate::server::scrobbles::range_after(q.range.as_deref());
 
     let by_hours = q.metric.as_deref() == Some("hours");
-    match state.db.chart(user.user_id, kind, after, limit, by_hours).await {
+    let exclude = super::insights::split_mask(&state, user.user_id).await;
+    let split_out = state
+        .db
+        .split_out(user.user_id, after, exclude)
+        .await
+        .or_warn("charts: split_out")
+        .unwrap_or(0);
+    match state.db.top_chart(user.user_id, kind, after, limit, by_hours, exclude).await {
         Ok(rows) => (
             StatusCode::OK,
-            Json(Chart { kind, range: q.range.unwrap_or_else(|| "all".into()), rows }),
+            Json(Chart { kind, range: q.range.unwrap_or_else(|| "all".into()), rows, split_out }),
         )
             .into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),

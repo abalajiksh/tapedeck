@@ -129,12 +129,11 @@ mod tests {
         move |e| panic!("{what}: {}", crate::logging::error_chain(&e))
     }
 
-    /// A row written straight to its table, returning its id.
-    ///
-    /// For `signal_chains` and `chain_variants`: `create_chain` and
-    /// `create_variant` bind their JSON columns as text, which Postgres refuses
-    /// (`column "components" is of type json but expression is of type
-    /// text`). A gap of its own, recorded in the PR rather than fixed here.
+    /// A row written straight to its table, returning its id — for fixtures
+    /// whose own writer would drag in more than the check is about.
+    /// (`create_chain` / `create_variant` work on Postgres since v0.132.0,
+    /// when the JSON columns became TEXT; `duration_sums_decode_on_postgres`
+    /// goes through them.)
     async fn insert_returning_id(db: &Database, sql: &str) -> i64 {
         sqlx::query_scalar(sql).fetch_one(&db.pool).await.unwrap_or_else(die(sql))
     }
@@ -455,6 +454,167 @@ mod tests {
         assert_eq!(upgraded, reference, "an upgraded chain_bindings differs from a fresh one");
     }
 
+    /// A v0.131 Postgres database — no facet columns on `scrobbles` — opened
+    /// by v0.132.0 gains them, shaped exactly as a fresh install's, with its
+    /// listens intact and the classifier's work list reading them. Fresh
+    /// schemas never see this, which is how the first PR for the facets
+    /// shipped without a Postgres arm.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn a_v0_131_postgres_database_gains_the_facet_columns() {
+        let url = fresh("facets_upgrade").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new"));
+        let me = db.setup_admin("tester", None, "not-a-real-hash").await.unwrap();
+        let play = crate::models::Play::new(
+            "Xtal".into(),
+            "Aphex Twin".into(),
+            1_700_000_000,
+            "pg-upgrade-1".into(),
+            "test".into(),
+        );
+        db.save_scrobble(me, &play, None, None, None, None, None, None, None, Default::default())
+            .await
+            .unwrap_or_else(die("save_scrobble"));
+        drop(db);
+
+        let columns = |schema: &'static str| async move {
+            let pool = PgPoolOptions::new().max_connections(1).connect(&base_url()).await.unwrap();
+            let rows: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+                "SELECT column_name::text, data_type::text, is_nullable::text, column_default::text
+                   FROM information_schema.columns
+                  WHERE table_schema = $1 AND table_name = 'scrobbles'
+                    AND column_name IN ('facets', 'facets_version', 'fact_key')
+                  ORDER BY column_name",
+            )
+            .bind(schema)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_else(die("read columns"));
+            pool.close().await;
+            rows
+        };
+        let reference = columns("tapedeck_pg_check_facets_upgrade").await;
+        assert_eq!(reference.len(), 3, "a fresh install has all three: {reference:?}");
+
+        // Back to v0.131.3's scrobbles: the indexes on the columns go with them.
+        let pool = PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        for sql in [
+            "DROP INDEX IF EXISTS idx_scrobbles_fact_key",
+            "DROP INDEX IF EXISTS idx_scrobbles_facets_version",
+            "ALTER TABLE scrobbles DROP COLUMN facets, DROP COLUMN facets_version, DROP COLUMN fact_key",
+        ] {
+            sqlx::query(sql).execute(&pool).await.unwrap_or_else(die("build v0.131.3 shape"));
+        }
+        pool.close().await;
+        assert!(columns("tapedeck_pg_check_facets_upgrade").await.is_empty());
+
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new over a v0.131.3 database"));
+        assert_eq!(
+            columns("tapedeck_pg_check_facets_upgrade").await,
+            reference,
+            "upgraded differs from fresh"
+        );
+        let todo = db
+            .listens_needing_facets(crate::classify::VERSION, Some(me), 10)
+            .await
+            .unwrap_or_else(die("listens_needing_facets"));
+        assert_eq!(todo.len(), 1, "the old listen is on the work list");
+
+        // A second start is a no-op.
+        drop(db);
+        Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new, second start"));
+    }
+
+    /// A Postgres database made before v0.132.0 has `json` columns for
+    /// `users.settings`, `signal_chains.components` and
+    /// `chain_variants.overrides`, which refused every text bind and would not
+    /// decode into a `String`. Opened by v0.132.0 they become TEXT — shaped as
+    /// a fresh install's, defaults included — and keep what they held.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn json_columns_become_text_on_an_older_postgres_database() {
+        let url = fresh("json_upgrade").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new"));
+        let me = db.setup_admin("tester", None, "not-a-real-hash").await.unwrap();
+        drop(db);
+
+        let shape = |schema: &'static str| async move {
+            let pool = PgPoolOptions::new().max_connections(1).connect(&base_url()).await.unwrap();
+            let rows: Vec<(String, String, String, String, Option<String>)> = sqlx::query_as(
+                "SELECT table_name::text, column_name::text, data_type::text, is_nullable::text,
+                        column_default::text
+                   FROM information_schema.columns
+                  WHERE table_schema = $1
+                    AND (table_name, column_name) IN (('users', 'settings'),
+                         ('signal_chains', 'components'), ('chain_variants', 'overrides'))
+                  ORDER BY 1, 2",
+            )
+            .bind(schema)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_else(die("read columns"));
+            pool.close().await;
+            rows
+        };
+        let reference = shape("tapedeck_pg_check_json_upgrade").await;
+        assert_eq!(reference.len(), 3);
+        assert!(reference.iter().all(|r| r.2 == "text"), "a fresh install is TEXT: {reference:?}");
+
+        // Back to the shape `JSON` used to translate to, with a chain in it.
+        let pool = PgPoolOptions::new().max_connections(1).connect(&url).await.unwrap();
+        for sql in [
+            "ALTER TABLE users ALTER COLUMN settings DROP DEFAULT".to_string(),
+            "ALTER TABLE users ALTER COLUMN settings TYPE JSON USING settings::json".to_string(),
+            "ALTER TABLE users ALTER COLUMN settings SET DEFAULT '{}'".to_string(),
+            "ALTER TABLE signal_chains ALTER COLUMN components DROP DEFAULT".to_string(),
+            "ALTER TABLE signal_chains ALTER COLUMN components TYPE JSON USING components::json"
+                .to_string(),
+            "ALTER TABLE signal_chains ALTER COLUMN components SET DEFAULT '[]'".to_string(),
+            "ALTER TABLE chain_variants ALTER COLUMN overrides DROP DEFAULT".to_string(),
+            "ALTER TABLE chain_variants ALTER COLUMN overrides TYPE JSON USING overrides::json"
+                .to_string(),
+            "ALTER TABLE chain_variants ALTER COLUMN overrides SET DEFAULT '[]'".to_string(),
+            format!(
+                "INSERT INTO signal_chains (user_id, name, components, created_at)
+                 VALUES ({me}, 'Desk', '[{{\"type\":\"dac\",\"name\":\"E30\",\"detail\":null}}]', 0)"
+            ),
+        ] {
+            sqlx::query(&sql).execute(&pool).await.unwrap_or_else(die("build the json shape"));
+        }
+        pool.close().await;
+        assert!(shape("tapedeck_pg_check_json_upgrade").await.iter().all(|r| r.2 == "json"));
+
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new over the json shape"));
+        assert_eq!(
+            shape("tapedeck_pg_check_json_upgrade").await,
+            reference,
+            "upgraded differs from fresh"
+        );
+        let chains = db.get_chains(me).await.unwrap_or_else(die("get_chains"));
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].components.len(), 1, "the chain kept its components");
+        assert_eq!(chains[0].components[0].name, "E30");
+        db.create_variant(me, chains[0].id.expect("an id"), "Other", &[])
+            .await
+            .unwrap_or_else(die("create_variant"));
+
+        // A second start is a no-op.
+        drop(db);
+        Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new, second start"));
+    }
+
     /// `chain_bindings`' columns (name, type, nullability) and foreign keys
     /// (name, definition), both sorted — column order differs after an
     /// `ADD COLUMN` and means nothing.
@@ -554,6 +714,703 @@ mod tests {
         for want in ["idx_notes_user_entity", "idx_scrobbles_session", "idx_entities_match"] {
             assert!(indexes.contains(&want.to_string()), "no `{want}`; got {indexes:?}");
         }
+        drop(db);
+    }
+
+    /// Every query behind Classical, Scores & Ambient, the seasonal lenses,
+    /// B-Sides, the split Top Charts and anniversaries, run on Postgres with
+    /// rows behind it — written for v0.132.0, whose SQL was otherwise only
+    /// ever executed on SQLite. A shape Postgres refuses (a GROUP BY it
+    /// considers ungrouped, an untyped NULL, a SQLite-only function) fails
+    /// here; the asserted numbers keep it about the answers too.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn the_insight_facets_run_on_postgres() {
+        use crate::classify::{self, ArtistDates, Outcome, PerformerRow};
+        use crate::db::InsightFilter;
+
+        let url = fresh("facets").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(|e| panic!("Database::new: {}", crate::logging::error_chain(&e)));
+        let uid = db
+            .setup_admin("tester", None, "not-a-real-hash")
+            .await
+            .unwrap_or_else(die("setup_admin"));
+
+        const MENDELSSOHN: &str = "c70d12a2-24fe-4f83-a6e6-57d84f8efb51";
+        const CONCERTO: &str = "w:0b0b0b0b-0000-4000-8000-000000000001";
+        let base = 1_766_000_000u64; // December 2025
+                                     // (title, artist, album, recording mbid, artist mbid, offset)
+        let listens = [
+            (
+                "Violin Concerto in E minor: I. Allegro molto appassionato",
+                "Hilary Hahn",
+                "Mendelssohn / Shostakovich",
+                "rec-1",
+                MENDELSSOHN,
+                0u64,
+            ),
+            (
+                "Violin Concerto in E minor: II. Andante",
+                "Hilary Hahn",
+                "Mendelssohn / Shostakovich",
+                "rec-2",
+                MENDELSSOHN,
+                700,
+            ),
+            (
+                "Violin Concerto in E minor: III. Allegretto non troppo",
+                "Hilary Hahn",
+                "Mendelssohn / Shostakovich",
+                "rec-3",
+                MENDELSSOHN,
+                1200,
+            ),
+            (
+                "Derezzed",
+                "Daft Punk",
+                "TRON: Legacy",
+                "rec-4",
+                "056e4f3e-d505-4dad-8ec1-d04f521cbb56",
+                9_000,
+            ),
+            (
+                "Arrival of the Birds",
+                "The Cinematic Orchestra",
+                "The Crimson Wing",
+                "rec-5",
+                "a1b2c3d4-0000-4000-8000-000000000005",
+                12_000,
+            ),
+            (
+                "1/1",
+                "Brian Eno",
+                "Ambient 1: Music for Airports",
+                "rec-6",
+                "ff95eb47-41c4-4f7f-a104-cdc30f02e872",
+                15_000,
+            ),
+            (
+                "Last Christmas",
+                "Wham!",
+                "Last Christmas",
+                "rec-7",
+                "5f7d0f1c-0000-4000-8000-000000000007",
+                18_000,
+            ),
+            (
+                "Last Christmas",
+                "Taylor Swift",
+                "Sounds of the Season",
+                "rec-8",
+                "20244d07-534f-4eff-b4d4-930878889970",
+                18_400,
+            ),
+            (
+                "Everything In Its Right Place",
+                "Radiohead",
+                "Kid A",
+                "rec-9",
+                "a74b1b7f-71a5-4011-9441-d0b5e4122711",
+                21_000,
+            ),
+        ];
+        for (i, (title, artist, album, rec, artist_mbid, off)) in listens.iter().enumerate() {
+            let mut play = crate::models::Play::new(
+                title.to_string(),
+                artist.to_string(),
+                base + off,
+                format!("pg-facets-{i}"),
+                "test".into(),
+            );
+            play.album = Some(album.to_string());
+            play.duration = Some(300);
+            play.mbid_recording = Some(format!("00000000-0000-4000-8000-00000000000{i}"));
+            play.mbid_release = Some(format!("rel-{rec}"));
+            play.mbid_artist = Some(vec![artist_mbid.to_string()]);
+            db.save_scrobble(
+                uid,
+                &play,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap_or_else(die("save_scrobble"));
+        }
+        db.rebuild_sessions(uid, 1800).await.unwrap_or_else(die("rebuild_sessions"));
+
+        let todo = db
+            .listens_needing_facets(classify::VERSION, Some(uid), 100)
+            .await
+            .unwrap_or_else(die("listens_needing_facets"));
+        assert_eq!(todo.len(), listens.len());
+        assert_eq!(
+            db.facets_pending(uid, classify::VERSION).await.unwrap_or_else(die("facets_pending")),
+            listens.len() as i64
+        );
+
+        let hahn = PerformerRow {
+            name: "Hilary Hahn".into(),
+            mbid: None,
+            role: "soloist".into(),
+            instrument: Some("violin".into()),
+            country: Some("US".into()),
+        };
+        let conductor = PerformerRow {
+            name: "Hugh Wolff".into(),
+            mbid: None,
+            role: "conductor".into(),
+            instrument: None,
+            country: Some("US".into()),
+        };
+        let orchestra = PerformerRow {
+            name: "Oslo Philharmonic Orchestra".into(),
+            mbid: None,
+            role: "orchestra".into(),
+            instrument: None,
+            country: Some("NO".into()),
+        };
+        for l in &todo {
+            let key = l.fact_key();
+            let movement = l.title.split(": ").nth(1).map(str::to_string);
+            let o = match l.artist.as_str() {
+                "Hilary Hahn" => Outcome {
+                    facets: classify::CLASSICAL,
+                    piece_key: CONCERTO.into(),
+                    piece_title: "Violin Concerto in E minor, Op. 64".into(),
+                    movement: movement.clone(),
+                    composer_name: Some("Felix Mendelssohn".into()),
+                    composer_mbid: Some(MENDELSSOHN.into()),
+                    leaf_key: Some(format!("w:leaf-{}", movement.unwrap_or_default())),
+                    part_count: Some(3),
+                    composed_year: Some(1844),
+                    form: Some("Concerto".into()),
+                    performers: vec![conductor.clone(), orchestra.clone()],
+                    evidence: vec!["canon composer".into()],
+                },
+                "Daft Punk" => Outcome {
+                    facets: classify::SCORE,
+                    piece_key: "t:derezzed".into(),
+                    piece_title: l.title.clone(),
+                    ..Default::default()
+                },
+                "The Cinematic Orchestra" => Outcome {
+                    facets: classify::SCORE_SUGGESTED,
+                    piece_key: "t:arrival of the birds".into(),
+                    piece_title: l.title.clone(),
+                    ..Default::default()
+                },
+                "Brian Eno" => Outcome {
+                    facets: classify::AMBIENT,
+                    piece_key: "t:1/1".into(),
+                    piece_title: l.title.clone(),
+                    ..Default::default()
+                },
+                "Wham!" | "Taylor Swift" => Outcome {
+                    facets: classify::CHRISTMAS,
+                    piece_key: "w:last-christmas".into(),
+                    piece_title: "Last Christmas".into(),
+                    ..Default::default()
+                },
+                _ => Outcome {
+                    facets: 0,
+                    piece_key: "t:everything in its right place".into(),
+                    piece_title: l.title.clone(),
+                    ..Default::default()
+                },
+            };
+            let inferred = if l.artist == "Hilary Hahn" { vec![hahn.clone()] } else { vec![] };
+            db.store_fact(&key, classify::VERSION, &o, &inferred)
+                .await
+                .unwrap_or_else(die("store_fact"));
+            // Storing twice is the upsert path a re-run takes.
+            db.store_fact(&key, classify::VERSION, &o, &inferred)
+                .await
+                .unwrap_or_else(die("store_fact again"));
+            let back = db
+                .stored_fact(&key, classify::VERSION)
+                .await
+                .unwrap_or_else(die("stored_fact"))
+                .expect("a stored fact reads back");
+            assert_eq!(back.facets, o.facets);
+            db.set_listen_facets(l.id, &key, o.facets, classify::VERSION)
+                .await
+                .unwrap_or_else(die("set_listen_facets"));
+        }
+        assert_eq!(
+            db.facets_pending(uid, classify::VERSION).await.unwrap_or_else(die("pending")),
+            0
+        );
+        let role = db.stated_role("hugh wolff").await.unwrap_or_else(die("stated_role"));
+        println!("stated role of Hugh Wolff: {role:?}");
+
+        // ── Classical ──
+        let all = InsightFilter::default();
+        for rank in [
+            "pieces",
+            "movements",
+            "composers",
+            "performances",
+            "conductor",
+            "orchestra",
+            "ensemble",
+            "soloist",
+        ] {
+            for by_hours in [false, true] {
+                let rows =
+                    db.classical_chart(uid, rank, &all, by_hours, 20).await.unwrap_or_else(|e| {
+                        panic!("classical_chart {rank}: {}", crate::logging::error_chain(&e))
+                    });
+                println!(
+                    "classical {rank} (hours={by_hours}): {:?}",
+                    rows.iter().map(|r| (&r.name, r.plays)).collect::<Vec<_>>()
+                );
+                match rank {
+                    "pieces" | "composers" | "performances" => {
+                        assert_eq!(rows[0].plays, 3, "{rank}")
+                    }
+                    "movements" => assert_eq!(rows.len(), 3),
+                    "soloist" | "conductor" | "orchestra" => assert_eq!(rows.len(), 1, "{rank}"),
+                    _ => assert!(rows.is_empty(), "{rank}"),
+                }
+            }
+        }
+        let soloists = db
+            .classical_chart(uid, "soloist", &all, false, 20)
+            .await
+            .unwrap_or_else(die("soloist"));
+        assert_eq!(soloists[0].inferred, Some(1), "Hahn's role was inferred");
+        let filtered = InsightFilter {
+            after: Some(base as i64 - 1),
+            before: Some(base as i64 + 100_000),
+            composer: Some(MENDELSSOHN.into()),
+            piece: Some(CONCERTO.into()),
+            performer: Some("hilary hahn".into()),
+            instrument: Some("violin".into()),
+        };
+        for rank in ["pieces", "movements", "composers", "performances", "soloist"] {
+            let rows =
+                db.classical_chart(uid, rank, &filtered, false, 20).await.unwrap_or_else(|e| {
+                    panic!("filtered classical_chart {rank}: {}", crate::logging::error_chain(&e))
+                });
+            assert!(!rows.is_empty(), "filtered {rank} came back empty");
+        }
+        let hearings = db
+            .classical_hearing_rows(uid, &all)
+            .await
+            .unwrap_or_else(die("classical_hearing_rows"));
+        assert_eq!(hearings.len(), 3);
+        assert!(
+            hearings.iter().all(|h| h.0.is_some() && h.0 == hearings[0].0),
+            "one sitting: {hearings:?}"
+        );
+        let instruments =
+            db.classical_instruments(uid, &all).await.unwrap_or_else(die("classical_instruments"));
+        assert_eq!(instruments, vec![("violin".to_string(), 3)]);
+        let coverage = db
+            .classical_role_coverage(uid, &all)
+            .await
+            .unwrap_or_else(die("classical_role_coverage"));
+        println!("role coverage: {coverage:?}");
+        assert_eq!(coverage.seconds, 900);
+        let stats =
+            db.classical_stat_rows(uid, &filtered).await.unwrap_or_else(die("classical_stat_rows"));
+        assert_eq!(stats.len(), 3);
+        let perf = db
+            .classical_performer_rows(uid, &all)
+            .await
+            .unwrap_or_else(die("classical_performer_rows"));
+        assert!(!perf.is_empty());
+        let timeline =
+            db.classical_timeline(uid, &all).await.unwrap_or_else(die("classical_timeline"));
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].composed_year, Some(1844));
+
+        // ── Scores, lenses, B-Sides ──
+        for flag in [classify::SCORE, classify::AMBIENT, classify::CHRISTMAS, classify::HALLOWEEN] {
+            for by_hours in [false, true] {
+                let rows = db.lens_songs(uid, flag, &all, by_hours, 20).await.unwrap_or_else(|e| {
+                    panic!("lens_songs {flag}: {}", crate::logging::error_chain(&e))
+                });
+                if flag == classify::CHRISTMAS {
+                    assert_eq!(rows.len(), 1, "two covers, one song");
+                    assert_eq!(rows[0].versions, Some(2));
+                }
+            }
+        }
+        let windowed = InsightFilter {
+            after: Some(base as i64),
+            before: Some(base as i64 + 19_000),
+            ..Default::default()
+        };
+        db.lens_songs(uid, classify::CHRISTMAS, &windowed, false, 20)
+            .await
+            .unwrap_or_else(die("lens_songs window"));
+        let versions = db
+            .piece_versions(uid, "w:last-christmas", 20)
+            .await
+            .unwrap_or_else(die("piece_versions"));
+        assert_eq!(versions.len(), 2);
+        let suggestions =
+            db.score_suggestions(uid, 20).await.unwrap_or_else(die("score_suggestions"));
+        assert_eq!(suggestions.len(), 1, "{suggestions:?}");
+        let tl =
+            db.facet_timeline(uid, None, None, 100).await.unwrap_or_else(die("facet_timeline"));
+        println!("facet timeline: {tl:?}");
+        db.facet_timeline(uid, Some(base as i64), Some(base as i64 + 86_400), 100)
+            .await
+            .unwrap_or_else(die("facet_timeline window"));
+        let ts = db
+            .facet_timestamps(uid, classify::CHRISTMAS)
+            .await
+            .unwrap_or_else(die("facet_timestamps"));
+        assert_eq!(ts.len(), 2);
+        let counts = db.facet_counts(uid).await.unwrap_or_else(die("facet_counts"));
+        println!("facet counts: {counts:?}");
+        assert_eq!(counts[0], 3, "classical");
+
+        // ── Top Charts with the split ──
+        let split = classify::CLASSICAL | classify::SCORE | classify::AMBIENT;
+        for kind in ["artists", "albums", "tracks"] {
+            for by_hours in [false, true] {
+                let rows =
+                    db.top_chart(uid, kind, None, 50, by_hours, split).await.unwrap_or_else(|e| {
+                        panic!("top_chart {kind}: {}", crate::logging::error_chain(&e))
+                    });
+                assert!(
+                    rows.iter().all(|r| r.name != "Hilary Hahn" && r.name != "Brian Eno"),
+                    "{kind}"
+                );
+            }
+            db.chart_filtered(
+                uid,
+                kind,
+                Some(0),
+                Some(i64::MAX),
+                50,
+                false,
+                0,
+                classify::CHRISTMAS,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("chart_filtered {kind}: {}", crate::logging::error_chain(&e))
+            });
+        }
+        assert_eq!(db.split_out(uid, None, split).await.unwrap_or_else(die("split_out")), 5);
+        assert_eq!(
+            db.split_out(uid, Some(base as i64 + 10_000), split)
+                .await
+                .unwrap_or_else(die("split_out after")),
+            1
+        );
+        let spread = db
+            .artist_album_plays(uid, "Hilary Hahn")
+            .await
+            .unwrap_or_else(die("artist_album_plays"));
+        assert_eq!(spread.len(), 1);
+
+        // ── Overrides: artist, album, work; set, read, clear ──
+        let n = db
+            .set_facet_override(
+                uid,
+                "artist",
+                "the cinematic orchestra",
+                classify::SCORE,
+                Some(true),
+            )
+            .await
+            .unwrap_or_else(die("set_facet_override artist"));
+        println!("artist override requeued {n}");
+        db.set_facet_override(uid, "album", "kid a\u{1f}radiohead", classify::AMBIENT, Some(false))
+            .await
+            .unwrap_or_else(die("set_facet_override album"));
+        db.set_facet_override(uid, "work", "t:derezzed", classify::SCORE, Some(false))
+            .await
+            .unwrap_or_else(die("set_facet_override work"));
+        // The upsert path.
+        db.set_facet_override(uid, "work", "t:derezzed", classify::SCORE, Some(true))
+            .await
+            .unwrap_or_else(die("set_facet_override again"));
+        let ov = db.facet_overrides(uid).await.unwrap_or_else(die("facet_overrides"));
+        assert_eq!(ov.len(), 3);
+        let on = db
+            .facet_overrides_on(uid, "work", "t:derezzed")
+            .await
+            .unwrap_or_else(die("facet_overrides_on"));
+        assert_eq!(on, vec![(classify::SCORE, true)]);
+        db.set_facet_override(uid, "work", "t:derezzed", classify::SCORE, None)
+            .await
+            .unwrap_or_else(die("clear override"));
+        assert_eq!(db.facet_overrides(uid).await.unwrap_or_else(die("facet_overrides")).len(), 2);
+
+        // ── Dates and anniversaries ──
+        let needing =
+            db.artists_needing_dates(50).await.unwrap_or_else(die("artists_needing_dates"));
+        println!("artists needing dates: {}", needing.len());
+        db.store_artist_dates(
+            MENDELSSOHN,
+            &ArtistDates {
+                name: "Felix Mendelssohn".into(),
+                kind: Some("Person".into()),
+                gender: Some("Male".into()),
+                country: Some("DE".into()),
+                begin: Some("1809-02-03".into()),
+                end: Some("1847-11-04".into()),
+                ended: true,
+            },
+        )
+        .await
+        .unwrap_or_else(die("store_artist_dates"));
+        db.store_artist_dates(
+            "a74b1b7f-71a5-4011-9441-d0b5e4122711",
+            &ArtistDates {
+                name: "Radiohead".into(),
+                kind: Some("Group".into()),
+                begin: Some("1985".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(die("store_artist_dates again"));
+        let dated = db.dated_artists(uid, 1).await.unwrap_or_else(die("dated_artists"));
+        println!(
+            "dated artists: {:?}",
+            dated.iter().map(|d| (&d.name, &d.begin, d.plays)).collect::<Vec<_>>()
+        );
+        // Enrichment fills `release_year`; written straight here.
+        sqlx::query(
+            "UPDATE scrobbles SET release_year = 2000 WHERE user_id = $1 AND album = 'Kid A'",
+        )
+        .bind(uid)
+        .execute(&db.pool)
+        .await
+        .unwrap_or_else(die("release_year"));
+        let albums = db.dated_albums(uid, 1).await.unwrap_or_else(die("dated_albums"));
+        println!("dated albums: {albums:?}");
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].2, 2000);
+        let radiohead = db
+            .artist_dates_for(Some("a74b1b7f-71a5-4011-9441-d0b5e4122711"), "Radiohead")
+            .await
+            .unwrap_or_else(die("artist_dates_for"));
+        assert_eq!(radiohead.map(|r| r.begin), Some(Some("1985".to_string())));
+        db.artist_dates_for(None, "Felix Mendelssohn")
+            .await
+            .unwrap_or_else(die("artist_dates_for by name"));
+        let stats = db
+            .classical_stat_rows(uid, &all)
+            .await
+            .unwrap_or_else(die("classical_stat_rows dated"));
+        assert!(
+            stats.iter().all(|r| r.born.as_deref() == Some("1809-02-03")),
+            "the composer's dates join"
+        );
+
+        // ── A member who leaves takes their overrides ──
+        let member =
+            db.create_user("leaver", None, "x", "member").await.unwrap_or_else(die("create_user"));
+        db.set_facet_override(member, "artist", "radiohead", classify::CLASSICAL, Some(true))
+            .await
+            .unwrap_or_else(die("member override"));
+        assert!(db.delete_user(member).await.unwrap_or_else(die("delete_user")));
+        drop(db);
+    }
+
+    /// The older readers that sum a duration into an integer: the Dashboard,
+    /// Statistics, album and artist pages, sessions, chains, gear and the
+    /// Shelf. On Postgres `SUM(bigint)` is NUMERIC and will not decode into an
+    /// `i64`; `a_listen_survives_a_round_trip_through_postgres` never saw it
+    /// because its one listen has no duration, so every sum was NULL and NULL
+    /// is never type-checked. Every listen here has a length.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn duration_sums_decode_on_postgres() {
+        let url = fresh("sums").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(|e| panic!("Database::new: {}", crate::logging::error_chain(&e)));
+        let uid = db
+            .setup_admin("tester", None, "not-a-real-hash")
+            .await
+            .unwrap_or_else(die("setup_admin"));
+        let chain = insert_chain(&db, uid, "Desk").await;
+        let now = chrono::Utc::now().timestamp();
+        // The app's own writers bind `components` and `overrides` as text,
+        // which a Postgres `json` column refused before v0.132.0.
+        let equipment = insert_returning_id(
+            &db,
+            &format!("INSERT INTO equipment (user_id, name, type) VALUES ({uid}, 'Stylus', 'cartridge') RETURNING id"),
+        )
+        .await;
+        let components: Vec<crate::models::ChainComponent> = serde_json::from_str(&format!(
+            r#"[{{"type":"source","name":"Turntable","detail":null}},
+                {{"type":"transducer","name":"Stylus","detail":null,"equipment_id":{equipment}}}]"#
+        ))
+        .expect("components parse");
+        assert!(db
+            .update_chain(uid, chain, "Desk", None, &components, "unknown", None)
+            .await
+            .unwrap_or_else(die("update_chain")));
+        db.create_variant(uid, chain, "Other stylus", &[])
+            .await
+            .unwrap_or_else(die("create_variant"));
+
+        for (i, title) in ["Xtal", "Tha", "Xtal", "Pulsewidth"].iter().enumerate() {
+            let mut play = crate::models::Play::new(
+                title.to_string(),
+                "Aphex Twin".into(),
+                (now - 3_600 + i as i64 * 300) as u64,
+                format!("pg-sums-{i}"),
+                "test".into(),
+            );
+            play.album = Some("Selected Ambient Works 85-92".into());
+            play.duration = Some(240);
+            db.save_scrobble(
+                uid,
+                &play,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap_or_else(die("save_scrobble"));
+        }
+        sqlx::query(
+            "UPDATE scrobbles SET chain_id = $1, quality_score = 0.75, genres = '[\"ambient\",\"idm\"]'
+              WHERE user_id = $2",
+        )
+            .bind(chain)
+            .bind(uid)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(die("chain and quality"));
+        db.rebuild_sessions(uid, 1800).await.unwrap_or_else(die("rebuild_sessions"));
+        let session: i64 =
+            sqlx::query_scalar("SELECT MAX(session_id) FROM scrobbles WHERE user_id = $1")
+                .bind(uid)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap_or_else(die("session id"));
+        assert!(db.recompute_session(session).await.unwrap_or_else(die("recompute_session")));
+
+        let dash = db
+            .get_dashboard_stats(uid, chrono_tz::Tz::UTC, 1)
+            .await
+            .unwrap_or_else(|e| panic!("get_dashboard_stats: {}", crate::logging::error_chain(&e)));
+        println!("dashboard: {}", serde_json::to_value(&dash).unwrap());
+        for (after, by_hours) in [(None, false), (Some(0), true)] {
+            let ranged = db.get_ranged_stats(uid, after, by_hours).await.unwrap_or_else(|e| {
+                panic!("get_ranged_stats {by_hours}: {}", crate::logging::error_chain(&e))
+            });
+            let v = serde_json::to_value(&ranged).unwrap();
+            println!(
+                "ranged (hours={by_hours}): {}",
+                v.to_string().chars().take(400).collect::<String>()
+            );
+        }
+        let album = db
+            .album_summary(uid, "Aphex Twin", "Selected Ambient Works 85-92")
+            .await
+            .unwrap_or_else(die("album_summary"))
+            .expect("the album has listens");
+        assert_eq!((album.plays, album.seconds), (4, 960));
+        let artist = db
+            .artist_summary(uid, "Aphex Twin")
+            .await
+            .unwrap_or_else(die("artist_summary"))
+            .expect("the artist has listens");
+        assert_eq!((artist.plays, artist.seconds), (4, 960));
+        let genres = db.genre_play_counts(uid, None).await.unwrap_or_else(die("genre_play_counts"));
+        assert_eq!(genres.len(), 2, "{genres:?}");
+        assert_eq!(genres[0].1, 4);
+        db.artists_by_genre(uid).await.unwrap_or_else(die("artists_by_genre"));
+        db.listening_coverage(uid).await.unwrap_or_else(die("listening_coverage"));
+        db.recording_mbid_coverage(uid).await.unwrap_or_else(die("recording_mbid_coverage"));
+
+        // ── Chains, gear and the Shelf ──
+        let chains = db.get_chains(uid).await.unwrap_or_else(die("get_chains"));
+        assert_eq!(chains.len(), 1);
+        assert_eq!(chains[0].components.len(), 2, "components read back through TEXT");
+        assert!(
+            (chains[0].total_hours - 960.0 / 3_600.0).abs() < 1e-9,
+            "{}",
+            chains[0].total_hours
+        );
+        let variants = db.list_variants(uid).await.unwrap_or_else(die("list_variants"));
+        assert_eq!(variants.len(), 1);
+        db.near_duplicate_chains(uid).await.unwrap_or_else(die("near_duplicate_chains"));
+        db.equipment_seconds(uid).await.unwrap_or_else(die("equipment_seconds"));
+        let gear = db.get_equipment(uid).await.unwrap_or_else(die("get_equipment"));
+        assert_eq!(gear.len(), 1);
+
+        // The Shelf's list still sorts with SQLite's `COLLATE NOCASE` — a gap
+        // that is not about sums. That one error is tolerated, and named.
+        fn nocase_gap<T>(what: &str, r: Result<T, sqlx::Error>) -> Option<T> {
+            match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    let m = crate::logging::error_chain(&e);
+                    assert!(m.contains("collation \"nocase\""), "{what}: {m}");
+                    println!("{what}: known gap — {m}");
+                    None
+                }
+            }
+        }
+        let release = db
+            .create_physical(
+                uid,
+                "vinyl",
+                "Aphex Twin",
+                "Selected Ambient Works 85-92",
+                Some(1992),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(die("create_physical"));
+        db.record_physical_play(
+            uid,
+            release,
+            "A",
+            now - 600,
+            1_200,
+            5,
+            Some(equipment),
+            Some(chain),
+        )
+        .await
+        .unwrap_or_else(die("record_physical_play"));
+        nocase_gap("list_physical", db.list_physical(uid, None).await);
+        db.get_physical(uid, release).await.unwrap_or_else(die("get_physical"));
+        let sides = db.side_plays(uid, release).await.unwrap_or_else(die("side_plays"));
+        assert_eq!(sides.len(), 1);
+        let (hours, n) = db
+            .equipment_playback_hours(uid, equipment)
+            .await
+            .unwrap_or_else(die("equipment_playback_hours"));
+        assert_eq!(n, 1);
+        assert!((hours - 1_200.0 / 3_600.0).abs() < 1e-9, "{hours}");
         drop(db);
     }
 }

@@ -106,6 +106,57 @@ impl Database {
             }
         }
 
+        // v0.132.0: the JSON-typed columns become TEXT, as `init()` now makes
+        // them (see `dialect::DDL_PHRASES`). A `json` column refused every
+        // text bind and would not decode into a `String`, so signal chains,
+        // variants and gear could not be written or read on Postgres at all.
+        // The default goes first: Postgres will not carry a `json` default
+        // across a type change by itself.
+        for (table, column, default) in [
+            ("users", "settings", "'{}'"),
+            ("signal_chains", "components", "'[]'"),
+            ("chain_variants", "overrides", "'[]'"),
+        ] {
+            let ty: Option<String> = sqlx::query_scalar(
+                "SELECT data_type::text FROM information_schema.columns
+                  WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_optional(&self.pool)
+            .await?;
+            if ty.as_deref() == Some("json") {
+                info!("⚙️ Migrating: {table}.{column} json → text...");
+                for sql in [
+                    format!("ALTER TABLE {table} ALTER COLUMN {column} DROP DEFAULT"),
+                    format!(
+                        "ALTER TABLE {table} ALTER COLUMN {column} TYPE TEXT USING {column}::text"
+                    ),
+                    format!("ALTER TABLE {table} ALTER COLUMN {column} SET DEFAULT {default}"),
+                ] {
+                    sqlx::query(&sql).execute(&self.pool).await?;
+                }
+            }
+        }
+
+        // v0.132.0: what kind of listen a listen is (Classical, Scores &
+        // Ambient, the seasons). Spelled as `init()` makes them on a fresh
+        // database; `indexes()` runs after this and indexes two of them. The
+        // first PR for it shipped only the SQLite block, and the PR guard's
+        // upgrade check caught the drift.
+        for (column, ty) in [
+            ("facets", "BIGINT NOT NULL DEFAULT 0"),
+            ("facets_version", "BIGINT NOT NULL DEFAULT 0"),
+            ("fact_key", "TEXT"),
+        ] {
+            if !has_column(&self.pool, "scrobbles", column).await? {
+                info!("⚙️ Migrating: scrobbles.{column}...");
+                sqlx::query(&format!("ALTER TABLE scrobbles ADD COLUMN {column} {ty}"))
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+
         Ok(())
     }
 
@@ -1444,6 +1495,24 @@ impl Database {
             let _ = sqlx::query("ALTER TABLE scrobbles ADD COLUMN timestamp_original INTEGER")
                 .execute(&self.pool)
                 .await;
+        }
+
+        // What kind of listen each listen is (v0.132.0). Every existing listen
+        // starts undecided (`facets_version` 0) and the classifier backfill
+        // works through them; until it reaches one, it stays in Top Charts —
+        // the safe default, since nothing leaves without evidence.
+        for (col, ddl) in [
+            ("facets", "ALTER TABLE scrobbles ADD COLUMN facets INTEGER NOT NULL DEFAULT 0"),
+            (
+                "facets_version",
+                "ALTER TABLE scrobbles ADD COLUMN facets_version INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("fact_key", "ALTER TABLE scrobbles ADD COLUMN fact_key TEXT"),
+        ] {
+            if !has_column(&self.pool, "scrobbles", col).await {
+                info!("⚙️ Migrating: adding scrobbles.{col}...");
+                let _ = sqlx::query(ddl).execute(&self.pool).await;
+            }
         }
 
         // The chain an accepted Shared Spool play is filed under. Unset for

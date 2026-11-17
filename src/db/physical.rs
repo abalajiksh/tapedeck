@@ -45,7 +45,7 @@ impl Database {
         sqlx::query_as(&crate::sql!(
             "SELECT r.*,
                     (SELECT COUNT(*) FROM physical_plays p WHERE p.release_id = r.id) AS play_count,
-                    (SELECT COALESCE(SUM(p.duration_secs), 0) FROM physical_plays p
+                    (SELECT CAST(COALESCE(SUM(p.duration_secs), 0) AS BIGINT) FROM physical_plays p
                       WHERE p.release_id = r.id) AS played_secs,
                     (SELECT MAX(p.played_at) FROM physical_plays p WHERE p.release_id = r.id)
                       AS last_played,
@@ -83,7 +83,7 @@ impl Database {
         sqlx::query_as(&crate::sql!(
             "SELECT r.*,
                     (SELECT COUNT(*) FROM physical_plays p WHERE p.release_id = r.id) AS play_count,
-                    (SELECT COALESCE(SUM(p.duration_secs), 0) FROM physical_plays p
+                    (SELECT CAST(COALESCE(SUM(p.duration_secs), 0) AS BIGINT) FROM physical_plays p
                       WHERE p.release_id = r.id) AS played_secs,
                     (SELECT MAX(p.played_at) FROM physical_plays p WHERE p.release_id = r.id)
                       AS last_played,
@@ -784,7 +784,7 @@ impl Database {
         sqlx::query_as(&crate::sql!(
             "SELECT side,
                     COUNT(*) AS plays,
-                    COALESCE(SUM(duration_secs), 0) AS secs,
+                    CAST(COALESCE(SUM(duration_secs), 0) AS BIGINT) AS secs,
                     MAX(played_at) AS last_played
                FROM physical_plays
               WHERE user_id = ? AND release_id = ?
@@ -808,7 +808,7 @@ impl Database {
         equipment_id: i64,
     ) -> Result<(f64, i64), sqlx::Error> {
         let row: (Option<i64>, i64) = sqlx::query_as(&crate::sql!(
-            "SELECT SUM(duration_secs), COUNT(*) FROM physical_plays
+            "SELECT CAST(SUM(duration_secs) AS BIGINT), COUNT(*) FROM physical_plays
               WHERE user_id = ? AND equipment_id = ?"
         ))
         .bind(user_id)
@@ -1613,7 +1613,7 @@ impl Database {
         after: Option<i64>,
     ) -> Result<Vec<(String, i64)>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
-            "SELECT g.value AS name, COUNT(*) AS plays
+            "SELECT MAX(g.value) AS name, COUNT(*) AS plays
                FROM scrobbles s, json_each(s.genres) g
               WHERE s.user_id = ? AND s.skipped = FALSE AND s.genres IS NOT NULL
                 AND (? IS NULL OR s.timestamp >= ?)
@@ -2130,7 +2130,7 @@ impl Database {
                 "SELECT COUNT(*),
                         SUM(CASE WHEN is_lossless = TRUE THEN 1 ELSE 0 END),
                         SUM(CASE WHEN {FIDELITY_KNOWN} THEN 1 ELSE 0 END),
-                        SUM(duration),
+                        CAST(SUM(duration) AS BIGINT),
                         AVG(quality_score)
                    FROM scrobbles WHERE user_id = ? AND skipped = FALSE"
             )))
@@ -2148,8 +2148,8 @@ impl Database {
             sqlx::query_as(&crate::sql!(
                 "SELECT SUM(CASE WHEN timestamp >= ?2 THEN 1 ELSE 0 END),
                     SUM(CASE WHEN timestamp >= ?3 THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN timestamp >= ?2 THEN duration END),
-                    SUM(CASE WHEN timestamp >= ?3 THEN duration END)
+                    CAST(SUM(CASE WHEN timestamp >= ?2 THEN duration END) AS BIGINT),
+                    CAST(SUM(CASE WHEN timestamp >= ?3 THEN duration END) AS BIGINT)
                FROM scrobbles
               WHERE user_id = ?1 AND skipped = FALSE AND timestamp >= ?4"
             ))

@@ -2073,6 +2073,17 @@ export interface ArtistView {
 	bio: BioBlock;
 	stats: StatCard[];
 	albums: AlbumAggregate[];
+	/** Round anniversaries this year, and a birthday that falls today. */
+	anniversaries: string[];
+	/** How their plays split across their records, all time. */
+	album_spread: {
+		name: string;
+		plays: number;
+		album_count: number;
+		albums: { name: string; album_artist: string; plays: number }[];
+		rest_plays: number;
+		no_album: number;
+	};
 	top_tracks: TrackAggregate[];
 	trend: { label: string; value: number }[];
 }
@@ -2093,6 +2104,151 @@ export interface ChartRow {
 	caa_id: number | null;
 	caa_release_mbid: string | null;
 }
+
+/** A row of a Classical, Scores or lens ranking. `key` is what a filter or
+ *  an override passes back. */
+export interface InsightRow {
+	key: string;
+	name: string;
+	sub: string | null;
+	album?: string | null;
+	album_artist?: string | null;
+	plays: number;
+	seconds: number;
+	/** Pieces: recordings heard. Composers and performers: pieces. Lens songs:
+	 *  artists' versions. */
+	versions?: number | null;
+	/** Complete hearings — every movement in one sitting. */
+	hearings?: number | null;
+	/** 1 where a performer's role was inferred, not stated by MusicBrainz. */
+	inferred?: number | null;
+	artwork_url: string | null;
+	caa_id?: number | null;
+	caa_release_mbid?: string | null;
+}
+
+export type ClassicalRank =
+	| 'pieces'
+	| 'movements'
+	| 'composers'
+	| 'performances'
+	| 'conductor'
+	| 'orchestra'
+	| 'ensemble'
+	| 'soloist';
+export type ClassicalMetric = 'hours' | 'plays' | 'hearings';
+
+export interface ClassicalChart {
+	rank: ClassicalRank;
+	metric: ClassicalMetric;
+	rows: InsightRow[];
+	instruments: { name: string; count: number }[];
+	coverage: { seconds: number; stated: number; inferred: number } | null;
+	pending: number;
+}
+
+export interface ScoresChart {
+	section: 'all' | 'score' | 'ambient';
+	kind: ChartKind;
+	rows: ChartRow[];
+	suggestions: InsightRow[];
+	pending: number;
+}
+
+export interface LensSummary {
+	id: string;
+	label: string;
+	in_season: boolean;
+	season: number;
+	starts: string;
+	ends: string;
+	listens: number;
+}
+
+export interface LensList {
+	lenses: LensSummary[];
+	classical: number;
+	score: number;
+	ambient: number;
+	pending: number;
+}
+
+export interface LensDetail {
+	id: string;
+	label: string;
+	season: number;
+	starts: string;
+	ends: string;
+	in_season: boolean;
+	seasons: number[];
+	range: 'season' | 'year' | 'all';
+	rank: 'songs' | 'artists' | 'albums';
+	rows: InsightRow[];
+	plays: number;
+	seconds: number;
+	share_pct: number | null;
+	opened: string | null;
+	curve: { date: string; plays: number; season_plays: number; share: number }[];
+	out_of_season: number;
+	pending: number;
+}
+
+export interface CompositionMonth {
+	month: string;
+	seconds: number;
+	classical: number;
+	score: number;
+	other: number;
+	christmas: number;
+	halloween: number;
+	easter: number;
+}
+
+export interface Share { name: string; seconds: number; plays: number; count: number | null }
+
+export interface ClassicalStats {
+	seconds: number;
+	periods: Share[];
+	dated: number;
+	unplaced: number;
+	forms: Share[];
+	years: {
+		years: number[];
+		composers: { key: string; name: string; plays: number[]; anniversaries: { year: number; label: string }[] }[];
+	};
+	living: { seconds: number; known: number; composers: Share[] };
+	women: { seconds: number; known: number; composers: Share[] };
+	composer_countries: Share[];
+	performer_countries: Share[];
+	range: { key: string; name: string; role: string; composers: number; pieces: number; plays: number }[];
+}
+
+export interface ClassicalTimeline {
+	composers: { key: string; name: string; born: number | null; died: number | null }[];
+	pieces: { key: string; title: string; composer: string; year: number; dated: boolean; plays: number; seconds: number }[];
+	unplaced: number;
+}
+
+export interface Anniversary {
+	kind: 'born' | 'died' | 'formed' | 'split' | 'released';
+	name: string;
+	artist: string | null;
+	date: string;
+	years: number;
+	living: boolean;
+	today: boolean;
+	plays: number;
+	label: string;
+}
+
+export interface Anniversaries {
+	year: number;
+	items: Anniversary[];
+	today: Anniversary[];
+	revisit: Anniversary[];
+}
+
+export type FacetName = 'classical' | 'score' | 'ambient' | 'christmas' | 'halloween' | 'easter' | 'score_suggested';
 
 export type ChartKind = 'artists' | 'albums' | 'tracks';
 export type ChartRange = 'today' | 'd7' | 'month' | 'year' | 'all';
@@ -4207,8 +4363,92 @@ class TapedeckAPI {
 	}
 
 	// ── Charts ──
-	async getChart(kind: ChartKind, range: ChartRange, limit = 100, metric: 'plays' | 'hours' = 'plays'): Promise<{ kind: ChartKind; range: string; rows: ChartRow[] }> {
+	async getChart(kind: ChartKind, range: ChartRange, limit = 100, metric: 'plays' | 'hours' = 'plays'): Promise<{ kind: ChartKind; range: string; rows: ChartRow[]; split_out: number }> {
 		return this.get(`/api/v1/charts?kind=${kind}&range=${range}&limit=${limit}&metric=${metric}`);
+	}
+
+	// ── Classical, Scores & Ambient, the seasonal lenses ──
+
+	async getClassical(p: {
+		rank: ClassicalRank;
+		range: ChartRange;
+		metric: ClassicalMetric;
+		composer?: string | null;
+		piece?: string | null;
+		performer?: string | null;
+		instrument?: string | null;
+		limit?: number;
+	}): Promise<ClassicalChart> {
+		const q = new URLSearchParams({ rank: p.rank, range: p.range, metric: p.metric, limit: String(p.limit ?? 100) });
+		if (p.composer) q.set('composer', p.composer);
+		if (p.piece) q.set('piece', p.piece);
+		if (p.performer) q.set('performer', p.performer);
+		if (p.instrument) q.set('instrument', p.instrument);
+		return this.get(`/api/v1/insights/classical?${q}`);
+	}
+
+	async getScores(section: 'all' | 'score' | 'ambient', kind: ChartKind, range: ChartRange, metric: 'plays' | 'hours'): Promise<ScoresChart> {
+		return this.get(`/api/v1/insights/scores?section=${section}&kind=${kind}&range=${range}&metric=${metric}`);
+	}
+
+	async getLenses(): Promise<LensList> {
+		return this.get('/api/v1/insights/lenses');
+	}
+
+	async getLens(id: string, p: { season?: number | null; range?: string; rank?: string; metric?: string } = {}): Promise<LensDetail> {
+		const q = new URLSearchParams();
+		if (p.season) q.set('season', String(p.season));
+		if (p.range) q.set('range', p.range);
+		if (p.rank) q.set('rank', p.rank);
+		if (p.metric) q.set('metric', p.metric);
+		return this.get(`/api/v1/insights/lenses/${encodeURIComponent(id)}?${q}`);
+	}
+
+	async getVersions(piece: string): Promise<{ rows: InsightRow[] }> {
+		return this.get(`/api/v1/insights/versions?piece=${encodeURIComponent(piece)}`);
+	}
+
+	/** Where a season's share card is drawn, for `ShareChapter`. */
+	lensImageEndpoint(id: string, season: number): string {
+		return `${BASE}/api/v1/insights/lenses/${encodeURIComponent(id)}/image?season=${season}`;
+	}
+
+	async getLensMixdown(id: string, season: number, theme: 'dark' | 'light'): Promise<ReportMixdown> {
+		return this.get(`/api/v1/insights/lenses/${encodeURIComponent(id)}/mixdown?season=${season}&theme=${theme}`);
+	}
+
+	async startLensMixdownVideo(id: string, season: number, theme: 'dark' | 'light'): Promise<MixdownVideo> {
+		return this.post(`/api/v1/insights/lenses/${encodeURIComponent(id)}/mixdown/video?season=${season}&theme=${theme}`);
+	}
+
+	async saveLensPlaylist(id: string, season: number): Promise<{ id: number; created: boolean; tracks: number }> {
+		return this.post(`/api/v1/insights/lenses/${encodeURIComponent(id)}/playlist?season=${season}`);
+	}
+
+	async getClassicalStats(range: ChartRange): Promise<ClassicalStats> {
+		return this.get(`/api/v1/insights/classical/stats?range=${range}`);
+	}
+
+	async getClassicalTimeline(range: ChartRange): Promise<ClassicalTimeline> {
+		return this.get(`/api/v1/insights/classical/timeline?range=${range}`);
+	}
+
+	async getAnniversaries(year?: number): Promise<Anniversaries> {
+		return this.get(`/api/v1/insights/anniversaries${year ? `?year=${year}` : ''}`);
+	}
+
+	async getComposition(range: 'year' | 'all'): Promise<{ months: CompositionMonth[]; capped: boolean; pending: number }> {
+		return this.get(`/api/v1/insights/composition?range=${range}`);
+	}
+
+	/** Correct what kind of listen something is. `value: null` removes your
+	 *  correction and goes back to what Tapedeck decided. */
+	async getFacetOverrides(target_kind: 'work' | 'album' | 'artist', target_key: string): Promise<{ overrides: { facet: FacetName; value: boolean }[] }> {
+		return this.get(`/api/v1/insights/overrides?target_kind=${target_kind}&target_key=${encodeURIComponent(target_key)}`);
+	}
+
+	async setFacetOverride(target_kind: 'work' | 'album' | 'artist', target_key: string, facet: FacetName, value: boolean | null): Promise<{ listens: number }> {
+		return this.post('/api/v1/insights/overrides', { target_kind, target_key, facet, value });
 	}
 
 	/** Fetch loved tracks from every connected service. */

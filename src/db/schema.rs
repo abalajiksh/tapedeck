@@ -118,6 +118,19 @@ impl Database {
                  ON scrobbles(joint_session_id) WHERE joint_session_id IS NOT NULL"
         );
 
+        // Re-applying one decision to the listens it decided — an override,
+        // or a fact that changed — is a point lookup by `fact_key`.
+        speed!(
+            "CREATE INDEX IF NOT EXISTS idx_scrobbles_fact_key
+                 ON scrobbles(fact_key) WHERE fact_key IS NOT NULL"
+        );
+        // The classifier's work list: listens decided by an older version.
+        // Once a history is caught up the list is empty, and this makes
+        // finding that out a seek rather than a whole-table scan per pass.
+        speed!(
+            "CREATE INDEX IF NOT EXISTS idx_scrobbles_facets_version ON scrobbles(facets_version)"
+        );
+
         // The album page's "whole record" button: 400,247 VDBE steps to 37.
         // The `WHERE` is load-bearing rather than a size trim — without it the
         // planner takes this index for the top-artist and top-album
@@ -564,6 +577,22 @@ impl Database {
                 -- 8pm. `note_revisions` is the precedent — an edit here never
                 -- destroys the observation it replaces.
                 timestamp_original INTEGER,
+                -- What kind of listen this is, as `classify` decided it, with
+                -- this listener's own overrides applied: a bitmask of
+                -- `classify::{CLASSICAL, SCORE, AMBIENT, CHRISTMAS, HALLOWEEN,
+                -- EASTER, SCORE_SUGGESTED}`. Classical and score/ambient leave
+                -- Top Charts (per listener); the seasons only add a view.
+                -- **Denormalised on purpose**: Top Charts filters on it on every
+                -- request, and a join to `recording_facts` there would put a
+                -- second table in the hottest aggregation in the application.
+                facets INTEGER NOT NULL DEFAULT 0,
+                -- The `classify::VERSION` that decided `facets`; 0 = not yet.
+                -- A rule change bumps the version and the backfill decides
+                -- again from cached facts, without a single lookup.
+                facets_version INTEGER NOT NULL DEFAULT 0,
+                -- Which `recording_facts` row decided it: `r:<recording>|<release>`
+                -- for a listen MusicBrainz knows, `n:` plus its names otherwise.
+                fact_key TEXT,
                 UNIQUE(user_id, source_id, source_name)
             )",
         )
@@ -1342,6 +1371,7 @@ impl Database {
         self.init_crate().await?;
         self.init_radio().await?;
         self.init_artist_pictures().await?;
+        self.init_facets().await?;
 
         Ok(())
     }
@@ -1678,6 +1708,103 @@ impl Database {
     /// that has to survive the request that made it: nobody has looked at it
     /// yet, and the whole point of storing it is that somebody does before it
     /// reaches the household's Plex.
+    /// Classical, Scores & Ambient, and the seasonal lenses (v0.132.0).
+    ///
+    /// `recording_facts` is one decision per *recording as heard on a release*
+    /// — shared between listeners, because what MusicBrainz says about a
+    /// recording is the same for everyone. What a listener changes by hand is
+    /// theirs alone, in `facet_overrides`, and is applied on top when the
+    /// decision is copied onto their listens (`scrobbles.facets`).
+    async fn init_facets(&self) -> Result<(), sqlx::Error> {
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS recording_facts (
+                fact_key TEXT PRIMARY KEY,
+                version INTEGER NOT NULL,
+                facets INTEGER NOT NULL DEFAULT 0,
+                -- Groups performances of one piece and covers of one song:
+                -- `w:<work mbid>`, or `t:` and a key built from the title.
+                piece_key TEXT NOT NULL,
+                piece_title TEXT NOT NULL,
+                movement TEXT,
+                composer_name TEXT,
+                composer_mbid TEXT,
+                -- The movement's own work, for counting complete hearings.
+                leaf_key TEXT,
+                part_count INTEGER,
+                -- When the piece was composed (MusicBrainz's composer
+                -- relationship), and its form: Symphony, Concerto, Opera…
+                composed_year INTEGER,
+                form TEXT,
+                -- JSON array of short reasons, shown on hover.
+                evidence TEXT NOT NULL DEFAULT '[]',
+                updated_at INTEGER NOT NULL
+            )",
+        )
+        .await?;
+        // Who played a classical recording, by role. `inferred` = 1 where
+        // nobody said so and Tapedeck guessed — from the performer's role on
+        // other recordings MusicBrainz *does* describe, or from a name like
+        // "… Philharmonic". The Classical tab marks those.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS recording_performers (
+                fact_key TEXT NOT NULL,
+                artist_key TEXT NOT NULL,
+                name TEXT NOT NULL,
+                mbid TEXT,
+                role TEXT NOT NULL,
+                instrument TEXT,
+                -- ISO 3166-1, as MusicBrainz has it.
+                country TEXT,
+                inferred INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (fact_key, artist_key, role)
+            )",
+        )
+        .await?;
+        // A listener's own corrections: "this is Christmas", "this album is
+        // score", "not classical". `target_kind` is `work` (key: a
+        // `piece_key`, so marking one cover marks every version) or `album`
+        // (key: the album's folded name and who it is filed under, joined by
+        // U+001F). `value` 1 sets the flag, 0 clears it.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS facet_overrides (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                target_kind TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                facet INTEGER NOT NULL,
+                value INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                UNIQUE (user_id, target_kind, target_key, facet)
+            )",
+        )
+        .await?;
+        self.ddl(
+            "CREATE INDEX IF NOT EXISTS idx_recording_facts_piece ON recording_facts(piece_key)",
+        )
+        .await?;
+        // An artist's dates, by MBID: a person's birth and death, a group's
+        // formation and break-up — for anniversaries, and for the period,
+        // living, women and country charts of composers outside the canon.
+        // Shared, like `recording_facts`: what MusicBrainz says about an
+        // artist is the same for everyone. `begin`/`end_date` are
+        // `YYYY[-MM[-DD]]`.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS artist_dates (
+                mbid TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                kind TEXT,
+                gender TEXT,
+                country TEXT,
+                begin TEXT,
+                end_date TEXT,
+                ended INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )",
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn init_saved_playlists(&self) -> Result<(), sqlx::Error> {
         self.ddl(
             "CREATE TABLE IF NOT EXISTS playlists (

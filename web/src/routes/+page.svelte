@@ -1,4 +1,5 @@
 <script lang="ts">
+	import Anniversaries from '$lib/components/Anniversaries.svelte';
 	import { onMount } from 'svelte';
 	import { api } from '$lib/api';
 	import type { Scrobble } from '$lib/api';
@@ -286,6 +287,8 @@
 			</span>
 		</a>
 	</div>
+
+	<Anniversaries mode="card" />
 
 	<!-- Recent -->
 	<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">

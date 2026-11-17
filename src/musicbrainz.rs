@@ -717,6 +717,18 @@ impl MusicBrainzClient {
                 info TEXT NOT NULL,
                 fetched_at INTEGER NOT NULL
             );
+
+            -- What the classifier knows about a recording, a work, a release
+            -- or a release group (`classify::RecordingFacts` and friends), as
+            -- JSON. `kind` is `recording`, `work`, `release` or `group`. An
+            -- empty answer is a real one and is kept, like the caches above.
+            CREATE TABLE IF NOT EXISTS mb_facts_cache (
+                kind TEXT NOT NULL,
+                mbid TEXT NOT NULL,
+                body TEXT NOT NULL,
+                fetched_at INTEGER NOT NULL,
+                PRIMARY KEY (kind, mbid)
+            );
             "#,
         )
         .await?;
@@ -1668,5 +1680,798 @@ mod credit_parse_tests {
         // Canonical names: she is credited as "Elizabeth Gillies" here.
         assert_eq!(names, ["Liz Gillies", "Ariana Grande"]);
         assert_eq!(c.artists[0].credited_as, "Elizabeth Gillies");
+    }
+}
+
+// ── Classifier facts ──
+//
+// What `classify` needs about a recording, the work a piece is filed under,
+// the release a listen came from and its release group. Each is cached in
+// `mb_facts_cache` by MBID, answered by the mirror when one is configured, and
+// only then by the API — and the caller says whether the API may be asked at
+// all, because a page or an override re-applying a decision must never wait
+// on a rate-limited service.
+
+/// Where a fact came from, which is what the backfill's budget counts.
+#[derive(Debug)]
+pub enum Fetched<T> {
+    /// The cache or the mirror: free.
+    Known(T),
+    /// An API request was made.
+    Asked(T),
+    /// Not cached, no mirror, and the caller did not allow a request.
+    Unasked,
+}
+
+impl<T> Fetched<T> {
+    pub fn into_value(self) -> Option<T> {
+        match self {
+            Fetched::Known(v) | Fetched::Asked(v) => Some(v),
+            Fetched::Unasked => None,
+        }
+    }
+    pub fn asked(&self) -> bool {
+        matches!(self, Fetched::Asked(_))
+    }
+}
+
+use crate::classify::{
+    ArtistDates, GroupFacts, ParentWork, Performer, RecordingFacts, ReleaseFacts, WorkFacts,
+    WorkRef,
+};
+
+/// Relationship attributes that are not an instrument or a voice.
+const NOT_AN_INSTRUMENT: &[&str] = &[
+    "solo",
+    "guest",
+    "additional",
+    "co",
+    "minor",
+    "assistant",
+    "executive",
+    "associate",
+    "live",
+    "task",
+];
+
+fn tag_list(v: &serde_json::Value) -> Vec<(String, i64)> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| {
+            Some((t["name"].as_str()?.to_lowercase(), t["count"].as_i64().unwrap_or(0)))
+        })
+        .collect()
+}
+
+fn artists_with(rels: &serde_json::Value, rel_type: &str) -> Vec<(String, String)> {
+    rels.as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| r["target-type"] == "artist" && r["type"] == rel_type)
+        .filter_map(|r| {
+            Some((
+                r["artist"]["name"].as_str()?.to_string(),
+                r["artist"]["id"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// A recording lookup with `artist-rels+work-rels+work-level-rels+tags+genres`.
+pub fn parse_recording_facts(v: &serde_json::Value) -> RecordingFacts {
+    let mut facts = RecordingFacts {
+        title: v["title"].as_str().unwrap_or("").to_string(),
+        tags: tag_list(&v["tags"]),
+        ..Default::default()
+    };
+    for (name, count) in tag_list(&v["genres"]) {
+        if !facts.tags.iter().any(|(t, _)| *t == name) {
+            facts.tags.push((name, count));
+        }
+    }
+    for rel in v["relations"].as_array().into_iter().flatten() {
+        match rel["target-type"].as_str() {
+            Some("artist") => {
+                let kind = rel["type"].as_str().unwrap_or("");
+                if !matches!(
+                    kind,
+                    "conductor" | "performing orchestra" | "instrument" | "vocal" | "performer"
+                ) {
+                    continue;
+                }
+                let a = &rel["artist"];
+                let attribute = rel["attributes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|x| x.as_str())
+                    .find(|x| !NOT_AN_INSTRUMENT.contains(x))
+                    .map(str::to_string);
+                facts.performers.push(Performer {
+                    name: a["name"].as_str().unwrap_or("").to_string(),
+                    mbid: a["id"].as_str().unwrap_or("").to_string(),
+                    rel: kind.to_string(),
+                    attribute,
+                    artist_type: a["type"].as_str().map(str::to_string),
+                    country: a["country"].as_str().map(str::to_string),
+                });
+            }
+            Some("work") if rel["type"] == "performance" => {
+                let w = &rel["work"];
+                let mut languages: Vec<String> = w["languages"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|l| l.as_str().map(str::to_string))
+                    .collect();
+                if languages.is_empty() {
+                    if let Some(l) = w["language"].as_str() {
+                        languages.push(l.to_string());
+                    }
+                }
+                let rels = &w["relations"];
+                let parent = rels.as_array().into_iter().flatten().find_map(|r| {
+                    (r["target-type"] == "work"
+                        && r["type"] == "parts"
+                        && r["direction"] == "backward")
+                        .then(|| ParentWork {
+                            mbid: r["work"]["id"].as_str().unwrap_or("").to_string(),
+                            title: r["work"]["title"].as_str().unwrap_or("").to_string(),
+                            work_type: r["work"]["type"].as_str().map(str::to_string),
+                        })
+                        .filter(|p| !p.mbid.is_empty())
+                });
+                facts.works.push(WorkRef {
+                    mbid: w["id"].as_str().unwrap_or("").to_string(),
+                    title: w["title"].as_str().unwrap_or("").to_string(),
+                    work_type: w["type"].as_str().map(str::to_string),
+                    languages,
+                    composers: artists_with(rels, "composer"),
+                    lyricist: !artists_with(rels, "lyricist").is_empty(),
+                    parent,
+                });
+            }
+            _ => {}
+        }
+    }
+    facts
+}
+
+/// A work lookup with `tags+genres+work-rels+artist-rels`.
+pub fn parse_work_facts(v: &serde_json::Value) -> WorkFacts {
+    let rels = &v["relations"];
+    let mut tags = tag_list(&v["tags"]);
+    for (name, count) in tag_list(&v["genres"]) {
+        if !tags.iter().any(|(t, _)| *t == name) {
+            tags.push((name, count));
+        }
+    }
+    WorkFacts {
+        mbid: v["id"].as_str().unwrap_or("").to_string(),
+        title: v["title"].as_str().unwrap_or("").to_string(),
+        work_type: v["type"].as_str().map(str::to_string),
+        tags,
+        part_count: rels
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| {
+                r["target-type"] == "work" && r["type"] == "parts" && r["direction"] == "forward"
+            })
+            .count() as i64,
+        composers: artists_with(rels, "composer"),
+        // The composer relationship's dates are the composition's: `begin`
+        // when it was started, `end` when it was finished. The finish is the
+        // year a piece is usually given.
+        composed: rels
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| r["target-type"] == "artist" && r["type"] == "composer")
+            .find_map(|r| {
+                r["end"].as_str().or_else(|| r["begin"].as_str()).and_then(crate::classify::year_of)
+            }),
+    }
+}
+
+/// An artist lookup (no `inc`): type, gender, country and life span.
+pub fn parse_artist_dates(v: &serde_json::Value) -> ArtistDates {
+    let span = &v["life-span"];
+    ArtistDates {
+        name: v["name"].as_str().unwrap_or("").to_string(),
+        kind: v["type"].as_str().map(str::to_string),
+        gender: v["gender"].as_str().map(str::to_lowercase),
+        country: v["country"].as_str().map(str::to_string),
+        begin: span["begin"].as_str().map(str::to_string),
+        end: span["end"].as_str().map(str::to_string),
+        ended: span["ended"].as_bool().unwrap_or(false),
+    }
+}
+
+/// A release lookup with `release-groups+recordings+artist-credits`.
+pub fn parse_release_facts(v: &serde_json::Value) -> ReleaseFacts {
+    let ids = |credit: &serde_json::Value| -> Vec<String> {
+        credit
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c["artist"]["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let own = ids(&v["artist-credit"]);
+    let (mut tracks, mut sole) = (0i64, 0i64);
+    for medium in v["media"].as_array().into_iter().flatten() {
+        for t in medium["tracks"].as_array().into_iter().flatten() {
+            tracks += 1;
+            let credit = ids(&t["recording"]["artist-credit"]);
+            if !credit.is_empty() && credit.iter().all(|a| own.contains(a)) {
+                sole += 1;
+            }
+        }
+    }
+    let rg = &v["release-group"];
+    ReleaseFacts {
+        title: v["title"].as_str().unwrap_or("").to_string(),
+        group_mbid: rg["id"].as_str().map(str::to_string),
+        group_title: rg["title"].as_str().unwrap_or("").to_string(),
+        primary_type: rg["primary-type"].as_str().map(str::to_string),
+        secondary_types: rg["secondary-types"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.as_str().map(str::to_string))
+            .collect(),
+        artist_mbids: own,
+        track_count: tracks,
+        sole_tracks: sole,
+    }
+}
+
+/// A release-group lookup with `tags+genres`.
+pub fn parse_group_facts(v: &serde_json::Value) -> GroupFacts {
+    GroupFacts { genres: tag_list(&v["genres"]), tags: tag_list(&v["tags"]) }
+}
+
+impl MusicBrainzClient {
+    async fn facts_cached<T: serde::de::DeserializeOwned>(
+        &self,
+        kind: &str,
+        mbid: &str,
+    ) -> Option<T> {
+        let row: Option<(String,)> = sqlx::query_as(&crate::sql!(
+            "SELECT body FROM mb_facts_cache WHERE kind = ? AND mbid = ?",
+        ))
+        .bind(kind)
+        .bind(mbid)
+        .fetch_optional(&self.sqlite_pool)
+        .await
+        .ok()
+        .flatten();
+        row.and_then(|(b,)| serde_json::from_str(&b).ok())
+    }
+
+    async fn facts_store<T: Serialize>(&self, kind: &str, mbid: &str, value: &T) {
+        let _ = sqlx::query(&crate::sql!(
+            "INSERT INTO mb_facts_cache (kind, mbid, body, fetched_at) VALUES (?, ?, ?, ?)
+             ON CONFLICT (kind, mbid) DO UPDATE SET body = excluded.body, fetched_at = excluded.fetched_at",
+        ))
+        .bind(kind)
+        .bind(mbid)
+        .bind(serde_json::to_string(value).unwrap_or_else(|_| "{}".into()))
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&self.sqlite_pool)
+        .await;
+    }
+
+    /// One API lookup, parsed. A 404 is an answer — the empty value — so a
+    /// recording MusicBrainz has merged away is not asked about forever.
+    async fn facts_api<T: Default>(
+        &self,
+        path: &str,
+        parse: fn(&serde_json::Value) -> T,
+    ) -> Result<T> {
+        let url = format!("{}/{}", self.config.api_base_url.trim_end_matches('/'), path);
+        let resp = self.api_get(&url).await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(T::default());
+        }
+        if !resp.status().is_success() {
+            return Err(anyhow!("MusicBrainz API error: {}", resp.status()));
+        }
+        Ok(parse(&resp.json::<serde_json::Value>().await?))
+    }
+
+    pub async fn recording_facts(
+        &self,
+        mbid: &str,
+        allow_api: bool,
+    ) -> Result<Fetched<RecordingFacts>> {
+        if let Some(v) = self.facts_cached("recording", mbid).await {
+            return Ok(Fetched::Known(v));
+        }
+        if let Some(pool) = &self.postgres_pool {
+            if let Ok(v) = mirror_recording_facts(pool, mbid).await {
+                self.facts_store("recording", mbid, &v).await;
+                return Ok(Fetched::Known(v));
+            }
+        }
+        if !allow_api {
+            return Ok(Fetched::Unasked);
+        }
+        let v = self
+            .facts_api(
+                &format!("recording/{mbid}?inc=artist-credits+artist-rels+work-rels+work-level-rels+tags+genres&fmt=json"),
+                parse_recording_facts,
+            )
+            .await?;
+        self.facts_store("recording", mbid, &v).await;
+        Ok(Fetched::Asked(v))
+    }
+
+    pub async fn work_facts(&self, mbid: &str, allow_api: bool) -> Result<Fetched<WorkFacts>> {
+        if let Some(v) = self.facts_cached("work", mbid).await {
+            return Ok(Fetched::Known(v));
+        }
+        if let Some(pool) = &self.postgres_pool {
+            if let Ok(v) = mirror_work_facts(pool, mbid).await {
+                self.facts_store("work", mbid, &v).await;
+                return Ok(Fetched::Known(v));
+            }
+        }
+        if !allow_api {
+            return Ok(Fetched::Unasked);
+        }
+        let v = self
+            .facts_api(
+                &format!("work/{mbid}?inc=tags+genres+work-rels+artist-rels&fmt=json"),
+                parse_work_facts,
+            )
+            .await?;
+        self.facts_store("work", mbid, &v).await;
+        Ok(Fetched::Asked(v))
+    }
+
+    pub async fn release_facts(
+        &self,
+        mbid: &str,
+        allow_api: bool,
+    ) -> Result<Fetched<ReleaseFacts>> {
+        if let Some(v) = self.facts_cached("release", mbid).await {
+            return Ok(Fetched::Known(v));
+        }
+        if let Some(pool) = &self.postgres_pool {
+            if let Ok(v) = mirror_release_facts(pool, mbid).await {
+                self.facts_store("release", mbid, &v).await;
+                return Ok(Fetched::Known(v));
+            }
+        }
+        if !allow_api {
+            return Ok(Fetched::Unasked);
+        }
+        let v = self
+            .facts_api(
+                &format!("release/{mbid}?inc=release-groups+recordings+artist-credits&fmt=json"),
+                parse_release_facts,
+            )
+            .await?;
+        self.facts_store("release", mbid, &v).await;
+        Ok(Fetched::Asked(v))
+    }
+
+    pub async fn artist_dates(&self, mbid: &str, allow_api: bool) -> Result<Fetched<ArtistDates>> {
+        if let Some(v) = self.facts_cached("artist", mbid).await {
+            return Ok(Fetched::Known(v));
+        }
+        if let Some(pool) = &self.postgres_pool {
+            if let Ok(v) = mirror_artist_dates(pool, mbid).await {
+                self.facts_store("artist", mbid, &v).await;
+                return Ok(Fetched::Known(v));
+            }
+        }
+        if !allow_api {
+            return Ok(Fetched::Unasked);
+        }
+        let v = self.facts_api(&format!("artist/{mbid}?fmt=json"), parse_artist_dates).await?;
+        self.facts_store("artist", mbid, &v).await;
+        Ok(Fetched::Asked(v))
+    }
+
+    pub async fn group_facts(&self, mbid: &str, allow_api: bool) -> Result<Fetched<GroupFacts>> {
+        if let Some(v) = self.facts_cached("group", mbid).await {
+            return Ok(Fetched::Known(v));
+        }
+        if let Some(pool) = &self.postgres_pool {
+            if let Ok(v) = mirror_group_facts(pool, mbid).await {
+                self.facts_store("group", mbid, &v).await;
+                return Ok(Fetched::Known(v));
+            }
+        }
+        if !allow_api {
+            return Ok(Fetched::Unasked);
+        }
+        let v = self
+            .facts_api(&format!("release-group/{mbid}?inc=tags+genres&fmt=json"), parse_group_facts)
+            .await?;
+        self.facts_store("group", mbid, &v).await;
+        Ok(Fetched::Asked(v))
+    }
+}
+
+// The mirror's answers to the same four questions. Plain SQL against the
+// MusicBrainz schema (`search_path` names it), `$1` placeholders because this
+// pool is always Postgres. Link types by name rather than id, so a schema
+// renumbering cannot silently change what is asked.
+
+fn split_pairs(s: &str) -> Vec<(String, String)> {
+    s.lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect()
+}
+
+fn split_tags(s: &str) -> Vec<(String, i64)> {
+    split_pairs(s).into_iter().map(|(n, c)| (n, c.parse().unwrap_or(0))).collect()
+}
+
+async fn mirror_recording_facts(pool: &Pool<Postgres>, mbid: &str) -> Result<RecordingFacts> {
+    let title: Option<(String,)> =
+        sqlx::query_as(&crate::sql!("SELECT name FROM recording WHERE gid = $1::uuid"))
+            .bind(mbid)
+            .fetch_optional(pool)
+            .await?;
+    let Some((title,)) = title else { return Ok(RecordingFacts::default()) };
+
+    #[allow(clippy::type_complexity)]
+    let performers: Vec<(String, String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(&crate::sql!(
+        "SELECT a.name, a.gid::text, lt.name,
+                (SELECT string_agg(lat.name, E'\\n') FROM link_attribute la
+                   JOIN link_attribute_type lat ON lat.id = la.attribute_type WHERE la.link = l.id),
+                at.name,
+                (SELECT i.code FROM iso_3166_1 i WHERE i.area = a.area LIMIT 1)
+           FROM recording r
+           JOIN l_artist_recording lar ON lar.entity1 = r.id
+           JOIN link l ON l.id = lar.link
+           JOIN link_type lt ON lt.id = l.link_type
+           JOIN artist a ON a.id = lar.entity0
+           LEFT JOIN artist_type at ON at.id = a.type
+          WHERE r.gid = $1::uuid
+            AND lt.name IN ('conductor', 'performing orchestra', 'instrument', 'vocal', 'performer')"
+    ))
+    .bind(mbid)
+    .fetch_all(pool)
+    .await?;
+
+    #[allow(clippy::type_complexity)]
+    let works: Vec<(
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        bool,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(&crate::sql!(
+        "SELECT w.gid::text, w.name, wt.name,
+                    COALESCE((SELECT string_agg(lg.iso_code_3, ',') FROM work_language wl
+                               JOIN language lg ON lg.id = wl.language WHERE wl.work = w.id), ''),
+                    COALESCE((SELECT string_agg(a.name || E'\\t' || a.gid::text, E'\\n')
+                                FROM l_artist_work law JOIN link l ON l.id = law.link
+                                JOIN link_type lt ON lt.id = l.link_type AND lt.name = 'composer'
+                                JOIN artist a ON a.id = law.entity0 WHERE law.entity1 = w.id), ''),
+                    EXISTS (SELECT 1 FROM l_artist_work law JOIN link l ON l.id = law.link
+                              JOIN link_type lt ON lt.id = l.link_type AND lt.name = 'lyricist'
+                             WHERE law.entity1 = w.id),
+                    p.gid::text, p.name, pt.name
+               FROM recording r
+               JOIN l_recording_work lrw ON lrw.entity0 = r.id
+               JOIN link lk ON lk.id = lrw.link
+               JOIN link_type lkt ON lkt.id = lk.link_type AND lkt.name = 'performance'
+               JOIN work w ON w.id = lrw.entity1
+               LEFT JOIN work_type wt ON wt.id = w.type
+               LEFT JOIN LATERAL (
+                    SELECT pw.gid, pw.name, pw.type FROM l_work_work lww
+                      JOIN link l2 ON l2.id = lww.link
+                      JOIN link_type lt2 ON lt2.id = l2.link_type AND lt2.name = 'parts'
+                      JOIN work pw ON pw.id = lww.entity0
+                     WHERE lww.entity1 = w.id LIMIT 1) p ON TRUE
+               LEFT JOIN work_type pt ON pt.id = p.type
+              WHERE r.gid = $1::uuid"
+    ))
+    .bind(mbid)
+    .fetch_all(pool)
+    .await?;
+
+    let tags: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(
+        "SELECT t.name, rt.count::bigint FROM recording_tag rt
+           JOIN tag t ON t.id = rt.tag JOIN recording r ON r.id = rt.recording
+          WHERE r.gid = $1::uuid AND rt.count > 0"
+    ))
+    .bind(mbid)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(RecordingFacts {
+        title,
+        performers: performers
+            .into_iter()
+            .map(|(name, mbid, rel, attrs, artist_type, country)| Performer {
+                name,
+                mbid,
+                rel,
+                attribute: attrs.and_then(|a| {
+                    a.lines().find(|x| !NOT_AN_INSTRUMENT.contains(x)).map(str::to_string)
+                }),
+                artist_type,
+                country,
+            })
+            .collect(),
+        works: works
+            .into_iter()
+            .map(|(mbid, title, work_type, langs, composers, lyricist, pg, pn, pt)| WorkRef {
+                mbid,
+                title,
+                work_type,
+                languages: langs.split(',').filter(|l| !l.is_empty()).map(str::to_string).collect(),
+                composers: split_pairs(&composers),
+                lyricist,
+                parent: match (pg, pn) {
+                    (Some(mbid), Some(title)) => Some(ParentWork { mbid, title, work_type: pt }),
+                    _ => None,
+                },
+            })
+            .collect(),
+        tags,
+    })
+}
+
+async fn mirror_work_facts(pool: &Pool<Postgres>, mbid: &str) -> Result<WorkFacts> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, Option<String>, i64, String, String, Option<i32>)> = sqlx::query_as(&crate::sql!(
+        "SELECT w.name, wt.name,
+                (SELECT count(*) FROM l_work_work lww JOIN link l ON l.id = lww.link
+                   JOIN link_type lt ON lt.id = l.link_type AND lt.name = 'parts'
+                  WHERE lww.entity0 = w.id),
+                COALESCE((SELECT string_agg(t.name || E'\\t' || x.count, E'\\n') FROM work_tag x
+                            JOIN tag t ON t.id = x.tag WHERE x.work = w.id AND x.count > 0), ''),
+                COALESCE((SELECT string_agg(a.name || E'\\t' || a.gid::text, E'\\n')
+                            FROM l_artist_work law JOIN link l ON l.id = law.link
+                            JOIN link_type lt ON lt.id = l.link_type AND lt.name = 'composer'
+                            JOIN artist a ON a.id = law.entity0 WHERE law.entity1 = w.id), ''),
+                (SELECT COALESCE(l.end_date_year, l.begin_date_year)::int
+                   FROM l_artist_work law JOIN link l ON l.id = law.link
+                   JOIN link_type lt ON lt.id = l.link_type AND lt.name = 'composer'
+                  WHERE law.entity1 = w.id AND COALESCE(l.end_date_year, l.begin_date_year) IS NOT NULL
+                  LIMIT 1)
+           FROM work w LEFT JOIN work_type wt ON wt.id = w.type
+          WHERE w.gid = $1::uuid"
+    ))
+    .bind(mbid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some((title, work_type, parts, tags, composers, composed)) => WorkFacts {
+            mbid: mbid.to_string(),
+            title,
+            work_type,
+            tags: split_tags(&tags),
+            part_count: parts,
+            composers: split_pairs(&composers),
+            composed,
+        },
+        None => WorkFacts::default(),
+    })
+}
+
+async fn mirror_artist_dates(pool: &Pool<Postgres>, mbid: &str) -> Result<ArtistDates> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        bool,
+    )> = sqlx::query_as(&crate::sql!(
+        "SELECT a.name, at.name, lower(g.name),
+                    (SELECT i.code FROM iso_3166_1 i WHERE i.area = a.area LIMIT 1),
+                    CASE WHEN a.begin_date_year IS NULL THEN NULL ELSE
+                        lpad(a.begin_date_year::text, 4, '0')
+                        || COALESCE('-' || lpad(a.begin_date_month::text, 2, '0'), '')
+                        || COALESCE('-' || lpad(a.begin_date_day::text, 2, '0'), '') END,
+                    CASE WHEN a.end_date_year IS NULL THEN NULL ELSE
+                        lpad(a.end_date_year::text, 4, '0')
+                        || COALESCE('-' || lpad(a.end_date_month::text, 2, '0'), '')
+                        || COALESCE('-' || lpad(a.end_date_day::text, 2, '0'), '') END,
+                    a.ended
+               FROM artist a LEFT JOIN artist_type at ON at.id = a.type
+               LEFT JOIN gender g ON g.id = a.gender
+              WHERE a.gid = $1::uuid"
+    ))
+    .bind(mbid)
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some((name, kind, gender, country, begin, end, ended)) => {
+            ArtistDates { name, kind, gender, country, begin, end, ended }
+        }
+        None => ArtistDates::default(),
+    })
+}
+
+async fn mirror_release_facts(pool: &Pool<Postgres>, mbid: &str) -> Result<ReleaseFacts> {
+    #[allow(clippy::type_complexity)]
+    let row: Option<(String, String, String, Option<String>, String, String, i64, i64)> =
+        sqlx::query_as(&crate::sql!(
+            "WITH rel AS (
+                SELECT r.id, r.name, r.artist_credit, rg.id AS rgid, rg.gid::text AS rggid,
+                       rg.name AS rgname, pt.name AS ptype
+                  FROM release r JOIN release_group rg ON rg.id = r.release_group
+                  LEFT JOIN release_group_primary_type pt ON pt.id = rg.type
+                 WHERE r.gid = $1::uuid),
+             own AS (SELECT acn.artist FROM rel JOIN artist_credit_name acn ON acn.artist_credit = rel.artist_credit),
+             tr AS (SELECT t.recording FROM rel JOIN medium m ON m.release = rel.id JOIN track t ON t.medium = m.id)
+             SELECT rel.name, rel.rggid, rel.rgname, rel.ptype,
+                    COALESCE((SELECT string_agg(st.name, ',') FROM release_group_secondary_type_join j
+                                JOIN release_group_secondary_type st ON st.id = j.secondary_type
+                               WHERE j.release_group = rel.rgid), ''),
+                    COALESCE((SELECT string_agg(a.gid::text, ',') FROM own JOIN artist a ON a.id = own.artist), ''),
+                    (SELECT count(*) FROM tr),
+                    (SELECT count(*) FROM tr WHERE NOT EXISTS (
+                        SELECT 1 FROM recording rc JOIN artist_credit_name acn ON acn.artist_credit = rc.artist_credit
+                         WHERE rc.id = tr.recording AND acn.artist NOT IN (SELECT artist FROM own)))
+               FROM rel"
+        ))
+        .bind(mbid)
+        .fetch_optional(pool)
+        .await?;
+    Ok(match row {
+        Some((title, group, group_title, primary, secondary, artists, tracks, sole)) => {
+            ReleaseFacts {
+                title,
+                group_mbid: Some(group),
+                group_title,
+                primary_type: primary,
+                secondary_types: secondary
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                artist_mbids: artists
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                track_count: tracks,
+                sole_tracks: sole,
+            }
+        }
+        None => ReleaseFacts::default(),
+    })
+}
+
+async fn mirror_group_facts(pool: &Pool<Postgres>, mbid: &str) -> Result<GroupFacts> {
+    let rows: Vec<(String, i64, bool)> = sqlx::query_as(&crate::sql!(
+        "SELECT t.name, x.count::bigint, EXISTS (SELECT 1 FROM genre g WHERE g.name = t.name)
+           FROM release_group_tag x JOIN tag t ON t.id = x.tag
+           JOIN release_group rg ON rg.id = x.release_group
+          WHERE rg.gid = $1::uuid AND x.count > 0"
+    ))
+    .bind(mbid)
+    .fetch_all(pool)
+    .await?;
+    Ok(GroupFacts {
+        genres: rows.iter().filter(|r| r.2).map(|r| (r.0.clone(), r.1)).collect(),
+        tags: rows.into_iter().map(|r| (r.0, r.1)).collect(),
+    })
+}
+
+#[cfg(test)]
+mod facts_parse_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> serde_json::Value {
+        let path = format!("{}/src/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_classical_recording_names_its_performers_and_its_parent_work() {
+        let f = parse_recording_facts(&fixture("mb_recording_hahn_mendelssohn.json"));
+        let hahn = f.performers.iter().find(|p| p.name == "Hilary Hahn").unwrap();
+        assert_eq!((hahn.rel.as_str(), hahn.attribute.as_deref()), ("instrument", Some("violin")));
+        assert!(f.performers.iter().any(|p| p.rel == "conductor" && p.name == "Hugh Wolff"));
+        assert!(f
+            .performers
+            .iter()
+            .any(|p| p.rel == "performing orchestra"
+                && p.artist_type.as_deref() == Some("Orchestra")));
+        assert!(!f.performers.iter().any(|p| p.rel == "engineer"), "crew is not a performer");
+        let w = &f.works[0];
+        assert_eq!(w.languages, vec!["zxx"]);
+        assert_eq!(w.composers[0].0, "Felix Mendelssohn");
+        let parent = w.parent.as_ref().unwrap();
+        assert_eq!(parent.mbid, "c230858f-8b2b-3e77-aa3e-777743980263");
+        assert_eq!(parent.work_type.as_deref(), Some("Concerto"));
+    }
+
+    #[test]
+    fn a_symphony_movement_points_at_its_symphony() {
+        let f = parse_recording_facts(&fixture("mb_recording_facts_mackerras_prague.json"));
+        let w = &f.works[0];
+        assert_eq!(w.composers[0].1, "b972f589-fb0e-474e-b64a-803b0364fa75", "Mozart");
+        assert!(w.parent.as_ref().unwrap().title.starts_with("Symphony no. 38"));
+        // An `arrangement` relation is not the parent.
+        assert_eq!(w.parent.as_ref().unwrap().mbid, "7a1a2491-ffda-3ce6-a0e2-f59748dee68e");
+    }
+
+    #[test]
+    fn last_christmas_is_a_song_with_lyrics_and_tagged_christmas() {
+        let f = parse_recording_facts(&fixture("mb_recording_facts_last_christmas.json"));
+        let w = &f.works[0];
+        assert_eq!(w.title, "Last Christmas");
+        assert!(w.lyricist);
+        assert!(w.languages.iter().any(|l| l == "eng"));
+        let work = parse_work_facts(&fixture("mb_work_last_christmas.json"));
+        assert!(work.tags.iter().any(|(t, n)| t == "christmas" && *n >= 2));
+        assert_eq!(work.work_type.as_deref(), Some("Song"));
+    }
+
+    #[test]
+    fn a_work_counts_its_movements() {
+        let w = parse_work_facts(&fixture("mb_work_mendelssohn_concerto.json"));
+        assert_eq!(w.part_count, 3);
+        assert_eq!(w.work_type.as_deref(), Some("Concerto"));
+        assert_eq!(w.composers[0].0, "Felix Mendelssohn");
+    }
+
+    #[test]
+    fn tron_legacy_is_a_soundtrack_credited_to_daft_punk_alone() {
+        let r = parse_release_facts(&fixture("mb_release_tron_legacy.json"));
+        assert_eq!(r.secondary_types, vec!["Soundtrack"]);
+        assert_eq!(r.track_count, 24);
+        assert_eq!(r.sole_tracks, 24);
+        assert_eq!(r.group_mbid.as_deref(), Some("b585e56e-69cb-4f53-9597-320af5e5f541"));
+    }
+
+    #[test]
+    fn a_work_carries_the_year_it_was_finished() {
+        let w = parse_work_facts(&fixture("mb_work_mendelssohn_concerto.json"));
+        assert_eq!(w.composed, Some(1844), "begun 1838, finished 16 September 1844");
+        assert_eq!(parse_work_facts(&fixture("mb_work_last_christmas.json")).composed, None);
+    }
+
+    #[test]
+    fn performers_carry_their_country() {
+        let f = parse_recording_facts(&fixture("mb_recording_hahn_mendelssohn.json"));
+        let wolff = f.performers.iter().find(|p| p.name == "Hugh Wolff").unwrap();
+        assert_eq!(wolff.country.as_deref(), Some("US"));
+    }
+
+    #[test]
+    fn artist_dates_for_a_person_and_a_band() {
+        let ravel = parse_artist_dates(&fixture("mb_artist_ravel.json"));
+        assert_eq!(ravel.kind.as_deref(), Some("Person"));
+        assert_eq!(ravel.gender.as_deref(), Some("male"));
+        assert_eq!(ravel.begin.as_deref(), Some("1875-03-07"));
+        assert_eq!(ravel.end.as_deref(), Some("1937-12-28"));
+        assert!(ravel.ended);
+        let radiohead = parse_artist_dates(&fixture("mb_artist_radiohead.json"));
+        assert_eq!(radiohead.kind.as_deref(), Some("Group"));
+        assert_eq!(radiohead.gender, None);
+        assert_eq!(radiohead.country.as_deref(), Some("GB"));
+        assert!(!radiohead.ended);
+    }
+
+    #[test]
+    fn release_group_genres_carry_their_votes() {
+        let saw = parse_group_facts(&fixture("mb_release_group_saw2.json"));
+        assert!(saw.genres.contains(&("ambient".to_string(), 18)));
+        assert!(crate::classify::ambient_album(&saw));
+        let tron = parse_group_facts(&fixture("mb_release_group_tron_legacy.json"));
+        assert!(!crate::classify::ambient_album(&tron));
     }
 }
