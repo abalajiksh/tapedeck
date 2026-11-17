@@ -627,7 +627,13 @@ pub async fn artist_detail(
     let anniversaries = {
         let tz = super::scrobbles::user_tz_for(&state, user.user_id).await;
         let today = chrono::Utc::now().with_timezone(&tz).date_naive();
-        match state.db.artist_dates_for(entity.mbid.as_deref(), &name).await.ok().flatten() {
+        match state
+            .db
+            .artist_dates_for(entity.mbid.as_deref(), &name)
+            .await
+            .or_warn("artist dates")
+            .flatten()
+        {
             Some(d) => crate::classify::anniversary::of_artist(
                 &d.name,
                 d.kind.as_deref(),

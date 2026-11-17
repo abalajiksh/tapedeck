@@ -233,7 +233,7 @@ async fn infer_performers(db: &Database, row: &FacetListen, o: &Outcome) -> Vec<
             continue;
         }
         let key = Database::artist_key(name);
-        let stated = db.stated_role(&key).await.ok().flatten();
+        let stated = db.stated_role(&key).await.or_warn("stated role").flatten();
         let row = match stated {
             Some((role, instrument)) => Some(PerformerRow {
                 name: name.clone(),

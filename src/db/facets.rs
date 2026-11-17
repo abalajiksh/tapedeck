@@ -5,6 +5,9 @@
 //! on a release) and is copied onto `scrobbles.facets` with the listener's own
 //! overrides applied. Rankings filter on the copy and join the decision only
 //! where they need its piece, composer or performers.
+//!
+//! Every `SUM` of a duration is `CAST(… AS BIGINT)`: Postgres widens
+//! `SUM(bigint)` to NUMERIC, which does not decode into an i64.
 
 use super::{ChartRow, Cover, Database, COVER_PICK};
 use crate::classify::{ArtistDates, Outcome, PerformerRow};
@@ -532,7 +535,7 @@ impl Database {
             "movements" => format!(
                 "SELECT COALESCE(f.leaf_key, LOWER(COALESCE(f.movement, s.title))) AS key,
                         MAX(COALESCE(f.movement, s.title)) AS name, MAX(f.piece_title) AS sub,
-                        COUNT(*) AS plays, COALESCE(SUM(s.duration), 0) AS seconds,
+                        COUNT(*) AS plays, CAST(COALESCE(SUM(s.duration), 0) AS BIGINT) AS seconds,
                         COUNT(DISTINCT s.fact_key) AS versions, {COVER_PICK} AS cover_pick
                    FROM {from} WHERE s.skipped = FALSE AND {cond}
                   GROUP BY COALESCE(f.leaf_key, LOWER(COALESCE(f.movement, s.title)))
@@ -541,7 +544,7 @@ impl Database {
             "composers" => format!(
                 "SELECT COALESCE(f.composer_mbid, LOWER(f.composer_name)) AS key,
                         MAX(f.composer_name) AS name, NULL AS sub,
-                        COUNT(*) AS plays, COALESCE(SUM(s.duration), 0) AS seconds,
+                        COUNT(*) AS plays, CAST(COALESCE(SUM(s.duration), 0) AS BIGINT) AS seconds,
                         COUNT(DISTINCT f.piece_key) AS versions, NULL AS cover_pick
                    FROM {from} WHERE s.skipped = FALSE AND {cond} AND f.composer_name IS NOT NULL
                   GROUP BY COALESCE(f.composer_mbid, LOWER(f.composer_name))
@@ -551,7 +554,7 @@ impl Database {
                 "SELECT f.piece_key || CHAR(31) || LOWER(TRIM(COALESCE(s.album, ''))) AS key,
                         MAX(f.piece_title) AS name, MAX(s.artist) AS sub,
                         MAX(s.album) AS album, MAX(COALESCE(s.album_filed_under, s.artist)) AS album_artist,
-                        COUNT(*) AS plays, COALESCE(SUM(s.duration), 0) AS seconds,
+                        COUNT(*) AS plays, CAST(COALESCE(SUM(s.duration), 0) AS BIGINT) AS seconds,
                         {COVER_PICK} AS cover_pick
                    FROM {from} WHERE s.skipped = FALSE AND {cond}
                   GROUP BY f.piece_key, LOWER(TRIM(COALESCE(s.album, ''))),
@@ -569,7 +572,7 @@ impl Database {
                 // conditions live in WHERE rather than ON.
                 format!(
                     "SELECT rp.artist_key AS key, MAX(rp.name) AS name, MAX(rp.instrument) AS sub,
-                            COUNT(*) AS plays, COALESCE(SUM(s.duration), 0) AS seconds,
+                            COUNT(*) AS plays, CAST(COALESCE(SUM(s.duration), 0) AS BIGINT) AS seconds,
                             COUNT(DISTINCT f.piece_key) AS versions, MAX(rp.inferred) AS inferred,
                             NULL AS cover_pick
                        FROM {from} JOIN recording_performers rp ON rp.fact_key = s.fact_key
@@ -580,7 +583,7 @@ impl Database {
             }
             _ => format!(
                 "SELECT f.piece_key AS key, MAX(f.piece_title) AS name, MAX(f.composer_name) AS sub,
-                        COUNT(*) AS plays, COALESCE(SUM(s.duration), 0) AS seconds,
+                        COUNT(*) AS plays, CAST(COALESCE(SUM(s.duration), 0) AS BIGINT) AS seconds,
                         COUNT(DISTINCT s.fact_key) AS versions, {COVER_PICK} AS cover_pick
                    FROM {from} WHERE s.skipped = FALSE AND {cond}
                   GROUP BY f.piece_key
@@ -655,13 +658,13 @@ impl Database {
     ) -> Result<RoleCoverage, sqlx::Error> {
         let (cond, binds) = Self::insight_where(user_id, crate::classify::CLASSICAL, f);
         let sql = format!(
-            "SELECT COALESCE(SUM(s.duration), 0),
-                    COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM recording_performers rp
-                          WHERE rp.fact_key = s.fact_key AND rp.inferred = 0) THEN s.duration ELSE 0 END), 0),
-                    COALESCE(SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM recording_performers rp
+            "SELECT CAST(COALESCE(SUM(s.duration), 0) AS BIGINT),
+                    CAST(COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM recording_performers rp
+                          WHERE rp.fact_key = s.fact_key AND rp.inferred = 0) THEN s.duration ELSE 0 END), 0) AS BIGINT),
+                    CAST(COALESCE(SUM(CASE WHEN NOT EXISTS (SELECT 1 FROM recording_performers rp
                           WHERE rp.fact_key = s.fact_key AND rp.inferred = 0)
                         AND EXISTS (SELECT 1 FROM recording_performers rp
-                          WHERE rp.fact_key = s.fact_key AND rp.inferred = 1) THEN s.duration ELSE 0 END), 0)
+                          WHERE rp.fact_key = s.fact_key AND rp.inferred = 1) THEN s.duration ELSE 0 END), 0) AS BIGINT)
                FROM scrobbles s JOIN recording_facts f ON f.fact_key = s.fact_key
               WHERE s.skipped = FALSE AND {cond}"
         );
@@ -693,7 +696,7 @@ impl Database {
         let sql = format!(
             "SELECT f.piece_key AS key, MAX(f.piece_title) AS name, MAX(s.artist) AS sub,
                     MAX(s.album) AS album, MAX(COALESCE(s.album_filed_under, s.artist)) AS album_artist,
-                    COUNT(*) AS plays, COALESCE(SUM(s.duration), 0) AS seconds,
+                    COUNT(*) AS plays, CAST(COALESCE(SUM(s.duration), 0) AS BIGINT) AS seconds,
                     COUNT(DISTINCT LOWER(TRIM(s.artist))) AS versions, {COVER_PICK} AS cover_pick
                FROM scrobbles s JOIN recording_facts f ON f.fact_key = s.fact_key
               WHERE s.skipped = FALSE AND {cond}
@@ -714,7 +717,7 @@ impl Database {
         let sql = format!(
             "SELECT LOWER(TRIM(s.artist)) AS key, MAX(s.artist) AS name, MAX(s.title) AS sub,
                     MAX(s.album) AS album, MAX(COALESCE(s.album_filed_under, s.artist)) AS album_artist,
-                    COUNT(*) AS plays, COALESCE(SUM(s.duration), 0) AS seconds, {COVER_PICK} AS cover_pick
+                    COUNT(*) AS plays, CAST(COALESCE(SUM(s.duration), 0) AS BIGINT) AS seconds, {COVER_PICK} AS cover_pick
                FROM scrobbles s JOIN recording_facts f ON f.fact_key = s.fact_key
               WHERE s.user_id = ? AND s.skipped = FALSE AND f.piece_key = ?
               GROUP BY LOWER(TRIM(s.artist))
@@ -739,7 +742,7 @@ impl Database {
             "SELECT LOWER(TRIM(s.album)) || CHAR(31) || LOWER(TRIM(COALESCE(s.album_filed_under, s.artist))) AS key,
                     MAX(s.album) AS name, MAX(COALESCE(s.album_filed_under, s.artist)) AS sub,
                     MAX(s.album) AS album, MAX(COALESCE(s.album_filed_under, s.artist)) AS album_artist,
-                    COUNT(*) AS plays, COALESCE(SUM(s.duration), 0) AS seconds, {COVER_PICK} AS cover_pick
+                    COUNT(*) AS plays, CAST(COALESCE(SUM(s.duration), 0) AS BIGINT) AS seconds, {COVER_PICK} AS cover_pick
                FROM scrobbles s
               WHERE s.user_id = ? AND s.skipped = FALSE
                 AND (s.facets & ?) != 0 AND (s.facets & ?) = 0
@@ -990,7 +993,7 @@ impl Database {
             "SELECT f.piece_key AS piece_key, MAX(f.piece_title) AS piece_title,
                     MAX(COALESCE(f.composer_mbid, LOWER(f.composer_name))) AS composer_key,
                     MAX(f.composer_name) AS composer_name, MAX(f.composed_year) AS composed_year,
-                    MAX(d.begin) AS born, COUNT(*) AS plays, COALESCE(SUM(s.duration), 0) AS seconds
+                    MAX(d.begin) AS born, COUNT(*) AS plays, CAST(COALESCE(SUM(s.duration), 0) AS BIGINT) AS seconds
                FROM scrobbles s JOIN recording_facts f ON f.fact_key = s.fact_key
                LEFT JOIN artist_dates d ON d.mbid = f.composer_mbid
               WHERE s.skipped = FALSE AND {cond}
@@ -1077,7 +1080,7 @@ impl Database {
         name: &str,
     ) -> Result<Option<DatedArtist>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
-            "SELECT mbid, name, kind, begin, end_date, ended, 0 AS plays FROM artist_dates
+            "SELECT mbid, name, kind, begin, end_date, ended, CAST(0 AS BIGINT) AS plays FROM artist_dates
               WHERE (? IS NOT NULL AND mbid = ?) OR LOWER(name) = ?
               ORDER BY CASE WHEN mbid = ? THEN 0 ELSE 1 END LIMIT 1"
         ))

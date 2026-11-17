@@ -1324,12 +1324,14 @@ impl Database {
         let order = if by_hours { "seconds DESC, plays DESC" } else { "plays DESC" };
         // Every branch selects the same shape so the caller doesn't care which
         // ran. `sub` is the secondary line (an album's artist), null for artists.
+        // `seconds` is cast because Postgres widens `SUM(bigint)` to NUMERIC,
+        // which will not decode into an i64; SQLite reads the cast as a no-op.
         let sql: String = match kind {
             "albums" => {
                 format!(
                     "SELECT MAX(album) AS name, MAX(COALESCE(album_filed_under, artist)) AS sub,
                         NULL AS album, COUNT(*) AS plays,
-                        COALESCE(SUM(duration), 0) AS seconds,
+                        CAST(COALESCE(SUM(duration), 0) AS BIGINT) AS seconds,
                         {COVER_PICK} AS cover_pick
                  FROM scrobbles
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
@@ -1342,10 +1344,10 @@ impl Database {
             }
             "tracks" => {
                 format!(
-                    "SELECT title AS name, artist AS sub, MAX(album) AS album,
+                    "SELECT MAX(title) AS name, MAX(artist) AS sub, MAX(album) AS album,
                         MAX(COALESCE(album_filed_under, artist)) AS album_artist,
                         MAX(artist_credit) AS artist_credit, COUNT(*) AS plays,
-                        COALESCE(SUM(duration), 0) AS seconds,
+                        CAST(COALESCE(SUM(duration), 0) AS BIGINT) AS seconds,
                         {COVER_PICK} AS cover_pick
                  FROM scrobbles
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
@@ -1364,7 +1366,7 @@ impl Database {
                 // folded — the same trade every other grouping here makes.
                 format!(
                     "SELECT MAX(sa.name) AS name, NULL AS sub, NULL AS album, COUNT(*) AS plays,
-                        COALESCE(SUM(s.duration), 0) AS seconds,
+                        CAST(COALESCE(SUM(s.duration), 0) AS BIGINT) AS seconds,
                         NULL AS cover_pick
                  FROM scrobble_artists sa
                  JOIN scrobbles s ON s.id = sa.scrobble_id

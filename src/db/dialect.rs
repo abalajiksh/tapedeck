@@ -50,8 +50,9 @@
 //!   side — arguably more correct, and still a behaviour change, which is why
 //!   it is not being taken by accident.
 //! * **`printf('%012d', …)`** in `COVER_PICK` is SQLite's. Postgres wants
-//!   `lpad(x::text, 12, '0')`. One site, and it decides whether a grouped cover
-//!   comes from one listen.
+//!   `lpad(x::text, 12, '0')`, which [`to_postgres`] now writes for that exact
+//!   shape (found by the v0.132.0 live checks). One site, and it decides
+//!   whether a grouped cover comes from one listen.
 //! * **DDL**: `AUTOINCREMENT` (56), partial-index and CHECK-rebuild guards read
 //!   out of `sqlite_master` (7), `PRAGMA` (10). All of `schema.rs` and
 //!   `migrate.rs` — the reason those were split out first.
@@ -364,6 +365,13 @@ fn to_postgres(sql: &str, mode: Mode) -> String {
                     i = rest;
                     continue;
                 }
+                if let Some((rest, column)) = zero_pad_at(sql, i) {
+                    out.push_str("LPAD(CAST(");
+                    out.push_str(column);
+                    out.push_str(" AS TEXT), 12, '0')");
+                    i = rest;
+                    continue;
+                }
                 let c = sql[i..].chars().next().unwrap();
                 out.push(c);
                 i += c.len_utf8();
@@ -423,6 +431,23 @@ fn word_at(sql: &str, i: usize, word: &str) -> Option<usize> {
 fn call_at(sql: &str, i: usize, word: &str) -> Option<usize> {
     let end = word_at(sql, i, word)?;
     (sql.as_bytes().get(end) == Some(&b'(')).then_some(end)
+}
+
+/// `printf('%012d', <column>)` at `i` — [`COVER_PICK`](super::COVER_PICK)'s
+/// zero-padded timestamp, the one `printf` in the tree — as `(end, column)`.
+/// Postgres has no `printf`; `LPAD(CAST(x AS TEXT), 12, '0')` is the same
+/// string. Only that exact shape: any other format would need its own
+/// translation, and guessing one is how a cover silently comes from the wrong
+/// listen.
+fn zero_pad_at(sql: &str, i: usize) -> Option<(usize, &str)> {
+    let open = call_at(sql, i, "printf")?;
+    let args = sql[open..].strip_prefix("('%012d', ")?;
+    let len = args.bytes().take_while(|c| is_word_byte(*c) || *c == b'.').count();
+    if len == 0 || args.as_bytes().get(len) != Some(&b')') {
+        return None;
+    }
+    let start = sql.len() - args.len();
+    Some((start + len + 1, &args[..len]))
 }
 
 #[cfg(test)]
@@ -515,6 +540,24 @@ mod tests {
             "SELECT unlike, likeness FROM t"
         );
         assert_eq!(to_postgres("WHERE s = 'LIKE'", Mode::Query), "WHERE s = 'LIKE'");
+    }
+
+    #[test]
+    fn the_cover_pick_zero_pad_becomes_lpad() {
+        assert_eq!(
+            to_postgres("SELECT printf('%012d', timestamp) || CHAR(31) || x", Mode::Query),
+            "SELECT LPAD(CAST(timestamp AS TEXT), 12, '0') || CHR(31) || x"
+        );
+        assert_eq!(
+            to_postgres("SELECT printf('%012d', s.timestamp)", Mode::Query),
+            "SELECT LPAD(CAST(s.timestamp AS TEXT), 12, '0')"
+        );
+        // Any other format is left for Postgres to refuse, loudly.
+        assert_eq!(to_postgres("SELECT printf('%5d', n)", Mode::Query), "SELECT printf('%5d', n)");
+        // The translated pick must sort the way SQLite's does.
+        let pick = to_postgres(crate::db::COVER_PICK, Mode::Query);
+        assert!(pick.contains("LPAD(CAST(timestamp AS TEXT), 12, '0')"), "{pick}");
+        assert!(!pick.contains("printf"), "{pick}");
     }
 
     #[test]

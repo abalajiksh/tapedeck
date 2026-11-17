@@ -243,7 +243,12 @@ pub async fn classical(
     } else {
         None
     };
-    let pending = state.db.facets_pending(user.user_id, classify::VERSION).await.unwrap_or(0);
+    let pending = state
+        .db
+        .facets_pending(user.user_id, classify::VERSION)
+        .await
+        .or_warn("facets pending")
+        .unwrap_or(0);
     (
         StatusCode::OK,
         Json(ClassicalChart {
@@ -862,7 +867,12 @@ pub async fn scores(
         .await
         .or_warn("scores: suggestions")
         .unwrap_or_default();
-    let pending = state.db.facets_pending(user.user_id, classify::VERSION).await.unwrap_or(0);
+    let pending = state
+        .db
+        .facets_pending(user.user_id, classify::VERSION)
+        .await
+        .or_warn("facets pending")
+        .unwrap_or(0);
     (
         StatusCode::OK,
         Json(ScoresChart {
@@ -993,7 +1003,12 @@ pub async fn lenses(
             }
         })
         .collect();
-    let pending = state.db.facets_pending(user.user_id, classify::VERSION).await.unwrap_or(0);
+    let pending = state
+        .db
+        .facets_pending(user.user_id, classify::VERSION)
+        .await
+        .or_warn("facets pending")
+        .unwrap_or(0);
     Json(LensList { lenses, classical: counts[0], score: counts[1], ambient: counts[2], pending })
         .into_response()
 }
@@ -1283,7 +1298,12 @@ pub async fn lens_detail(
         Ok(r) => r,
         Err(e) => return err(500, e.to_string()),
     };
-    let pending = state.db.facets_pending(user.user_id, classify::VERSION).await.unwrap_or(0);
+    let pending = state
+        .db
+        .facets_pending(user.user_id, classify::VERSION)
+        .await
+        .or_warn("facets pending")
+        .unwrap_or(0);
     Json(LensDetail {
         id: l.id.to_string(),
         label: l.label.to_string(),
@@ -1778,7 +1798,12 @@ pub async fn composition(
             m.easter += secs;
         }
     }
-    let pending = state.db.facets_pending(user.user_id, classify::VERSION).await.unwrap_or(0);
+    let pending = state
+        .db
+        .facets_pending(user.user_id, classify::VERSION)
+        .await
+        .or_warn("facets pending")
+        .unwrap_or(0);
     Json(Composition { months: months.into_values().collect(), capped, pending }).into_response()
 }
 

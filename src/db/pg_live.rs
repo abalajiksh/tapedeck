@@ -556,4 +556,511 @@ mod tests {
         }
         drop(db);
     }
+
+    /// Every query behind Classical, Scores & Ambient, the seasonal lenses,
+    /// B-Sides, the split Top Charts and anniversaries, run on Postgres with
+    /// rows behind it — written for v0.132.0, whose SQL was otherwise only
+    /// ever executed on SQLite. A shape Postgres refuses (a GROUP BY it
+    /// considers ungrouped, an untyped NULL, a SQLite-only function) fails
+    /// here; the asserted numbers keep it about the answers too.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn the_insight_facets_run_on_postgres() {
+        use crate::classify::{self, ArtistDates, Outcome, PerformerRow};
+        use crate::db::InsightFilter;
+
+        let url = fresh("facets").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(|e| panic!("Database::new: {}", crate::logging::error_chain(&e)));
+        let uid = db
+            .setup_admin("tester", None, "not-a-real-hash")
+            .await
+            .unwrap_or_else(die("setup_admin"));
+
+        const MENDELSSOHN: &str = "c70d12a2-24fe-4f83-a6e6-57d84f8efb51";
+        const CONCERTO: &str = "w:0b0b0b0b-0000-4000-8000-000000000001";
+        let base = 1_766_000_000u64; // December 2025
+                                     // (title, artist, album, recording mbid, artist mbid, offset)
+        let listens = [
+            (
+                "Violin Concerto in E minor: I. Allegro molto appassionato",
+                "Hilary Hahn",
+                "Mendelssohn / Shostakovich",
+                "rec-1",
+                MENDELSSOHN,
+                0u64,
+            ),
+            (
+                "Violin Concerto in E minor: II. Andante",
+                "Hilary Hahn",
+                "Mendelssohn / Shostakovich",
+                "rec-2",
+                MENDELSSOHN,
+                700,
+            ),
+            (
+                "Violin Concerto in E minor: III. Allegretto non troppo",
+                "Hilary Hahn",
+                "Mendelssohn / Shostakovich",
+                "rec-3",
+                MENDELSSOHN,
+                1200,
+            ),
+            (
+                "Derezzed",
+                "Daft Punk",
+                "TRON: Legacy",
+                "rec-4",
+                "056e4f3e-d505-4dad-8ec1-d04f521cbb56",
+                9_000,
+            ),
+            (
+                "Arrival of the Birds",
+                "The Cinematic Orchestra",
+                "The Crimson Wing",
+                "rec-5",
+                "a1b2c3d4-0000-4000-8000-000000000005",
+                12_000,
+            ),
+            (
+                "1/1",
+                "Brian Eno",
+                "Ambient 1: Music for Airports",
+                "rec-6",
+                "ff95eb47-41c4-4f7f-a104-cdc30f02e872",
+                15_000,
+            ),
+            (
+                "Last Christmas",
+                "Wham!",
+                "Last Christmas",
+                "rec-7",
+                "5f7d0f1c-0000-4000-8000-000000000007",
+                18_000,
+            ),
+            (
+                "Last Christmas",
+                "Taylor Swift",
+                "Sounds of the Season",
+                "rec-8",
+                "20244d07-534f-4eff-b4d4-930878889970",
+                18_400,
+            ),
+            (
+                "Everything In Its Right Place",
+                "Radiohead",
+                "Kid A",
+                "rec-9",
+                "a74b1b7f-71a5-4011-9441-d0b5e4122711",
+                21_000,
+            ),
+        ];
+        for (i, (title, artist, album, rec, artist_mbid, off)) in listens.iter().enumerate() {
+            let mut play = crate::models::Play::new(
+                title.to_string(),
+                artist.to_string(),
+                base + off,
+                format!("pg-facets-{i}"),
+                "test".into(),
+            );
+            play.album = Some(album.to_string());
+            play.duration = Some(300);
+            play.mbid_recording = Some(format!("00000000-0000-4000-8000-00000000000{i}"));
+            play.mbid_release = Some(format!("rel-{rec}"));
+            play.mbid_artist = Some(vec![artist_mbid.to_string()]);
+            db.save_scrobble(
+                uid,
+                &play,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap_or_else(die("save_scrobble"));
+        }
+        db.rebuild_sessions(uid, 1800).await.unwrap_or_else(die("rebuild_sessions"));
+
+        let todo = db
+            .listens_needing_facets(classify::VERSION, Some(uid), 100)
+            .await
+            .unwrap_or_else(die("listens_needing_facets"));
+        assert_eq!(todo.len(), listens.len());
+        assert_eq!(
+            db.facets_pending(uid, classify::VERSION).await.unwrap_or_else(die("facets_pending")),
+            listens.len() as i64
+        );
+
+        let hahn = PerformerRow {
+            name: "Hilary Hahn".into(),
+            mbid: None,
+            role: "soloist".into(),
+            instrument: Some("violin".into()),
+            country: Some("US".into()),
+        };
+        let conductor = PerformerRow {
+            name: "Hugh Wolff".into(),
+            mbid: None,
+            role: "conductor".into(),
+            instrument: None,
+            country: Some("US".into()),
+        };
+        let orchestra = PerformerRow {
+            name: "Oslo Philharmonic Orchestra".into(),
+            mbid: None,
+            role: "orchestra".into(),
+            instrument: None,
+            country: Some("NO".into()),
+        };
+        for l in &todo {
+            let key = l.fact_key();
+            let movement = l.title.split(": ").nth(1).map(str::to_string);
+            let o = match l.artist.as_str() {
+                "Hilary Hahn" => Outcome {
+                    facets: classify::CLASSICAL,
+                    piece_key: CONCERTO.into(),
+                    piece_title: "Violin Concerto in E minor, Op. 64".into(),
+                    movement: movement.clone(),
+                    composer_name: Some("Felix Mendelssohn".into()),
+                    composer_mbid: Some(MENDELSSOHN.into()),
+                    leaf_key: Some(format!("w:leaf-{}", movement.unwrap_or_default())),
+                    part_count: Some(3),
+                    composed_year: Some(1844),
+                    form: Some("Concerto".into()),
+                    performers: vec![conductor.clone(), orchestra.clone()],
+                    evidence: vec!["canon composer".into()],
+                },
+                "Daft Punk" => Outcome {
+                    facets: classify::SCORE,
+                    piece_key: "t:derezzed".into(),
+                    piece_title: l.title.clone(),
+                    ..Default::default()
+                },
+                "The Cinematic Orchestra" => Outcome {
+                    facets: classify::SCORE_SUGGESTED,
+                    piece_key: "t:arrival of the birds".into(),
+                    piece_title: l.title.clone(),
+                    ..Default::default()
+                },
+                "Brian Eno" => Outcome {
+                    facets: classify::AMBIENT,
+                    piece_key: "t:1/1".into(),
+                    piece_title: l.title.clone(),
+                    ..Default::default()
+                },
+                "Wham!" | "Taylor Swift" => Outcome {
+                    facets: classify::CHRISTMAS,
+                    piece_key: "w:last-christmas".into(),
+                    piece_title: "Last Christmas".into(),
+                    ..Default::default()
+                },
+                _ => Outcome {
+                    facets: 0,
+                    piece_key: "t:everything in its right place".into(),
+                    piece_title: l.title.clone(),
+                    ..Default::default()
+                },
+            };
+            let inferred = if l.artist == "Hilary Hahn" { vec![hahn.clone()] } else { vec![] };
+            db.store_fact(&key, classify::VERSION, &o, &inferred)
+                .await
+                .unwrap_or_else(die("store_fact"));
+            // Storing twice is the upsert path a re-run takes.
+            db.store_fact(&key, classify::VERSION, &o, &inferred)
+                .await
+                .unwrap_or_else(die("store_fact again"));
+            let back = db
+                .stored_fact(&key, classify::VERSION)
+                .await
+                .unwrap_or_else(die("stored_fact"))
+                .expect("a stored fact reads back");
+            assert_eq!(back.facets, o.facets);
+            db.set_listen_facets(l.id, &key, o.facets, classify::VERSION)
+                .await
+                .unwrap_or_else(die("set_listen_facets"));
+        }
+        assert_eq!(
+            db.facets_pending(uid, classify::VERSION).await.unwrap_or_else(die("pending")),
+            0
+        );
+        let role = db.stated_role("hugh wolff").await.unwrap_or_else(die("stated_role"));
+        println!("stated role of Hugh Wolff: {role:?}");
+
+        // ── Classical ──
+        let all = InsightFilter::default();
+        for rank in [
+            "pieces",
+            "movements",
+            "composers",
+            "performances",
+            "conductor",
+            "orchestra",
+            "ensemble",
+            "soloist",
+        ] {
+            for by_hours in [false, true] {
+                let rows =
+                    db.classical_chart(uid, rank, &all, by_hours, 20).await.unwrap_or_else(|e| {
+                        panic!("classical_chart {rank}: {}", crate::logging::error_chain(&e))
+                    });
+                println!(
+                    "classical {rank} (hours={by_hours}): {:?}",
+                    rows.iter().map(|r| (&r.name, r.plays)).collect::<Vec<_>>()
+                );
+                match rank {
+                    "pieces" | "composers" | "performances" => {
+                        assert_eq!(rows[0].plays, 3, "{rank}")
+                    }
+                    "movements" => assert_eq!(rows.len(), 3),
+                    "soloist" | "conductor" | "orchestra" => assert_eq!(rows.len(), 1, "{rank}"),
+                    _ => assert!(rows.is_empty(), "{rank}"),
+                }
+            }
+        }
+        let soloists = db
+            .classical_chart(uid, "soloist", &all, false, 20)
+            .await
+            .unwrap_or_else(die("soloist"));
+        assert_eq!(soloists[0].inferred, Some(1), "Hahn's role was inferred");
+        let filtered = InsightFilter {
+            after: Some(base as i64 - 1),
+            before: Some(base as i64 + 100_000),
+            composer: Some(MENDELSSOHN.into()),
+            piece: Some(CONCERTO.into()),
+            performer: Some("hilary hahn".into()),
+            instrument: Some("violin".into()),
+        };
+        for rank in ["pieces", "movements", "composers", "performances", "soloist"] {
+            let rows =
+                db.classical_chart(uid, rank, &filtered, false, 20).await.unwrap_or_else(|e| {
+                    panic!("filtered classical_chart {rank}: {}", crate::logging::error_chain(&e))
+                });
+            assert!(!rows.is_empty(), "filtered {rank} came back empty");
+        }
+        let hearings = db
+            .classical_hearing_rows(uid, &all)
+            .await
+            .unwrap_or_else(die("classical_hearing_rows"));
+        assert_eq!(hearings.len(), 3);
+        assert!(
+            hearings.iter().all(|h| h.0.is_some() && h.0 == hearings[0].0),
+            "one sitting: {hearings:?}"
+        );
+        let instruments =
+            db.classical_instruments(uid, &all).await.unwrap_or_else(die("classical_instruments"));
+        assert_eq!(instruments, vec![("violin".to_string(), 3)]);
+        let coverage = db
+            .classical_role_coverage(uid, &all)
+            .await
+            .unwrap_or_else(die("classical_role_coverage"));
+        println!("role coverage: {coverage:?}");
+        assert_eq!(coverage.seconds, 900);
+        let stats =
+            db.classical_stat_rows(uid, &filtered).await.unwrap_or_else(die("classical_stat_rows"));
+        assert_eq!(stats.len(), 3);
+        let perf = db
+            .classical_performer_rows(uid, &all)
+            .await
+            .unwrap_or_else(die("classical_performer_rows"));
+        assert!(!perf.is_empty());
+        let timeline =
+            db.classical_timeline(uid, &all).await.unwrap_or_else(die("classical_timeline"));
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].composed_year, Some(1844));
+
+        // ── Scores, lenses, B-Sides ──
+        for flag in [classify::SCORE, classify::AMBIENT, classify::CHRISTMAS, classify::HALLOWEEN] {
+            for by_hours in [false, true] {
+                let rows = db.lens_songs(uid, flag, &all, by_hours, 20).await.unwrap_or_else(|e| {
+                    panic!("lens_songs {flag}: {}", crate::logging::error_chain(&e))
+                });
+                if flag == classify::CHRISTMAS {
+                    assert_eq!(rows.len(), 1, "two covers, one song");
+                    assert_eq!(rows[0].versions, Some(2));
+                }
+            }
+        }
+        let windowed = InsightFilter {
+            after: Some(base as i64),
+            before: Some(base as i64 + 19_000),
+            ..Default::default()
+        };
+        db.lens_songs(uid, classify::CHRISTMAS, &windowed, false, 20)
+            .await
+            .unwrap_or_else(die("lens_songs window"));
+        let versions = db
+            .piece_versions(uid, "w:last-christmas", 20)
+            .await
+            .unwrap_or_else(die("piece_versions"));
+        assert_eq!(versions.len(), 2);
+        let suggestions =
+            db.score_suggestions(uid, 20).await.unwrap_or_else(die("score_suggestions"));
+        assert_eq!(suggestions.len(), 1, "{suggestions:?}");
+        let tl =
+            db.facet_timeline(uid, None, None, 100).await.unwrap_or_else(die("facet_timeline"));
+        println!("facet timeline: {tl:?}");
+        db.facet_timeline(uid, Some(base as i64), Some(base as i64 + 86_400), 100)
+            .await
+            .unwrap_or_else(die("facet_timeline window"));
+        let ts = db
+            .facet_timestamps(uid, classify::CHRISTMAS)
+            .await
+            .unwrap_or_else(die("facet_timestamps"));
+        assert_eq!(ts.len(), 2);
+        let counts = db.facet_counts(uid).await.unwrap_or_else(die("facet_counts"));
+        println!("facet counts: {counts:?}");
+        assert_eq!(counts[0], 3, "classical");
+
+        // ── Top Charts with the split ──
+        let split = classify::CLASSICAL | classify::SCORE | classify::AMBIENT;
+        for kind in ["artists", "albums", "tracks"] {
+            for by_hours in [false, true] {
+                let rows =
+                    db.top_chart(uid, kind, None, 50, by_hours, split).await.unwrap_or_else(|e| {
+                        panic!("top_chart {kind}: {}", crate::logging::error_chain(&e))
+                    });
+                assert!(
+                    rows.iter().all(|r| r.name != "Hilary Hahn" && r.name != "Brian Eno"),
+                    "{kind}"
+                );
+            }
+            db.chart_filtered(
+                uid,
+                kind,
+                Some(0),
+                Some(i64::MAX),
+                50,
+                false,
+                0,
+                classify::CHRISTMAS,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!("chart_filtered {kind}: {}", crate::logging::error_chain(&e))
+            });
+        }
+        assert_eq!(db.split_out(uid, None, split).await.unwrap_or_else(die("split_out")), 5);
+        assert_eq!(
+            db.split_out(uid, Some(base as i64 + 10_000), split)
+                .await
+                .unwrap_or_else(die("split_out after")),
+            1
+        );
+        let spread = db
+            .artist_album_plays(uid, "Hilary Hahn")
+            .await
+            .unwrap_or_else(die("artist_album_plays"));
+        assert_eq!(spread.len(), 1);
+
+        // ── Overrides: artist, album, work; set, read, clear ──
+        let n = db
+            .set_facet_override(
+                uid,
+                "artist",
+                "the cinematic orchestra",
+                classify::SCORE,
+                Some(true),
+            )
+            .await
+            .unwrap_or_else(die("set_facet_override artist"));
+        println!("artist override requeued {n}");
+        db.set_facet_override(uid, "album", "kid a\u{1f}radiohead", classify::AMBIENT, Some(false))
+            .await
+            .unwrap_or_else(die("set_facet_override album"));
+        db.set_facet_override(uid, "work", "t:derezzed", classify::SCORE, Some(false))
+            .await
+            .unwrap_or_else(die("set_facet_override work"));
+        // The upsert path.
+        db.set_facet_override(uid, "work", "t:derezzed", classify::SCORE, Some(true))
+            .await
+            .unwrap_or_else(die("set_facet_override again"));
+        let ov = db.facet_overrides(uid).await.unwrap_or_else(die("facet_overrides"));
+        assert_eq!(ov.len(), 3);
+        let on = db
+            .facet_overrides_on(uid, "work", "t:derezzed")
+            .await
+            .unwrap_or_else(die("facet_overrides_on"));
+        assert_eq!(on, vec![(classify::SCORE, true)]);
+        db.set_facet_override(uid, "work", "t:derezzed", classify::SCORE, None)
+            .await
+            .unwrap_or_else(die("clear override"));
+        assert_eq!(db.facet_overrides(uid).await.unwrap_or_else(die("facet_overrides")).len(), 2);
+
+        // ── Dates and anniversaries ──
+        let needing =
+            db.artists_needing_dates(50).await.unwrap_or_else(die("artists_needing_dates"));
+        println!("artists needing dates: {}", needing.len());
+        db.store_artist_dates(
+            MENDELSSOHN,
+            &ArtistDates {
+                name: "Felix Mendelssohn".into(),
+                kind: Some("Person".into()),
+                gender: Some("Male".into()),
+                country: Some("DE".into()),
+                begin: Some("1809-02-03".into()),
+                end: Some("1847-11-04".into()),
+                ended: true,
+            },
+        )
+        .await
+        .unwrap_or_else(die("store_artist_dates"));
+        db.store_artist_dates(
+            "a74b1b7f-71a5-4011-9441-d0b5e4122711",
+            &ArtistDates {
+                name: "Radiohead".into(),
+                kind: Some("Group".into()),
+                begin: Some("1985".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(die("store_artist_dates again"));
+        let dated = db.dated_artists(uid, 1).await.unwrap_or_else(die("dated_artists"));
+        println!(
+            "dated artists: {:?}",
+            dated.iter().map(|d| (&d.name, &d.begin, d.plays)).collect::<Vec<_>>()
+        );
+        // Enrichment fills `release_year`; written straight here.
+        sqlx::query(
+            "UPDATE scrobbles SET release_year = 2000 WHERE user_id = $1 AND album = 'Kid A'",
+        )
+        .bind(uid)
+        .execute(&db.pool)
+        .await
+        .unwrap_or_else(die("release_year"));
+        let albums = db.dated_albums(uid, 1).await.unwrap_or_else(die("dated_albums"));
+        println!("dated albums: {albums:?}");
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].2, 2000);
+        let radiohead = db
+            .artist_dates_for(Some("a74b1b7f-71a5-4011-9441-d0b5e4122711"), "Radiohead")
+            .await
+            .unwrap_or_else(die("artist_dates_for"));
+        assert_eq!(radiohead.map(|r| r.begin), Some(Some("1985".to_string())));
+        db.artist_dates_for(None, "Felix Mendelssohn")
+            .await
+            .unwrap_or_else(die("artist_dates_for by name"));
+        let stats = db
+            .classical_stat_rows(uid, &all)
+            .await
+            .unwrap_or_else(die("classical_stat_rows dated"));
+        assert!(
+            stats.iter().all(|r| r.born.as_deref() == Some("1809-02-03")),
+            "the composer's dates join"
+        );
+
+        // ── A member who leaves takes their overrides ──
+        let member =
+            db.create_user("leaver", None, "x", "member").await.unwrap_or_else(die("create_user"));
+        db.set_facet_override(member, "artist", "radiohead", classify::CLASSICAL, Some(true))
+            .await
+            .unwrap_or_else(die("member override"));
+        assert!(db.delete_user(member).await.unwrap_or_else(die("delete_user")));
+        drop(db);
+    }
 }
