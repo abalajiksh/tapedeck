@@ -1662,27 +1662,24 @@ impl Database {
     /// "today", which had exactly this bug.
     ///
     /// Returns `(period, genre, plays)`; the caller turns that into a position.
-    /// `fmt` is a `strftime` pattern — `%Y` for years, `%Y-%m` for months.
+    /// A period is `YYYY`, or `YYYY-MM` when `by_month`.
     pub async fn genre_plays_by_period(
         &self,
         user_id: i64,
         tz_offset_hours: f64,
-        fmt: &str,
+        by_month: bool,
     ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
-        let shift = format!("{} hours", tz_offset_hours);
-        sqlx::query_as(&crate::sql!(
-            "SELECT strftime(?, s.timestamp, 'unixepoch', ?) AS yr, g.value AS name,
-                    COUNT(*) AS plays
+        let (fmt, shift) = period_binds(tz_offset_hours, by_month);
+        let raw = format!(
+            "SELECT {} AS yr, MAX(g.value) AS name, COUNT(*) AS plays
                FROM scrobbles s, json_each(s.genres) g
-              WHERE s.user_id = ? AND s.skipped = FALSE AND s.genres IS NOT NULL
+              WHERE s.user_id = ?3 AND s.skipped = FALSE AND s.genres IS NOT NULL
               GROUP BY yr, LOWER(g.value)
               ORDER BY yr",
-        ))
-        .bind(fmt)
-        .bind(&shift)
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
+            period_of("s.timestamp")
+        );
+        let stmt = crate::sql!(&raw);
+        sqlx::query_as(&stmt).bind(fmt).bind(shift).bind(user_id).fetch_all(&self.pool).await
     }
     /// Listens per year, and how many of them have genres resolved — so a
     /// trajectory can say which years are still filling in rather than drawing
@@ -1691,22 +1688,20 @@ impl Database {
         &self,
         user_id: i64,
         tz_offset_hours: f64,
-        fmt: &str,
+        by_month: bool,
     ) -> Result<Vec<(String, i64, i64)>, sqlx::Error> {
-        let shift = format!("{} hours", tz_offset_hours);
-        sqlx::query_as(&crate::sql!(
-            "SELECT strftime(?, timestamp, 'unixepoch', ?) AS yr,
+        let (fmt, shift) = period_binds(tz_offset_hours, by_month);
+        let raw = format!(
+            "SELECT {} AS yr,
                     COUNT(*) AS listens,
                     SUM(CASE WHEN genres IS NOT NULL THEN 1 ELSE 0 END) AS enriched
                FROM scrobbles
-              WHERE user_id = ? AND skipped = FALSE
-              GROUP BY yr ORDER BY yr"
-        ))
-        .bind(fmt)
-        .bind(&shift)
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
+              WHERE user_id = ?3 AND skipped = FALSE
+              GROUP BY yr ORDER BY yr",
+            period_of("timestamp")
+        );
+        let stmt = crate::sql!(&raw);
+        sqlx::query_as(&stmt).bind(fmt).bind(shift).bind(user_id).fetch_all(&self.pool).await
     }
     /// How many of the user's listens carry any genre at all, and how many
     /// exist — so a thin map can say "the backfill is still running" rather
@@ -2225,4 +2220,32 @@ pub struct DashboardStats {
     pub week_hours: f64,
     /// Over the listens that carry a score; 0 with none.
     pub avg_quality: f64,
+}
+
+/// The year (`YYYY`) or month (`YYYY-MM`) a unix timestamp falls in, shifted by
+/// a fixed hour offset, as SQL over `ts`. Binds `?1` = the format, `?2` = the
+/// shift, both from [`period_binds`]; numbered so the bind order is the same
+/// on both backends although the arguments are not.
+///
+/// One spelling per backend, on purpose: SQLite's `strftime` stays byte for
+/// byte what households have always been answered with, and Postgres, which
+/// has no `strftime`, gets the same string from `to_char`. `AT TIME ZONE
+/// 'UTC'` makes the result independent of the session's `TimeZone`.
+#[cfg(not(feature = "postgres"))]
+fn period_of(ts: &str) -> String {
+    format!("strftime(?1, {ts}, 'unixepoch', ?2)")
+}
+#[cfg(feature = "postgres")]
+fn period_of(ts: &str) -> String {
+    format!("to_char(to_timestamp({ts}) AT TIME ZONE 'UTC' + CAST(?2 AS INTERVAL), ?1)")
+}
+
+/// `(format, shift)` for [`period_of`]. The shift is `"<hours> hours"`, which
+/// SQLite reads as a modifier and Postgres as an interval.
+fn period_binds(tz_offset_hours: f64, by_month: bool) -> (&'static str, String) {
+    #[cfg(not(feature = "postgres"))]
+    let fmt = if by_month { "%Y-%m" } else { "%Y" };
+    #[cfg(feature = "postgres")]
+    let fmt = if by_month { "YYYY-MM" } else { "YYYY" };
+    (fmt, format!("{tz_offset_hours} hours"))
 }

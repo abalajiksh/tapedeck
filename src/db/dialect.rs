@@ -78,6 +78,9 @@
 //! * **`last_insert_rowid()`** (17) → `RETURNING`.
 //! * **`INSERT OR IGNORE` / `OR REPLACE`** (16) → `ON CONFLICT`.
 //! * **`GROUP_CONCAT`** (2) → `string_agg`, **`strftime`** (6), **`datetime(`** (6).
+//!   `strftime` usually takes its format as a bind, so no textual rewrite can
+//!   translate it; the genre trajectory's two (`physical::period_of`) are
+//!   spelled once per backend instead, `to_char` on Postgres (v0.132.1).
 //! * **Bare columns beside an aggregate.** `loves_detailed` leans on SQLite's
 //!   rule that one `min`/`max` makes bare columns come from that row. Postgres
 //!   rejects it outright — loud, at least, but it is a rewrite rather than a

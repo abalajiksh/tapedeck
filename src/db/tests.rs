@@ -212,6 +212,63 @@ fn play(title: &str, artist: &str, ts: u64) -> Play {
     Play::new(title.into(), artist.into(), ts, format!("src-{ts}"), "test".into())
 }
 
+/// The genre trajectory's periods: the year (or month) a listen falls in at
+/// the listener's offset. A listen at 23:30 UTC on New Year's Eve is 2025 an
+/// hour east of Greenwich and 2024 at it. `pg_live` holds Postgres, which has
+/// no `strftime`, to these same answers.
+#[tokio::test]
+async fn trajectory_periods_follow_the_listeners_offset() {
+    let db = testdb().await;
+    let me = db.setup_admin("tester", None, "x").await.unwrap();
+    for (i, ts) in [1_735_687_800u64, 1_749_988_800, 1_677_664_800].into_iter().enumerate() {
+        db.save_scrobble(
+            me,
+            &play(&format!("t{i}"), "Artist", ts),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    }
+    sqlx::query("UPDATE scrobbles SET genres = '[\"Ambient\",\"idm\"]' WHERE user_id = ?")
+        .bind(me)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let years = db.listens_by_period(me, 1.0, false).await.unwrap();
+    assert_eq!(years, [("2023".to_string(), 1, 1), ("2025".to_string(), 2, 2)]);
+    let utc = db.listens_by_period(me, 0.0, false).await.unwrap();
+    assert_eq!(utc.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["2023", "2024", "2025"]);
+    let months = db.listens_by_period(me, 1.0, true).await.unwrap();
+    assert_eq!(
+        months.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+        ["2023-03", "2025-01", "2025-06"]
+    );
+    let behind = db.listens_by_period(me, -5.5, true).await.unwrap();
+    assert_eq!(
+        behind.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+        ["2023-03", "2024-12", "2025-06"]
+    );
+
+    let genres = db.genre_plays_by_period(me, 1.0, false).await.unwrap();
+    assert_eq!(
+        genres,
+        [
+            ("2023".to_string(), "Ambient".to_string(), 1),
+            ("2023".to_string(), "idm".to_string(), 1),
+            ("2025".to_string(), "Ambient".to_string(), 2),
+            ("2025".to_string(), "idm".to_string(), 2),
+        ]
+    );
+}
+
 /// A grouped row's cover has to come from **one listen**.
 ///
 /// Reported 2026-08-21: a Cœur de pirate record wore a 5-CD compilation's

@@ -688,7 +688,7 @@ pub async fn genre_trajectory(
     axum::extract::Query(q): axum::extract::Query<TrajectoryQuery>,
 ) -> impl IntoResponse {
     let tz = super::scrobbles::user_tz_for(&state, user.user_id).await;
-    // SQLite's `strftime` modifier wants a signed hour offset; derive it from
+    // The period is bucketed with a signed hour offset; derive it from
     // the zone's *current* offset, which is right to the year boundary except
     // for a listen inside the DST hour of New Year — which no zone has.
     let offset_hours = {
@@ -698,7 +698,7 @@ pub async fn genre_trajectory(
     };
 
     // How many distinct years are there? Cheap, and it decides the granularity.
-    let by_year = state.db.listens_by_period(user.user_id, offset_hours, "%Y").await;
+    let by_year = state.db.listens_by_period(user.user_id, offset_hours, false).await;
     let year_count = by_year.as_ref().map(|v| v.len()).unwrap_or(0);
     let unit = match q.by.as_deref() {
         Some("month") => "month",
@@ -706,9 +706,9 @@ pub async fn genre_trajectory(
         _ if year_count < MONTHS_BELOW_YEARS => "month",
         _ => "year",
     };
-    let fmt = if unit == "month" { "%Y-%m" } else { "%Y" };
+    let by_month = unit == "month";
 
-    let rows = match state.db.genre_plays_by_period(user.user_id, offset_hours, fmt).await {
+    let rows = match state.db.genre_plays_by_period(user.user_id, offset_hours, by_month).await {
         Ok(r) => r,
         Err(e) => {
             error!("Trajectory query failed: {}", e);
@@ -746,7 +746,7 @@ pub async fn genre_trajectory(
     // it were complete.
     let coverage: std::collections::HashMap<String, (i64, i64)> = state
         .db
-        .listens_by_period(user.user_id, offset_hours, fmt)
+        .listens_by_period(user.user_id, offset_hours, by_month)
         .await
         .or_warn("genre_trajectory: listens_by_period")
         .unwrap_or_default()

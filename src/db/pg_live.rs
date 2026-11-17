@@ -670,6 +670,77 @@ mod tests {
         assert_eq!(order, [("alpha", "apple"), ("Alpha", "Zed"), ("beta", "b"), ("Ångström", "c")]);
     }
 
+    /// The genre trajectory's periods on Postgres, which has no `strftime`:
+    /// the same answers `db::tests::trajectory_periods_follow_the_listeners_offset`
+    /// pins for SQLite.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn trajectory_periods_answer_as_sqlite_does() {
+        let url = fresh("periods").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new"));
+        let me = db.setup_admin("tester", None, "x").await.unwrap_or_else(die("setup_admin"));
+        for (i, ts) in [1_735_687_800u64, 1_749_988_800, 1_677_664_800].into_iter().enumerate() {
+            let play = crate::models::Play::new(
+                format!("t{i}"),
+                "Artist".into(),
+                ts,
+                format!("src-{ts}"),
+                "test".into(),
+            );
+            db.save_scrobble(
+                me,
+                &play,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap_or_else(die("save_scrobble"));
+        }
+        sqlx::query("UPDATE scrobbles SET genres = '[\"Ambient\",\"idm\"]' WHERE user_id = $1")
+            .bind(me)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(die("genres"));
+
+        let years =
+            db.listens_by_period(me, 1.0, false).await.unwrap_or_else(die("listens_by_period"));
+        assert_eq!(years, [("2023".to_string(), 1, 1), ("2025".to_string(), 2, 2)]);
+        let utc = db.listens_by_period(me, 0.0, false).await.unwrap_or_else(die("utc"));
+        assert_eq!(utc.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["2023", "2024", "2025"]);
+        let months = db.listens_by_period(me, 1.0, true).await.unwrap_or_else(die("months"));
+        assert_eq!(
+            months.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["2023-03", "2025-01", "2025-06"]
+        );
+        let behind = db.listens_by_period(me, -5.5, true).await.unwrap_or_else(die("behind"));
+        assert_eq!(
+            behind.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["2023-03", "2024-12", "2025-06"]
+        );
+
+        let genres = db
+            .genre_plays_by_period(me, 1.0, false)
+            .await
+            .unwrap_or_else(die("genre_plays_by_period"));
+        assert_eq!(
+            genres,
+            [
+                ("2023".to_string(), "Ambient".to_string(), 1),
+                ("2023".to_string(), "idm".to_string(), 1),
+                ("2025".to_string(), "Ambient".to_string(), 2),
+                ("2025".to_string(), "idm".to_string(), 2),
+            ]
+        );
+    }
+
     /// `chain_bindings`' columns (name, type, nullability) and foreign keys
     /// (name, definition), both sorted — column order differs after an
     /// `ADD COLUMN` and means nothing.
