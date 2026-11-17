@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.131.3
+  version: 0.132.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -3865,6 +3865,670 @@ paths:
       security:
       - apiToken:
         - read
+      - sessionCookie: []
+  /api/v1/insights/classical:
+    get:
+      tags:
+      - Statistics
+      summary: The Classical tab.
+      description: |-
+        Scope: `read` *(since v0.132)*. Pieces roll movements up to the whole work
+        (Ciaccona → Partita No. 2); an opera is one piece and `rank=movements`
+        with its `piece` opens it. A composer is the *piece's* composer, whoever
+        the listen was credited to. Performers come from MusicBrainz's recording
+        credits, or are inferred (`inferred: 1`) for listens that carry names
+        only; a concerto counts in full for its soloist, conductor and orchestra,
+        so performer shares do not sum to 100%.
+      operationId: classical
+      parameters:
+      - name: rank
+        in: query
+        description: |-
+          `pieces` (default), `movements` (needs `piece`), `composers`,
+          `performances`, `conductor`, `orchestra`, `ensemble` or `soloist`.
+        required: false
+        schema:
+          type: string
+      - name: range
+        in: query
+        description: '`today`, `d7`, `month`, `year` or `all` (default), as on Top Charts.'
+        required: false
+        schema:
+          type: string
+      - name: metric
+        in: query
+        description: |-
+          `hours` (default), `plays` or `hearings` — complete hearings, every
+          movement of a piece in one sitting; pieces and composers only.
+        required: false
+        schema:
+          type: string
+      - name: composer
+        in: query
+        description: 'Narrow to one composer: a key from a `composers` row.'
+        required: false
+        schema:
+          type: string
+      - name: piece
+        in: query
+        description: 'Narrow to one piece: a key from a `pieces` row.'
+        required: false
+        schema:
+          type: string
+      - name: performer
+        in: query
+        description: 'Narrow to one performer: a key from a performer row.'
+        required: false
+        schema:
+          type: string
+      - name: instrument
+        in: query
+        description: 'With `rank=soloist`: one instrument or voice, e.g. `violin`.'
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+          default: 100
+          maximum: 500
+          minimum: 1
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClassicalChart'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/scores:
+    get:
+      tags:
+      - Statistics
+      summary: The Scores & Ambient tab.
+      description: |-
+        Scope: `read` *(since v0.132)*. Score is instrumental music on a
+        soundtrack — a song on a soundtrack stays a song, and in Top Charts. Ambient
+        is an album whose top genre on MusicBrainz is ambient.
+      operationId: scores
+      parameters:
+      - name: section
+        in: query
+        description: '`all` (default), `score` or `ambient`.'
+        required: false
+        schema:
+          type: string
+      - name: kind
+        in: query
+        description: '`tracks` (default), `albums` or `artists`.'
+        required: false
+        schema:
+          type: string
+      - name: range
+        in: query
+        required: false
+        schema:
+          type: string
+      - name: metric
+        in: query
+        description: '`plays` (default) or `hours`.'
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+          default: 100
+          maximum: 500
+          minimum: 1
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScoresChart'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/lenses:
+    get:
+      tags:
+      - Statistics
+      summary: The seasonal lenses, and which are in season today.
+      description: |-
+        Scope: `read` *(since v0.132)*. Christmas runs 1 September – 6 January,
+        Halloween 1 October – 2 November, Easter Palm Sunday – Easter Monday
+        (Western date), all by your own calendar. A lens takes nothing out of Top
+        Charts; it adds a view.
+      operationId: lenses
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LensList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/lenses/{id}:
+    get:
+      tags:
+      - Statistics
+      summary: 'One seasonal lens: its charts, its curve, and when your season opened.'
+      description: |-
+        Scope: `read` *(since v0.132)*. `range=season` (the default) charts the
+        chosen season; `year` and `all` chart wider windows by the same flag.
+      operationId: lens_detail
+      parameters:
+      - name: id
+        in: path
+        description: '`christmas`, `halloween` or `easter`.'
+        required: true
+        schema:
+          type: string
+      - name: season
+        in: query
+        description: |-
+          The season, by the year it began. The running or most recent one when
+          absent.
+        required: false
+        schema:
+          type: integer
+          format: int32
+      - name: range
+        in: query
+        description: '`season` (default), `year` or `all`.'
+        required: false
+        schema:
+          type: string
+      - name: rank
+        in: query
+        description: '`songs` (default; covers of one song are one row), `artists` or `albums`.'
+        required: false
+        schema:
+          type: string
+      - name: metric
+        in: query
+        description: '`plays` (default) or `hours`.'
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int64
+          default: 50
+          maximum: 200
+          minimum: 1
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LensDetail'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/versions:
+    get:
+      tags:
+      - Statistics
+      summary: Every artist's version of one song you heard — the covers behind a row.
+      description: 'Scope: `read` *(since v0.132)*.'
+      operationId: versions
+      parameters:
+      - name: piece
+        in: query
+        description: A `key` from a `songs` row.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Versions'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/lenses/{id}/image:
+    get:
+      tags:
+      - Statistics
+      summary: A season as a share card (PNG).
+      description: |-
+        Scope: `read` *(since v0.132)*. The season's plays and share, the day it
+        opened, its daily curve, the artist you played most and what was on repeat.
+      operationId: lens_image
+      parameters:
+      - name: id
+        in: path
+        description: '`christmas`, `halloween` or `easter`.'
+        required: true
+        schema:
+          type: string
+      - name: season
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int32
+      - name: size
+        in: query
+        description: '`story` (default), `square` or `wide`. The image only.'
+        required: false
+        schema:
+          type: string
+      - name: theme
+        in: query
+        description: '`dark` (default) or `light`.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: A PNG.
+          content:
+            image/png: {}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/lenses/{id}/mixdown:
+    get:
+      tags:
+      - Statistics
+      summary: A season as a Mixdown — the year's scenes, told for the season.
+      description: |-
+        Scope: `read` *(since v0.132)*. Played exactly as
+        `GET /api/v1/reports/mixdown` describes.
+      operationId: lens_mixdown
+      parameters:
+      - name: id
+        in: path
+        description: '`christmas`, `halloween` or `easter`.'
+        required: true
+        schema:
+          type: string
+      - name: season
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int32
+      - name: size
+        in: query
+        description: '`story` (default), `square` or `wide`. The image only.'
+        required: false
+        schema:
+          type: string
+      - name: theme
+        in: query
+        description: '`dark` (default) or `light`.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The mixdown.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MixdownResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/lenses/{id}/mixdown/video:
+    post:
+      tags:
+      - Statistics
+      summary: Make a video of a season's Mixdown.
+      description: |-
+        Scope: `read` *(since v0.132)*. The same job as
+        `POST /api/v1/reports/mixdown/video`; poll and download it there.
+      operationId: lens_mixdown_video
+      parameters:
+      - name: id
+        in: path
+        description: '`christmas`, `halloween` or `easter`.'
+        required: true
+        schema:
+          type: string
+      - name: season
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int32
+      - name: size
+        in: query
+        description: '`story` (default), `square` or `wide`. The image only.'
+        required: false
+        schema:
+          type: string
+      - name: theme
+        in: query
+        description: '`dark` (default) or `light`.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '202':
+          description: Started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MixdownVideo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: You already have a video being made.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '501':
+          description: This server has no video encoder.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/lenses/{id}/playlist:
+    post:
+      tags:
+      - Statistics
+      summary: Save a season's most-played songs as a playlist.
+      description: |-
+        Scope: `write` *(since v0.132)*. Your own history only — up to fifty songs
+        you played that season, most played first. Saving the same season again
+        returns the playlist already made. Push it to a media server from
+        Playlists like any other.
+      operationId: lens_playlist
+      parameters:
+      - name: id
+        in: path
+        description: '`christmas`, `halloween` or `easter`.'
+        required: true
+        schema:
+          type: string
+      - name: season
+        in: query
+        required: false
+        schema:
+          type: integer
+          format: int32
+      - name: size
+        in: query
+        description: '`story` (default), `square` or `wide`. The image only.'
+        required: false
+        schema:
+          type: string
+      - name: theme
+        in: query
+        description: '`dark` (default) or `light`.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PlaylistMade'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+      security:
+      - apiToken:
+        - write
+      - sessionCookie: []
+  /api/v1/insights/composition:
+    get:
+      tags:
+      - Statistics
+      summary: What your listening is made of, month by month.
+      description: |-
+        Scope: `read` *(since v0.132)*. Seconds of classical, score & ambient and
+        everything else — each listen counted once, classical first — with the
+        seasonal lenses as overlays inside them. Statistics keeps every listen in
+        its own figures; this is the one chart that says what share was which.
+      operationId: composition
+      parameters:
+      - name: range
+        in: query
+        description: '`year` (default) or `all`.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Composition'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/classical/stats:
+    get:
+      tags:
+      - Statistics
+      summary: Statistics of your classical listening.
+      description: |-
+        Scope: `read` *(since v0.132)*. After Bachtrack's annual classical music
+        statistics, refitted from concerts to listens: by period and form, your
+        top composers year by year with their anniversaries, how much is by living
+        composers and by women, where composers and performers are from, and the
+        performers who took you across the most composers. Composer facts come
+        from MusicBrainz; `known` says how much of the window they cover.
+      operationId: classical_stats
+      parameters:
+      - name: range
+        in: query
+        description: '`today`, `d7`, `month`, `year` or `all` (default).'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClassicalStats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/classical/timeline:
+    get:
+      tags:
+      - Statistics
+      summary: |-
+        Your classical listening on a timeline — Chronologue's grid, drawn from
+        your history.
+      description: |-
+        Scope: `read` *(since v0.132)*. One column per composer, in order of
+        birth, and each piece you heard at the year it was composed. A piece
+        MusicBrainz gives no year stands at its composer's mid-career, with
+        `dated: false`.
+      operationId: classical_timeline
+      parameters:
+      - name: range
+        in: query
+        description: '`today`, `d7`, `month`, `year` or `all` (default).'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Timeline'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/anniversaries:
+    get:
+      tags:
+      - Statistics
+      summary: Anniversaries among what you listen to.
+      description: |-
+        Scope: `read` *(since v0.132)*. Births and deaths of artists and composers,
+        bands forming and splitting, and albums' releases — round numbers only (10,
+        20, 25, 30 … 100, 75, every 50), from MusicBrainz's dates. Only artists
+        and albums in your own history.
+      operationId: anniversaries
+      parameters:
+      - name: year
+        in: query
+        description: The year to mark; this year, in your timezone, when absent.
+        required: false
+        schema:
+          type: integer
+          format: int32
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Anniversaries'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+  /api/v1/insights/overrides:
+    get:
+      tags:
+      - Statistics
+      summary: Your corrections on one piece, album or artist.
+      description: 'Scope: `read` *(since v0.132)*.'
+      operationId: get_overrides
+      parameters:
+      - name: target_kind
+        in: query
+        description: '`work`, `album` or `artist`.'
+        required: true
+        schema:
+          type: string
+      - name: target_key
+        in: query
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: OK.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OverrideStates'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - read
+      - sessionCookie: []
+    post:
+      tags:
+      - Statistics
+      summary: Correct what kind of listen something is.
+      description: |-
+        Scope: `write` *(since v0.132)*. Yours only: overrides never change what
+        another member of this instance sees. Applied at once, from what Tapedeck
+        already knows — nothing is looked up.
+      operationId: set_override
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OverrideBody'
+        required: true
+      responses:
+        '200':
+          description: Applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OverrideResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+      security:
+      - apiToken:
+        - write
       - sessionCookie: []
   /api/v1/playlist-lab:
     get:
@@ -13543,6 +14207,78 @@ components:
           type: integer
           format: int64
           description: How many different songs of theirs were played at all.
+    Anniversaries:
+      type: object
+      required:
+      - year
+      - items
+      - today
+      - revisit
+      properties:
+        year:
+          type: integer
+          format: int32
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Anniversary'
+          description: |-
+            Round anniversaries this year of artists, composers and albums in your
+            history, most played first.
+        today:
+          type: array
+          items:
+            $ref: '#/components/schemas/Anniversary'
+          description: Birthdays and deathdays falling on today's date.
+        revisit:
+          type: array
+          items:
+            $ref: '#/components/schemas/Anniversary'
+          description: |-
+            Albums with a round anniversary this year that you have not played
+            for half a year — for Rediscovery.
+    Anniversary:
+      type: object
+      required:
+      - kind
+      - name
+      - date
+      - years
+      - living
+      - today
+      - plays
+      - label
+      properties:
+        kind:
+          type: string
+          description: '`born`, `died`, `formed`, `split` or `released`.'
+        name:
+          type: string
+          description: The artist, or the album.
+        artist:
+          type:
+          - string
+          - 'null'
+          description: 'For an album: who it is filed under.'
+        date:
+          type: string
+          description: '`YYYY[-MM[-DD]]`, as MusicBrainz has it.'
+        years:
+          type: integer
+          format: int32
+        living:
+          type: boolean
+          description: 'For a person: alive, as far as MusicBrainz knows.'
+        today:
+          type: boolean
+          description: Falls on today's date (month and day), not only in this year.
+        plays:
+          type: integer
+          format: int64
+          description: Your plays of them, all time.
+        label:
+          type: string
+          description: The sentence to show.
     AnnotationTarget:
       type: object
       description: |-
@@ -13850,6 +14586,8 @@ components:
       - bio
       - stats
       - albums
+      - album_spread
+      - anniversaries
       - top_tracks
       - trend
       properties:
@@ -13927,6 +14665,19 @@ components:
           items:
             $ref: '#/components/schemas/AlbumAggregate'
           description: Up to six records.
+        album_spread:
+          $ref: '#/components/schemas/AlbumSpread'
+          description: |-
+            How their plays split across their records — a catalogue explorer is
+            many slices, a one-album fan one long one. The same figure as the
+            Statistics page's album spread, for this artist alone and all time.
+        anniversaries:
+          type: array
+          items:
+            type: string
+          description: |-
+            Their round anniversaries this year, and a birthday or deathday that
+            falls today: "Maurice Ravel was born 150 years ago".
         top_tracks:
           type: array
           items:
@@ -14566,6 +15317,7 @@ components:
       - kind
       - range
       - rows
+      - split_out
       properties:
         kind:
           type: string
@@ -14577,6 +15329,13 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ChartRow'
+        split_out:
+          type: integer
+          format: int64
+          description: |-
+            Listens in the window left out because they are classical or score
+            and you keep those in their own tabs (preferences `split_classical`,
+            `split_scores`). Zero when you do not.
     ChartRow:
       type: object
       description: |-
@@ -14632,6 +15391,134 @@ components:
           type:
           - string
           - 'null'
+    ClassicalChart:
+      type: object
+      required:
+      - rank
+      - metric
+      - rows
+      - instruments
+      - pending
+      properties:
+        rank:
+          type: string
+        metric:
+          type: string
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/InsightRow'
+        instruments:
+          type: array
+          items:
+            $ref: '#/components/schemas/NamedCount'
+          description: |-
+            Instruments and voices the soloists in this window played, most heard
+            first — the chips under "Soloists".
+        coverage:
+          oneOf:
+          - type: 'null'
+          - $ref: '#/components/schemas/RoleCoverage'
+            description: |-
+              For a performer ranking: how much of the window rests on roles
+              MusicBrainz states, and how much on roles Tapedeck inferred.
+        pending:
+          type: integer
+          format: int64
+          description: |-
+            Listens the classifier has not reached yet. They are in Top Charts
+            until it does.
+    ClassicalShare:
+      type: object
+      required:
+      - name
+      - seconds
+      - plays
+      properties:
+        name:
+          type: string
+        seconds:
+          type: integer
+          format: int64
+        plays:
+          type: integer
+          format: int64
+        count:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Composers or performers behind it, where that is counted.
+    ClassicalStats:
+      type: object
+      required:
+      - seconds
+      - periods
+      - dated
+      - unplaced
+      - forms
+      - years
+      - living
+      - women
+      - composer_countries
+      - performer_countries
+      - range
+      properties:
+        seconds:
+          type: integer
+          format: int64
+        periods:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClassicalShare'
+          description: |-
+            Seconds by Bachtrack's seven periods, by composition year, else the
+            composer's mid-career. `dated` is how many of those seconds were placed
+            by a composition year.
+        dated:
+          type: integer
+          format: int64
+        unplaced:
+          type: integer
+          format: int64
+        forms:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClassicalShare'
+        years:
+          $ref: '#/components/schemas/ClassicalYears'
+        living:
+          $ref: '#/components/schemas/Subset'
+        women:
+          $ref: '#/components/schemas/Subset'
+          description: Women and non-binary composers.
+        composer_countries:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClassicalShare'
+        performer_countries:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClassicalShare'
+        range:
+          type: array
+          items:
+            $ref: '#/components/schemas/RangeRow'
+    ClassicalYears:
+      type: object
+      required:
+      - years
+      - composers
+      properties:
+        years:
+          type: array
+          items:
+            type: integer
+            format: int32
+        composers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ComposerYears'
     ClientRegistered:
       type: object
       description: |-
@@ -14753,6 +15640,87 @@ components:
       - transducer
       - network
       - bluetooth
+    ComposerYears:
+      type: object
+      required:
+      - key
+      - name
+      - plays
+      - anniversaries
+      properties:
+        key:
+          type: string
+        name:
+          type: string
+        plays:
+          type: array
+          items:
+            type: integer
+            format: int64
+          description: Plays per year, aligned with `ClassicalYears::years`.
+        anniversaries:
+          type: array
+          items:
+            $ref: '#/components/schemas/YearMark'
+          description: Round anniversaries inside those years.
+    Composition:
+      type: object
+      required:
+      - months
+      - capped
+      - pending
+      properties:
+        months:
+          type: array
+          items:
+            $ref: '#/components/schemas/CompositionMonth'
+        capped:
+          type: boolean
+          description: |-
+            True when the window holds more listens than this instance reads for
+            analytics, and the oldest months are missing.
+        pending:
+          type: integer
+          format: int64
+    CompositionMonth:
+      type: object
+      required:
+      - month
+      - seconds
+      - classical
+      - score
+      - other
+      - christmas
+      - halloween
+      - easter
+      properties:
+        month:
+          type: string
+          description: '`YYYY-MM`, in your timezone.'
+        seconds:
+          type: integer
+          format: int64
+          description: Every second played. The three bands below add up to it.
+        classical:
+          type: integer
+          format: int64
+        score:
+          type: integer
+          format: int64
+          description: Score and ambient, minus anything already counted as classical.
+        other:
+          type: integer
+          format: int64
+        christmas:
+          type: integer
+          format: int64
+          description: 'Overlays: also inside the bands above.'
+        halloween:
+          type: integer
+          format: int64
+        easter:
+          type: integer
+          format: int64
     Connected:
       type: object
       required:
@@ -15130,6 +16098,27 @@ components:
           type: integer
           format: int64
           description: Unix seconds of the first listen.
+    CurveDay:
+      type: object
+      required:
+      - date
+      - plays
+      - season_plays
+      - share
+      properties:
+        date:
+          type: string
+        plays:
+          type: integer
+          format: int64
+          description: Everything played that day.
+        season_plays:
+          type: integer
+          format: int64
+          description: The season's music among it.
+        share:
+          type: number
+          format: double
     DailyHour:
       type: object
       description: |-
@@ -17686,6 +18675,74 @@ components:
           - integer
           - 'null'
           format: int64
+    InsightRow:
+      type: object
+      description: One row of a Classical, Scores or lens ranking.
+      required:
+      - key
+      - name
+      - plays
+      - seconds
+      properties:
+        key:
+          type: string
+          description: |-
+            What a filter or an expanded row passes back: a piece key, a composer's
+            MBID, a performer's folded name.
+        name:
+          type: string
+        sub:
+          type:
+          - string
+          - 'null'
+          description: 'The secondary line: a piece''s composer, a performer''s instrument.'
+        album:
+          type:
+          - string
+          - 'null'
+        album_artist:
+          type:
+          - string
+          - 'null'
+        plays:
+          type: integer
+          format: int64
+        seconds:
+          type: integer
+          format: int64
+        versions:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: |-
+            Pieces: how many recordings you heard it in. Composers and performers:
+            how many pieces. Songs in a lens: how many artists' versions.
+        hearings:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: 'Complete hearings: every movement in one sitting. Pieces and composers.'
+        inferred:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: 1 where this performer's role was inferred rather than stated.
+        artwork_url:
+          type:
+          - string
+          - 'null'
+        caa_id:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        caa_release_mbid:
+          type:
+          - string
+          - 'null'
     InstancePulse:
       type: object
       description: What the instance has been playing, over shared chains only.
@@ -18257,6 +19314,142 @@ components:
         sessions:
           type: integer
           format: int64
+    LensDetail:
+      type: object
+      required:
+      - id
+      - label
+      - season
+      - starts
+      - ends
+      - in_season
+      - seasons
+      - range
+      - rank
+      - rows
+      - plays
+      - seconds
+      - curve
+      - out_of_season
+      - pending
+      properties:
+        id:
+          type: string
+        label:
+          type: string
+        season:
+          type: integer
+          format: int32
+        starts:
+          type: string
+        ends:
+          type: string
+        in_season:
+          type: boolean
+        seasons:
+          type: array
+          items:
+            type: integer
+            format: int32
+          description: Every season you have listens in, newest first.
+        range:
+          type: string
+        rank:
+          type: string
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/InsightRow'
+        plays:
+          type: integer
+          format: int64
+          description: |-
+            The season's own listens and seconds, and their share of everything
+            you played in it — the same population, both skip-free.
+        seconds:
+          type: integer
+          format: int64
+        share_pct:
+          type:
+          - integer
+          - 'null'
+          format: int64
+        opened:
+          type:
+          - string
+          - 'null'
+          description: |-
+            The day your season opened: the first of three days running when it
+            was at least three times its level in the months before.
+        curve:
+          type: array
+          items:
+            $ref: '#/components/schemas/CurveDay'
+          description: One point per day from just before the season to its end (or today).
+        out_of_season:
+          type: integer
+          format: int64
+          description: Listens carrying it that fell outside every season — "Christmas in July".
+        pending:
+          type: integer
+          format: int64
+    LensList:
+      type: object
+      required:
+      - lenses
+      - classical
+      - score
+      - ambient
+      - pending
+      properties:
+        lenses:
+          type: array
+          items:
+            $ref: '#/components/schemas/LensSummary'
+        classical:
+          type: integer
+          format: int64
+          description: All-time listens in the two split tabs, for their cards on B-Sides.
+        score:
+          type: integer
+          format: int64
+        ambient:
+          type: integer
+          format: int64
+        pending:
+          type: integer
+          format: int64
+    LensSummary:
+      type: object
+      required:
+      - id
+      - label
+      - in_season
+      - season
+      - starts
+      - ends
+      - listens
+      properties:
+        id:
+          type: string
+          description: '`christmas`, `halloween` or `easter`.'
+        label:
+          type: string
+        in_season:
+          type: boolean
+          description: Whether today, in your timezone, is in its season — when a tab shows.
+        season:
+          type: integer
+          format: int32
+          description: 'The season running, or the last one: the year it began.'
+        starts:
+          type: string
+        ends:
+          type: string
+        listens:
+          type: integer
+          format: int64
+          description: All-time listens carrying it.
     LibraryArtStored:
       oneOf:
       - type: object
@@ -20179,6 +21372,17 @@ components:
           format: double
         color:
           type: string
+    NamedCount:
+      type: object
+      required:
+      - name
+      - count
+      properties:
+        name:
+          type: string
+        count:
+          type: integer
+          format: int64
     NeighbourGenre:
       type: object
       description: |-
@@ -20995,6 +22199,66 @@ components:
         logs_enabled:
           type: boolean
           description: File logging is on, so `/admin/logs` has something to show.
+    OverrideBody:
+      type: object
+      required:
+      - target_kind
+      - target_key
+      - facet
+      properties:
+        target_kind:
+          type: string
+          description: |-
+            `work` — a piece or song, every version of it (key: a row's `key`
+            from a lens or Classical, which starts `w:` or `t:`); `album` (key: a
+            Scores suggestion's `key`); or `artist` (key: the artist's name) —
+            everything they are credited on. Broadest first, most specific wins:
+            artist, then album, then piece.
+        target_key:
+          type: string
+        facet:
+          type: string
+          description: |-
+            `classical`, `score`, `ambient`, `christmas`, `halloween`, `easter`
+            or `score_suggested`.
+        value:
+          type:
+          - boolean
+          - 'null'
+          description: |-
+            `true` sets it, `false` clears it, `null` removes your override and
+            returns to what Tapedeck decided. **Required**: an absent `value` is a
+            400, so a client that forgot it cannot quietly undo a correction.
+    OverrideResult:
+      type: object
+      required:
+      - listens
+      properties:
+        listens:
+          type: integer
+          format: int64
+          description: Listens the change touched, already re-applied.
+          minimum: 0
+    OverrideState:
+      type: object
+      required:
+      - facet
+      - value
+      properties:
+        facet:
+          type: string
+        value:
+          type: boolean
+    OverrideStates:
+      type: object
+      required:
+      - overrides
+      properties:
+        overrides:
+          type: array
+          items:
+            $ref: '#/components/schemas/OverrideState'
+          description: Your corrections on that target. Empty means Tapedeck decides.
     PairingApproved:
       type: object
       description: The token, collected.
@@ -21967,6 +23231,22 @@ components:
           type: integer
           format: int64
           description: From `/api/v1/playlist-targets`.
+    PlaylistMade:
+      type: object
+      required:
+      - id
+      - created
+      - tracks
+      properties:
+        id:
+          type: integer
+          format: int64
+        created:
+          type: boolean
+          description: False when this season's playlist already existed and was returned.
+        tracks:
+          type: integer
+          minimum: 0
     PlaylistMatch:
       type: object
       description: A track the search got wrong, and which of its candidates it really is.
@@ -22221,6 +23501,12 @@ components:
         credit_primary:
           type: string
           description: 'Who a classical listen is filed under when MusicBrainz names both the performers and the work''s composer: `performer` (the default) or `composer`. Only reorders who is credited; changing it re-files the MusicBrainz-credited listens in the background.'
+        split_classical:
+          type: boolean
+          description: Keep classical out of Top Charts and rank it in the Classical tab instead. `true` when unset. Statistics, Dashboard and Reports always count everything.
+        split_scores:
+          type: boolean
+          description: Keep film, game and TV score, and ambient, out of Top Charts and in the Scores & Ambient tab. `true` when unset. Songs from soundtracks always stay in Top Charts.
         week_start:
           type: integer
           description: First day of the week, 0 = Sunday … 6 = Saturday. Monday (1) when unset.
@@ -22892,6 +24178,34 @@ components:
           - 'null'
           format: int64
           default: null
+    RangeRow:
+      type: object
+      required:
+      - key
+      - name
+      - role
+      - composers
+      - pieces
+      - plays
+      properties:
+        key:
+          type: string
+        name:
+          type: string
+        role:
+          type: string
+        composers:
+          type: integer
+          format: int64
+          description: |-
+            Distinct composers you heard them play — Bachtrack's "countries
+            visited", for listens.
+        pieces:
+          type: integer
+          format: int64
+        plays:
+          type: integer
+          format: int64
     RangedStats:
       type: object
       description: |-
@@ -23956,6 +25270,25 @@ components:
             type: integer
             format: int64
           description: Credited listens per week, aligned with `Dossier::weeks`.
+    RoleCoverage:
+      type: object
+      description: How much of a classical window the performer charts can speak for.
+      required:
+      - seconds
+      - stated
+      - inferred
+      properties:
+        seconds:
+          type: integer
+          format: int64
+        stated:
+          type: integer
+          format: int64
+          description: Seconds whose performers MusicBrainz states.
+        inferred:
+          type: integer
+          format: int64
+          description: Seconds with roles only Tapedeck inferred.
     RomanLine:
       type: object
       description: One lyric line in Latin letters.
@@ -24499,6 +25832,35 @@ components:
           type: string
         requested:
           type: boolean
+    ScoresChart:
+      type: object
+      required:
+      - section
+      - kind
+      - rows
+      - suggestions
+      - pending
+      properties:
+        section:
+          type: string
+        kind:
+          type: string
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChartRow'
+        suggestions:
+          type: array
+          items:
+            $ref: '#/components/schemas/InsightRow'
+          description: |-
+            Albums that look like score — a soundtrack credited to its composer
+            alone — but are not moved without your word. Confirm one with an
+            `album` override setting `score`; dismiss it by clearing
+            `score_suggested`.
+        pending:
+          type: integer
+          format: int64
     ScrapeProgress:
       type: object
       description: The running or most recent scrape.
@@ -27670,6 +29032,24 @@ components:
       description: |-
         A submit answers one of these: the outcome, or — with `?dry_run` — the
         preview.
+    Subset:
+      type: object
+      required:
+      - seconds
+      - known
+      - composers
+      properties:
+        seconds:
+          type: integer
+          format: int64
+          description: Seconds in the subset, of `known` seconds whose composer is described.
+        known:
+          type: integer
+          format: int64
+        composers:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClassicalShare'
     TapedeckAudio:
       type: object
       description: |-
@@ -28222,6 +29602,76 @@ components:
             and re-grouping silently on a metadata edit would move an identity
             somebody else is holding a reference to. So this reports, and Rebuild
             remains a thing the user asks for.
+    Timeline:
+      type: object
+      required:
+      - composers
+      - pieces
+      - unplaced
+      properties:
+        composers:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimelineComposer'
+          description: Columns, by birth.
+        pieces:
+          type: array
+          items:
+            $ref: '#/components/schemas/TimelinePiece'
+        unplaced:
+          type: integer
+          format: int64
+          description: Pieces with neither a composition year nor a composer's birth year.
+    TimelineComposer:
+      type: object
+      required:
+      - key
+      - name
+      properties:
+        key:
+          type: string
+        name:
+          type: string
+        born:
+          type:
+          - integer
+          - 'null'
+          format: int32
+        died:
+          type:
+          - integer
+          - 'null'
+          format: int32
+    TimelinePiece:
+      type: object
+      required:
+      - key
+      - title
+      - composer
+      - year
+      - dated
+      - plays
+      - seconds
+      properties:
+        key:
+          type: string
+        title:
+          type: string
+        composer:
+          type: string
+        year:
+          type: integer
+          format: int32
+          description: 'Where it stands: the year composed, or the composer''s mid-career.'
+        dated:
+          type: boolean
+          description: True when `year` is the composition year MusicBrainz records.
+        plays:
+          type: integer
+          format: int64
+        seconds:
+          type: integer
+          format: int64
     TokenIssued:
       type: object
       description: An access credential. Served `no-store`.
@@ -29237,6 +30687,15 @@ components:
           description: |-
             Snapshot of the name, so a deleted gear row leaves the variant readable
             instead of blank.
+    Versions:
+      type: object
+      required:
+      - rows
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: '#/components/schemas/InsightRow'
     Vocabulary:
       type: object
       description: Compiled in and read-only.
@@ -29466,6 +30925,17 @@ components:
               $ref: '#/components/schemas/ReaderLine'
             description: Always empty.
       description: The words, or why there are none. Three answers, all of them real.
+    YearMark:
+      type: object
+      required:
+      - year
+      - label
+      properties:
+        year:
+          type: integer
+          format: int32
+        label:
+          type: string
   responses:
     BadRequest:
       description: Malformed or rejected input.

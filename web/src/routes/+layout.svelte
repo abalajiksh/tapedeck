@@ -28,14 +28,22 @@
 	// Pages that share one sidebar entry. Each keeps its own URL; the group
 	// shows a tab strip (SectionTabs) above the page to move between them.
 	type Group = { id: string; label: string; tabs: { href: string; label: string }[] };
-	const GROUPS: Group[] = [
+	// A season's tab comes out while it is on — Christmas from 1 September to
+	// 6 January, Halloween in October, Easter in Holy Week — and lives in
+	// B-Sides the rest of the year. The server decides "on", in your timezone.
+	let seasonal: { href: string; label: string }[] = [];
+	$: GROUPS = [
 		{
 			id: 'insights',
 			label: 'Insights',
 			tabs: [
 				{ href: '/charts', label: 'Top Charts' },
+				{ href: '/classical', label: 'Classical' },
+				{ href: '/scores', label: 'Scores & Ambient' },
+				...seasonal,
 				{ href: '/stats', label: 'Statistics' },
-				{ href: '/reports', label: 'Reports' }
+				{ href: '/reports', label: 'Reports' },
+				{ href: '/b-sides', label: 'B-Sides' }
 			]
 		},
 		{
@@ -155,6 +163,11 @@
 
 				initPrefs();
 				void refreshPatchBadge();
+				try {
+					seasonal = (await api.getLenses()).lenses
+						.filter((l) => l.in_season)
+						.map((l) => ({ href: `/b-sides/${l.id}`, label: l.label }));
+				} catch { /* no seasonal tab is the quiet failure */ }
 
 				// Record the browser timezone once, so analytics use local time.
 				try {

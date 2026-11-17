@@ -1,4 +1,5 @@
 <script lang="ts">
+	import Anniversaries from '$lib/components/Anniversaries.svelte';
 	/**
 	 * Reports — a feed of period cards, newest first.
 	 *
@@ -217,6 +218,9 @@
 		{#key period.key}
 			{#if unit === 'year'}
 				<YearChapter p={period} onShare={() => (sharing = true)} />
+				{#if /^\d{4}$/.test(String(period.label))}
+					<Anniversaries mode="year" year={Number(period.label)} limit={8} />
+				{/if}
 			{:else if unit === 'week'}
 				<WeekChapter p={period} onShare={() => (sharing = true)}>
 					<svelte:fragment slot="blurb">{blurb(period)}</svelte:fragment>

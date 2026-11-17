@@ -53,6 +53,22 @@ impl utoipa::PartialSchema for Preferences {
                 ),
             )
             .property(
+                "split_classical",
+                prop(
+                    Type::Boolean,
+                    "Keep classical out of Top Charts and rank it in the Classical tab instead. \
+                     `true` when unset. Statistics, Dashboard and Reports always count everything.",
+                ),
+            )
+            .property(
+                "split_scores",
+                prop(
+                    Type::Boolean,
+                    "Keep film, game and TV score, and ambient, out of Top Charts and in the Scores & \
+                     Ambient tab. `true` when unset. Songs from soundtracks always stay in Top Charts.",
+                ),
+            )
+            .property(
                 "week_start",
                 prop(Type::Integer, "First day of the week, 0 = Sunday … 6 = Saturday. Monday (1) when unset."),
             )

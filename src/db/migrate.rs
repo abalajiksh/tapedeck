@@ -1446,6 +1446,24 @@ impl Database {
                 .await;
         }
 
+        // What kind of listen each listen is (v0.132.0). Every existing listen
+        // starts undecided (`facets_version` 0) and the classifier backfill
+        // works through them; until it reaches one, it stays in Top Charts —
+        // the safe default, since nothing leaves without evidence.
+        for (col, ddl) in [
+            ("facets", "ALTER TABLE scrobbles ADD COLUMN facets INTEGER NOT NULL DEFAULT 0"),
+            (
+                "facets_version",
+                "ALTER TABLE scrobbles ADD COLUMN facets_version INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("fact_key", "ALTER TABLE scrobbles ADD COLUMN fact_key TEXT"),
+        ] {
+            if !has_column(&self.pool, "scrobbles", col).await {
+                info!("⚙️ Migrating: adding scrobbles.{col}...");
+                let _ = sqlx::query(ddl).execute(&self.pool).await;
+            }
+        }
+
         // The chain an accepted Shared Spool play is filed under. Unset for
         // every account that predates it, which reproduces the old behaviour
         // exactly — those listens carried no chain at all.

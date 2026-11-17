@@ -9,6 +9,7 @@ pub mod everynoise;
 mod export;
 pub mod import;
 pub mod ingest;
+pub mod insights;
 mod lb_api;
 pub mod library;
 mod loves_pull;
@@ -161,6 +162,7 @@ pub fn api_docs() -> Vec<utoipa::openapi::OpenApi> {
         report_image::Api::openapi(),
         report_mixdown::Api::openapi(),
         rediscovery::Api::openapi(),
+        insights::Api::openapi(),
         playlist_lab::Api::openapi(),
         library::Api::openapi(),
         artwork::Api::openapi(),
@@ -219,6 +221,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .merge(physical::create_physical_router())
         .merge(radio::create_radio_router())
         .merge(rediscovery::create_rediscovery_router())
+        .merge(insights::create_insights_router())
         .merge(playlists::create_playlists_router())
         .merge(playlist_lab::create_playlist_lab_router())
         .merge(everynoise::create_everynoise_router())

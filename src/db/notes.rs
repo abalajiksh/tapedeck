@@ -1294,6 +1294,28 @@ impl Database {
         limit: i64,
         by_hours: bool,
     ) -> Result<Vec<ChartRow>, sqlx::Error> {
+        self.chart_filtered(user_id, kind, after, None, limit, by_hours, 0, 0).await
+    }
+
+    /// [`Self::chart`] over a window with an end, and by what kind of listen.
+    ///
+    /// `exclude` drops listens carrying any of those `classify` flags — Top
+    /// Charts passes the listener's splits (classical, score/ambient) here.
+    /// `require` keeps only listens carrying at least one — the Scores tab and
+    /// the seasonal lenses chart that way. Zero means "no condition", so
+    /// `chart` is this with both off.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn chart_filtered(
+        &self,
+        user_id: i64,
+        kind: &str,
+        after: Option<i64>,
+        before: Option<i64>,
+        limit: i64,
+        by_hours: bool,
+        exclude: i64,
+        require: i64,
+    ) -> Result<Vec<ChartRow>, sqlx::Error> {
         // Same reasoning as `get_ranged_stats`: the chart is cut to `limit`
         // rows, so ranking by the chosen metric has to happen in SQL. It also
         // has to agree with Statistics — "See more" hands off from there
@@ -1311,6 +1333,8 @@ impl Database {
                         {COVER_PICK} AS cover_pick
                  FROM scrobbles
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
+                   AND (? IS NULL OR timestamp < ?)
+                   AND (facets & ?) = 0 AND (? = 0 OR (facets & ?) != 0)
                    AND album IS NOT NULL AND TRIM(album) != ''
                  GROUP BY LOWER(TRIM(album)), LOWER(TRIM(COALESCE(album_filed_under, artist)))
                  ORDER BY {order} LIMIT ?"
@@ -1325,6 +1349,8 @@ impl Database {
                         {COVER_PICK} AS cover_pick
                  FROM scrobbles
                  WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
+                   AND (? IS NULL OR timestamp < ?)
+                   AND (facets & ?) = 0 AND (? = 0 OR (facets & ?) != 0)
                  GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
                  ORDER BY {order} LIMIT ?"
                 )
@@ -1344,6 +1370,8 @@ impl Database {
                  JOIN scrobbles s ON s.id = sa.scrobble_id
                  WHERE s.user_id = ? AND s.skipped = FALSE
                    AND (? IS NULL OR s.timestamp >= ?)
+                   AND (? IS NULL OR s.timestamp < ?)
+                   AND (s.facets & ?) = 0 AND (? = 0 OR (s.facets & ?) != 0)
                  GROUP BY sa.artist_key
                  ORDER BY {order} LIMIT ?"
                 )
@@ -1353,6 +1381,11 @@ impl Database {
             .bind(user_id)
             .bind(after)
             .bind(after)
+            .bind(before)
+            .bind(before)
+            .bind(exclude)
+            .bind(require)
+            .bind(require)
             .bind(limit)
             .fetch_all(&self.pool)
             .await?;

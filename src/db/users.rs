@@ -299,6 +299,9 @@ impl Database {
         for table in [
             "notes",
             "loves",
+            // A listener's own corrections to what kind of listen a listen is.
+            // The decisions in `recording_facts` are shared and stay.
+            "facet_overrides",
             // The air log points at a radio session, so it clears first.
             "radio_air_log",
             "radio_sessions",

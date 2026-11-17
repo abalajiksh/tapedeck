@@ -38,6 +38,7 @@
 		{ id: 'account', label: 'Account', hint: 'Password, picture, bio' },
 		{ id: 'sharing', label: 'Sharing', hint: 'Now-playing, and being findable' },
 		{ id: 'appearance', label: 'Appearance', hint: 'Theme and artwork' },
+		{ id: 'insights', label: 'Insights', hint: 'Classical, scores and Top Charts' },
 		{ id: 'time', label: 'Time', hint: 'Timezone and week start' },
 		{ id: 'scrobbling', label: 'Scrobbling', hint: 'When a listen counts' },
 		{ id: 'sources', label: 'Sources', hint: 'Plex, Navidrome, Jellyfin' },
@@ -699,6 +700,11 @@
 	let weekSaved = false;
 	/** Who a classical listen is filed under when MusicBrainz names both. */
 	let creditPrimary: 'performer' | 'composer' = 'performer';
+	/** Whether classical, and score & ambient, keep to their own tabs rather
+	 *  than Top Charts. Both on unless switched off. */
+	let splitClassical = true;
+	let splitScores = true;
+	let splitSaved = false;
 	let creditSaved = false;
 
 	// ── Scrobble threshold ──
@@ -1093,6 +1099,14 @@
 		} catch (e) {
 			discogsMsg = String(e).replace(/^API \d+: /, '');
 		}
+	}
+
+	async function saveSplits() {
+		try {
+			await api.putPreferences({ split_classical: splitClassical, split_scores: splitScores });
+			splitSaved = true;
+			setTimeout(() => (splitSaved = false), 2000);
+		} catch { /* ignore */ }
 	}
 
 	async function saveCreditPrimary() {
@@ -1668,6 +1682,8 @@
 				thresholdSecs = Math.min(3600, Math.max(10, Math.round(prefs.scrobble_threshold_secs)));
 			if (prefs.lyrics_indic_style === 'iso') indicStyle = 'iso';
 			if (prefs.credit_primary === 'composer') creditPrimary = 'composer';
+			if (prefs.split_classical === false) splitClassical = false;
+			if (prefs.split_scores === false) splitScores = false;
 			if (prefs.lyrics_cyrillic_style === 'iso') cyrillicStyle = 'iso';
 		} catch { timezone = 'UTC'; }
 		try { isAdmin = (await api.me()).is_admin; } catch { /* optional */ }
@@ -2432,6 +2448,32 @@
 					</p>
 				</div>
 
+			</div>
+		{/if}
+
+		{#if section === 'insights'}
+			<div class="panel" style="border-radius:22px;padding:24px;margin-bottom:18px;">
+				<h3 class="h-display" style="font-size:19px;margin-bottom:4px;">Their own tabs {#if splitSaved}<span style="color:var(--td-good-fg);font-size:14px;">✓</span>{/if}</h3>
+				<p style="font-size:13px;color:var(--td-muted);margin:0 0 16px;max-width:64ch;">
+					Classical and score are ranked in tabs of their own, where a symphony's four movements
+					count as one piece. Statistics, the Dashboard and Reports always count everything.
+					Only your own Top Charts change.
+				</p>
+				<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;">
+					<input type="checkbox" bind:checked={splitClassical} on:change={saveSplits}
+						style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+					Keep classical out of Top Charts
+				</label>
+				<label style="display:flex;align-items:center;gap:10px;cursor:pointer;font-size:14px;margin-top:10px;">
+					<input type="checkbox" bind:checked={splitScores} on:change={saveSplits}
+						style="width:16px;height:16px;accent-color:var(--td-accent);cursor:pointer;">
+					Keep film, game and TV score, and ambient, out of Top Charts
+				</label>
+				<p style="font-size:12.5px;color:var(--td-muted);margin:12px 0 0;max-width:64ch;">
+					Songs from soundtracks always stay in Top Charts. Christmas, Halloween and Easter never
+					leave them: they get a tab of their own while they're in season, and live in
+					<a href="/b-sides">B-Sides</a> the rest of the year.
+				</p>
 			</div>
 		{/if}
 

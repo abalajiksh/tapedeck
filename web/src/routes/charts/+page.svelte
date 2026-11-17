@@ -28,6 +28,8 @@
 	let range: ChartRange = 'all';
 	let metric: 'plays' | 'hours' = 'plays';
 	let rows: ChartRow[] = [];
+	/** Classical and score left out, because they have tabs of their own. */
+	let splitOut = 0;
 	let loading = true;
 
 	$: rangeWord = timeframes.find((t) => t.k === range)?.word ?? '';
@@ -57,7 +59,9 @@
 	async function load() {
 		loading = true;
 		try {
-			rows = (await api.getChart(kind, range, 100, metric)).rows;
+			const c = await api.getChart(kind, range, 100, metric);
+			rows = c.rows;
+			splitOut = c.split_out ?? 0;
 		} catch (e) {
 			console.warn('charts', e);
 			rows = [];
@@ -98,6 +102,12 @@
 		<p style="margin:6px 0 0;color:var(--td-muted);font-size:15px;">
 			{rows.length ? `${rows.length} charted · ${totalPlays.toLocaleString()} plays ${rangeWord}` : `Nothing charted ${rangeWord}`}
 		</p>
+		{#if splitOut > 0}
+			<p class="split">
+				{splitOut.toLocaleString()} {splitOut === 1 ? 'play' : 'plays'} {rangeWord} live in
+				<a href="/classical">Classical</a> and <a href="/scores">Scores & Ambient</a> instead.
+			</p>
+		{/if}
 	</div>
 	<div style="display:inline-flex;background:var(--td-sidebar);border-radius:999px;padding:3px;gap:2px;">
 		<button class="seg-btn" class:on={metric === 'plays'} on:click={() => setMetric('plays')}>Plays</button>
@@ -175,6 +185,8 @@
 		border-top-color: var(--td-accent); border-radius: 50%;
 		animation: td-spin 0.7s linear infinite;
 	}
+	.split { margin: 4px 0 0; font-size: 12.5px; color: var(--td-muted-2); }
+	.split a { color: var(--td-accent); }
 	.eyebrow {
 		font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
 		color: #c67139; font-weight: 600; margin-bottom: 8px;

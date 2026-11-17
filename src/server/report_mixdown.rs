@@ -257,7 +257,7 @@ async fn fetch_picture(
 /// the export eight seconds and one picture, never the export. Whatever does
 /// not arrive, or is not a picture a frame can draw, is simply not in the map, and the
 /// frame shows the lettered tile under it.
-async fn fetch_art(
+pub(crate) async fn fetch_art(
     state: &Arc<AppState>,
     user: &AuthUser,
     headers: &HeaderMap,

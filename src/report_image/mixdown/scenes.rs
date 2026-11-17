@@ -28,6 +28,10 @@ struct B<'a> {
     art: &'a Art,
     /// The pictures actually drawn, with the largest side each is drawn at.
     used: Vec<(String, u32)>,
+    /// A season's mixdown says "YOUR SEASON", "ARTIST OF THE SEASON". The
+    /// scenes are the year's — a season is a few months, charted by month —
+    /// and only the noun changes.
+    season: Option<&'static str>,
 }
 
 /// The largest size up to `max` at which `text` fits in `room`, never below
@@ -100,6 +104,9 @@ impl B<'_> {
     }
 
     fn unit_upper(&self) -> &'static str {
+        if let Some(name) = self.season {
+            return name;
+        }
         match self.unit {
             Unit::Week => "WEEK",
             Unit::Month => "MONTH",
@@ -514,6 +521,16 @@ fn scene(id: &str, duration_ms: u32, layers: Vec<Layer>) -> Scene {
 }
 
 pub(super) fn build(c: &Card, unit: Unit, theme: Theme, art: &Art) -> Mixdown {
+    build_named(c, unit, theme, art, None)
+}
+
+pub(super) fn build_named(
+    c: &Card,
+    unit: Unit,
+    theme: Theme,
+    art: &Art,
+    season: Option<&'static str>,
+) -> Mixdown {
     let p = theme.palette();
     let colour = period_colour(c.colour.as_deref(), &p);
     let mut b = B {
@@ -525,6 +542,7 @@ pub(super) fn build(c: &Card, unit: Unit, theme: Theme, art: &Art) -> Mixdown {
         covered: true,
         art,
         used: Vec::new(),
+        season,
     };
 
     // The ground: the card's own, so a mixdown and the card it ends on are
@@ -551,7 +569,7 @@ pub(super) fn build(c: &Card, unit: Unit, theme: Theme, art: &Art) -> Mixdown {
         width: WIDTH,
         height: HEIGHT,
         fps: FPS,
-        unit: unit.as_str().to_string(),
+        unit: if season.is_some() { "season".to_string() } else { unit.as_str().to_string() },
         label: c.label.clone(),
         theme: theme.as_str().to_string(),
         background,
