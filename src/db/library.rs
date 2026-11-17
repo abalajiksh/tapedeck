@@ -16,7 +16,7 @@ impl Database {
     ) -> Result<Option<AlbumSummary>, sqlx::Error> {
         let row: Option<AlbumSummary> = sqlx::query_as(&crate::sql!(
             "SELECT COUNT(*) AS plays,
-                    COALESCE(SUM(duration), 0) AS seconds,
+                    CAST(COALESCE(SUM(duration), 0) AS BIGINT) AS seconds,
                     COUNT(DISTINCT LOWER(TRIM(title))) AS track_count,
                     MIN(timestamp) AS first_heard,
                     MAX(timestamp) AS last_heard,
@@ -269,7 +269,7 @@ impl Database {
     ) -> Result<Option<ArtistSummary>, sqlx::Error> {
         let row: Option<ArtistSummary> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT COUNT(*) AS plays,
-                    COALESCE(SUM(duration), 0) AS seconds,
+                    CAST(COALESCE(SUM(duration), 0) AS BIGINT) AS seconds,
                     COUNT(DISTINCT LOWER(TRIM(title))) AS track_count,
                     COUNT(DISTINCT CASE WHEN album IS NOT NULL AND TRIM(album) != ''
                           THEN LOWER(TRIM(album)) END) AS album_count,

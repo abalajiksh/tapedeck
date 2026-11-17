@@ -53,10 +53,22 @@
 //!   `lpad(x::text, 12, '0')`, which [`to_postgres`] now writes for that exact
 //!   shape (found by the v0.132.0 live checks). One site, and it decides
 //!   whether a grouped cover comes from one listen.
+//! * **`SUM` over an integer column is NUMERIC** on Postgres (`SUM(bigint)`
+//!   widens so it cannot overflow), and sqlx will not decode NUMERIC into an
+//!   `i64`. SQLite hands back an integer, so nothing on that side notices.
+//!   Write `CAST(SUM(x) AS BIGINT)` — or `CAST(COALESCE(SUM(x), 0) AS
+//!   BIGINT)` — wherever the sum is read into an integer. `SUM(CASE … THEN 1
+//!   ELSE 0 END)` is fine as it is: the literals are `int4`, whose sum is
+//!   `bigint`. `AVG` of a `REAL` is `double precision` and decodes into `f64`.
+//!   The same goes for a bare integer literal read as `i64`: `0 AS n` is
+//!   `int4`, so write `CAST(0 AS BIGINT)`.
 //! * **DDL**: `AUTOINCREMENT` (56), partial-index and CHECK-rebuild guards read
 //!   out of `sqlite_master` (7), `PRAGMA` (10). All of `schema.rs` and
 //!   `migrate.rs` — the reason those were split out first.
-//! * **`json_each`** (13) → `jsonb_array_elements`.
+//! * **`json_each`** (13) → `jsonb_array_elements`. Over a column holding a
+//!   JSON array (`scrobbles.genres`) [`to_postgres`] now writes
+//!   `json_array_elements_text(CAST(col AS JSON))`; an object column such as
+//!   `signal_chains.components` still needs its own rewrite.
 //! * **`last_insert_rowid()`** (17) → `RETURNING`.
 //! * **`INSERT OR IGNORE` / `OR REPLACE`** (16) → `ON CONFLICT`.
 //! * **`GROUP_CONCAT`** (2) → `string_agg`, **`strftime`** (6), **`datetime(`** (6).
@@ -365,6 +377,13 @@ fn to_postgres(sql: &str, mode: Mode) -> String {
                     i = rest;
                     continue;
                 }
+                if let Some((rest, column)) = json_array_at(sql, i) {
+                    out.push_str("json_array_elements_text(CAST(");
+                    out.push_str(column);
+                    out.push_str(" AS JSON))");
+                    i = rest;
+                    continue;
+                }
                 if let Some((rest, column)) = zero_pad_at(sql, i) {
                     out.push_str("LPAD(CAST(");
                     out.push_str(column);
@@ -431,6 +450,24 @@ fn word_at(sql: &str, i: usize, word: &str) -> Option<usize> {
 fn call_at(sql: &str, i: usize, word: &str) -> Option<usize> {
     let end = word_at(sql, i, word)?;
     (sql.as_bytes().get(end) == Some(&b'(')).then_some(end)
+}
+
+/// `json_each(<column>)` at `i`, as `(end, column)`: a JSON **array** held in
+/// a column, fanned out one row per element. Postgres's
+/// `json_array_elements_text(CAST(x AS JSON))` gives the same rows, and names
+/// its column `value` too, so `g.value` reads the same on both. Only a plain
+/// column argument — anything else is left for Postgres to refuse. SQLite's
+/// `json_each` also walks objects and has `key`/`type` columns; this
+/// translation does neither, and an object column (`signal_chains.components`)
+/// needs a rewrite of its own.
+fn json_array_at(sql: &str, i: usize) -> Option<(usize, &str)> {
+    let open = call_at(sql, i, "json_each")?;
+    let args = &sql[open + 1..];
+    let len = args.bytes().take_while(|c| is_word_byte(*c) || *c == b'.').count();
+    if len == 0 || args.as_bytes().get(len) != Some(&b')') {
+        return None;
+    }
+    Some((open + 1 + len + 1, &args[..len]))
 }
 
 /// `printf('%012d', <column>)` at `i` — [`COVER_PICK`](super::COVER_PICK)'s
@@ -540,6 +577,16 @@ mod tests {
             "SELECT unlike, likeness FROM t"
         );
         assert_eq!(to_postgres("WHERE s = 'LIKE'", Mode::Query), "WHERE s = 'LIKE'");
+    }
+
+    #[test]
+    fn json_each_over_an_array_column_becomes_json_array_elements_text() {
+        assert_eq!(
+            to_postgres("SELECT g.value FROM t, json_each(t.genres) g WHERE x = ?", Mode::Query),
+            "SELECT g.value FROM t, json_array_elements_text(CAST(t.genres AS JSON)) g WHERE x = $1"
+        );
+        // Not a plain column: left alone.
+        assert_eq!(to_postgres("json_each('[1]')", Mode::Query), "json_each('[1]')");
     }
 
     #[test]

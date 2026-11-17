@@ -556,7 +556,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         let totals: Vec<(Option<i64>, Option<i64>)> = sqlx::query_as(&crate::sql!(
-            "SELECT chain_id, SUM(duration) FROM scrobbles
+            "SELECT chain_id, CAST(SUM(duration) AS BIGINT) FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE AND chain_id IS NOT NULL
               GROUP BY chain_id"
         ))
@@ -722,7 +722,7 @@ impl Database {
         // Both bindings are held: `crate::sql!` borrows, so the translated
         // statement cannot outlive the string it was built from.
         let raw = format!(
-            "SELECT chain_id, chain_variant_id, {era} AS era, SUM(duration)
+            "SELECT chain_id, chain_variant_id, CAST({era} AS BIGINT) AS era, CAST(SUM(duration) AS BIGINT)
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE AND chain_id IS NOT NULL
               GROUP BY chain_id, chain_variant_id, era"
