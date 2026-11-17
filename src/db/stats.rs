@@ -153,11 +153,16 @@ impl Database {
         // `SUM(duration)` is NULL for listens whose source reported no length,
         // so it is coalesced to 0; those sort last under Hours, which is right
         // — an unknown running time is not a large one.
-        let order = if by_hours { "COALESCE(secs, 0) DESC, plays DESC" } else { "plays DESC" };
+        // The aggregate rather than its alias: Postgres takes an output column
+        // name in ORDER BY only on its own, never inside an expression.
+        // Unqualified `duration` is the listen's in all three queries
+        // (`scrobble_artists` has none).
+        let order =
+            if by_hours { "COALESCE(SUM(duration), 0) DESC, plays DESC" } else { "plays DESC" };
         let plays: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let total = plays.0;
 
-        let secs: (Option<i64>,) = sqlx::query_as(&crate::sql!("SELECT SUM(duration) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND duration IS NOT NULL")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
+        let secs: (Option<i64>,) = sqlx::query_as(&crate::sql!("SELECT CAST(SUM(duration) AS BIGINT) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?) AND duration IS NOT NULL")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
         let hours = secs.0.unwrap_or(0) as f64 / 3600.0;
         // Hours is a sum over the listens that *have* a length, so it is a floor
         // rather than a total — a source that reported no duration contributes
@@ -251,7 +256,7 @@ impl Database {
         // same question on two screens, and the whole reason the handoff
         // between them exists is that they must not disagree.
         let top_rows: Vec<(String, i64, Option<i64>)> = sqlx::query_as(&crate::sql!(&format!(
-            "SELECT MAX(sa.name) AS artist, COUNT(*) as plays, SUM(s.duration) as secs
+            "SELECT MAX(sa.name) AS artist, COUNT(*) as plays, CAST(SUM(s.duration) AS BIGINT) as secs
              FROM scrobble_artists sa
              JOIN scrobbles s ON s.id = sa.scrobble_id
              WHERE s.user_id = ? AND s.skipped = FALSE AND (? IS NULL OR s.timestamp >= ?)
@@ -281,7 +286,7 @@ impl Database {
         let album_rows: Vec<(String, String, i64, Option<i64>)> =
             sqlx::query_as(&crate::sql!(&format!(
                 "SELECT MAX(album), MAX(COALESCE(album_filed_under, artist)), COUNT(*) as plays,
-                    SUM(duration) as secs
+                    CAST(SUM(duration) AS BIGINT) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                AND album IS NOT NULL AND album != ''
              GROUP BY LOWER(TRIM(album)), LOWER(TRIM(COALESCE(album_filed_under, artist)))
@@ -316,9 +321,9 @@ impl Database {
             i64,
             Option<i64>,
         )> = sqlx::query_as(&crate::sql!(&format!(
-            "SELECT title, artist, MAX(artist_credit) AS artist_credit, MAX(album) AS album,
+            "SELECT MAX(title), MAX(artist), MAX(artist_credit) AS artist_credit, MAX(album) AS album,
                     MAX(COALESCE(album_filed_under, artist)) AS album_artist,
-                    COUNT(*) as plays, SUM(duration) as secs
+                    COUNT(*) as plays, CAST(SUM(duration) AS BIGINT) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)) ORDER BY {} LIMIT 50",
             order
@@ -401,7 +406,7 @@ impl Database {
         // of listens, and cannot be read as "40% of what I played was rock".
         // Tombstoned rows (`[]`) contribute nothing and drop out naturally.
         let genre_rows: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(
-            "SELECT g.value AS name, COUNT(*) AS c
+            "SELECT MAX(g.value) AS name, COUNT(*) AS c
                FROM scrobbles s, json_each(s.genres) g
               WHERE s.user_id = ? AND s.skipped = FALSE
                 AND (? IS NULL OR s.timestamp >= ?) AND s.genres IS NOT NULL

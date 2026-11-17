@@ -1063,4 +1063,183 @@ mod tests {
         assert!(db.delete_user(member).await.unwrap_or_else(die("delete_user")));
         drop(db);
     }
+
+    /// The older readers that sum a duration into an integer: the Dashboard,
+    /// Statistics, album and artist pages, sessions, chains, gear and the
+    /// Shelf. On Postgres `SUM(bigint)` is NUMERIC and will not decode into an
+    /// `i64`; `a_listen_survives_a_round_trip_through_postgres` never saw it
+    /// because its one listen has no duration, so every sum was NULL and NULL
+    /// is never type-checked. Every listen here has a length.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn duration_sums_decode_on_postgres() {
+        let url = fresh("sums").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(|e| panic!("Database::new: {}", crate::logging::error_chain(&e)));
+        let uid = db
+            .setup_admin("tester", None, "not-a-real-hash")
+            .await
+            .unwrap_or_else(die("setup_admin"));
+        let chain = insert_chain(&db, uid, "Desk").await;
+        let now = chrono::Utc::now().timestamp();
+
+        for (i, title) in ["Xtal", "Tha", "Xtal", "Pulsewidth"].iter().enumerate() {
+            let mut play = crate::models::Play::new(
+                title.to_string(),
+                "Aphex Twin".into(),
+                (now - 3_600 + i as i64 * 300) as u64,
+                format!("pg-sums-{i}"),
+                "test".into(),
+            );
+            play.album = Some("Selected Ambient Works 85-92".into());
+            play.duration = Some(240);
+            db.save_scrobble(
+                uid,
+                &play,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap_or_else(die("save_scrobble"));
+        }
+        sqlx::query(
+            "UPDATE scrobbles SET chain_id = $1, quality_score = 0.75, genres = '[\"ambient\",\"idm\"]'
+              WHERE user_id = $2",
+        )
+            .bind(chain)
+            .bind(uid)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(die("chain and quality"));
+        db.rebuild_sessions(uid, 1800).await.unwrap_or_else(die("rebuild_sessions"));
+        let session: i64 =
+            sqlx::query_scalar("SELECT MAX(session_id) FROM scrobbles WHERE user_id = $1")
+                .bind(uid)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap_or_else(die("session id"));
+        assert!(db.recompute_session(session).await.unwrap_or_else(die("recompute_session")));
+
+        let dash = db
+            .get_dashboard_stats(uid, chrono_tz::Tz::UTC, 1)
+            .await
+            .unwrap_or_else(|e| panic!("get_dashboard_stats: {}", crate::logging::error_chain(&e)));
+        println!("dashboard: {}", serde_json::to_value(&dash).unwrap());
+        for (after, by_hours) in [(None, false), (Some(0), true)] {
+            let ranged = db.get_ranged_stats(uid, after, by_hours).await.unwrap_or_else(|e| {
+                panic!("get_ranged_stats {by_hours}: {}", crate::logging::error_chain(&e))
+            });
+            let v = serde_json::to_value(&ranged).unwrap();
+            println!(
+                "ranged (hours={by_hours}): {}",
+                v.to_string().chars().take(400).collect::<String>()
+            );
+        }
+        let album = db
+            .album_summary(uid, "Aphex Twin", "Selected Ambient Works 85-92")
+            .await
+            .unwrap_or_else(die("album_summary"))
+            .expect("the album has listens");
+        assert_eq!((album.plays, album.seconds), (4, 960));
+        let artist = db
+            .artist_summary(uid, "Aphex Twin")
+            .await
+            .unwrap_or_else(die("artist_summary"))
+            .expect("the artist has listens");
+        assert_eq!((artist.plays, artist.seconds), (4, 960));
+        let genres = db.genre_play_counts(uid, None).await.unwrap_or_else(die("genre_play_counts"));
+        assert_eq!(genres.len(), 2, "{genres:?}");
+        assert_eq!(genres[0].1, 4);
+        db.artists_by_genre(uid).await.unwrap_or_else(die("artists_by_genre"));
+        db.listening_coverage(uid).await.unwrap_or_else(die("listening_coverage"));
+        db.recording_mbid_coverage(uid).await.unwrap_or_else(die("recording_mbid_coverage"));
+
+        // ── Chains, gear and the Shelf ──
+        //
+        // These also hit two Postgres gaps that are not about sums: JSON
+        // columns (`signal_chains.components`, `chain_variants.overrides`) are
+        // `json` on Postgres and decoded into `String` — the gap
+        // `insert_returning_id` describes — and the Shelf sorts with SQLite's
+        // `COLLATE NOCASE`. Those two errors are tolerated, and named; anything
+        // else (a NUMERIC sum above all) fails. The chain and gear readers stop
+        // at their first query on the JSON gap, so their sums go unchecked here
+        // until it is closed.
+        fn known_gap<T>(what: &str, r: Result<T, sqlx::Error>) -> Option<T> {
+            match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    let m = crate::logging::error_chain(&e);
+                    assert!(
+                        m.contains("SQL type `JSON`") || m.contains("collation \"nocase\""),
+                        "{what}: {m}"
+                    );
+                    println!("{what}: known gap — {m}");
+                    None
+                }
+            }
+        }
+        if let Some(chains) = known_gap("get_chains", db.get_chains(uid).await) {
+            println!("chain hours: {:?}", chains.iter().map(|c| c.total_hours).collect::<Vec<_>>());
+        }
+        known_gap("list_variants", db.list_variants(uid).await);
+        known_gap("near_duplicate_chains", db.near_duplicate_chains(uid).await);
+        known_gap("equipment_seconds", db.equipment_seconds(uid).await);
+        let equipment = insert_returning_id(
+            &db,
+            &format!("INSERT INTO equipment (user_id, name, type) VALUES ({uid}, 'Stylus', 'cartridge') RETURNING id"),
+        )
+        .await;
+        known_gap("get_equipment", db.get_equipment(uid).await);
+
+        let release = db
+            .create_physical(
+                uid,
+                "vinyl",
+                "Aphex Twin",
+                "Selected Ambient Works 85-92",
+                Some(1992),
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(die("create_physical"));
+        db.record_physical_play(
+            uid,
+            release,
+            "A",
+            now - 600,
+            1_200,
+            5,
+            Some(equipment),
+            Some(chain),
+        )
+        .await
+        .unwrap_or_else(die("record_physical_play"));
+        known_gap("list_physical", db.list_physical(uid, None).await);
+        known_gap("get_physical", db.get_physical(uid, release).await);
+        let sides = db.side_plays(uid, release).await.unwrap_or_else(die("side_plays"));
+        assert_eq!(sides.len(), 1);
+        let (hours, n) = db
+            .equipment_playback_hours(uid, equipment)
+            .await
+            .unwrap_or_else(die("equipment_playback_hours"));
+        assert_eq!(n, 1);
+        assert!((hours - 1_200.0 / 3_600.0).abs() < 1e-9, "{hours}");
+        drop(db);
+    }
 }

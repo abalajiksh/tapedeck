@@ -457,7 +457,7 @@ impl Database {
         let agg: Option<(i64, Option<i64>, Option<i64>, Option<i64>, Option<f64>)> =
             sqlx::query_as(&crate::sql!(
                 "SELECT COUNT(*), MIN(timestamp), MAX(timestamp + COALESCE(duration, 0)),
-                        SUM(COALESCE(duration, 0)), AVG(quality_score)
+                        CAST(SUM(COALESCE(duration, 0)) AS BIGINT), AVG(quality_score)
                  FROM scrobbles WHERE session_id = ?",
             ))
             .bind(session_id)
