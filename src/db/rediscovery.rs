@@ -450,33 +450,62 @@ impl Database {
         equipment_id: i64,
         limit: i64,
     ) -> Result<Vec<RediscoveryRow>, sqlx::Error> {
-        let mut rows: Vec<RediscoveryRow> = sqlx::query_as(&crate::sql!(&format!(
-            "SELECT title AS name, artist, MAX(album) AS album, COUNT(*) AS plays,
-                    MAX(timestamp) AS last_played,
-                    {COVER_PICK} AS cover_pick
-               FROM scrobbles s
-              WHERE s.user_id = ? AND s.skipped = FALSE
-                AND NOT EXISTS (
+        // The chains this gear is a step of, among those the listens were
+        // filed under. Read in Rust, as `equipment_seconds` does, rather than
+        // walked in SQL: `json_each` + `json_extract` over the components is
+        // SQLite's spelling only, and chains are tens of rows.
+        let chains: Vec<(i64, String)> = sqlx::query_as(&crate::sql!(
+            "SELECT id, components FROM signal_chains
+              WHERE id IN (SELECT DISTINCT chain_id FROM scrobbles
+                            WHERE user_id = ? AND skipped = FALSE AND chain_id IS NOT NULL)"
+        ))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let on_gear: Vec<i64> = chains
+            .into_iter()
+            .filter(|(_, json)| {
+                serde_json::from_str::<Vec<ChainComponent>>(json)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|c| c.equipment_id == Some(equipment_id))
+            })
+            .map(|(id, _)| id)
+            .collect();
+        // A track heard on any of those chains is not "never on this gear".
+        // No chain has it: nothing is excluded.
+        let heard_on_it = if on_gear.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "AND NOT EXISTS (
                       SELECT 1 FROM scrobbles s2
-                        JOIN signal_chains c ON c.id = s2.chain_id
                        WHERE s2.user_id = s.user_id AND s2.skipped = FALSE
                          AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
                          AND LOWER(TRIM(s2.artist)) = LOWER(TRIM(s.artist))
-                         AND EXISTS (
-                               SELECT 1 FROM json_each(c.components) j
-                                WHERE json_extract(j.value, '$.equipment_id') = ?
-                             )
-                    )
+                         AND s2.chain_id IN ({})
+                    )",
+                vec!["?"; on_gear.len()].join(", ")
+            )
+        };
+        let raw = format!(
+            "SELECT MAX(title) AS name, MAX(artist) AS artist, MAX(album) AS album,
+                    COUNT(*) AS plays, MAX(timestamp) AS last_played,
+                    {COVER_PICK} AS cover_pick
+               FROM scrobbles s
+              WHERE s.user_id = ? AND s.skipped = FALSE
+                {heard_on_it}
               GROUP BY LOWER(TRIM(s.title)), LOWER(TRIM(s.artist))
              HAVING COUNT(*) > 1
               ORDER BY COUNT(*) DESC
               LIMIT ?"
-        )))
-        .bind(user_id)
-        .bind(equipment_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+        );
+        let stmt = crate::sql!(&raw);
+        let mut q = sqlx::query_as::<_, RediscoveryRow>(&stmt).bind(user_id);
+        for id in &on_gear {
+            q = q.bind(id);
+        }
+        let mut rows = q.bind(limit).fetch_all(&self.pool).await?;
         rows.iter_mut().for_each(|r| r.resolve_cover());
         Ok(rows)
     }

@@ -269,6 +269,115 @@ async fn trajectory_periods_follow_the_listeners_offset() {
     );
 }
 
+/// "Never on this gear": tracks heard more than once, none of those times
+/// through a chain that has the gear as a step. Finds the chains in Rust now
+/// (Postgres has no `json_each` over objects); this holds it to the answers
+/// of the SQLite query it replaced. `pg_live` runs the same case on Postgres.
+#[tokio::test]
+async fn never_on_gear_reads_the_chains_components() {
+    let db = testdb().await;
+    let me = db.setup_admin("tester", None, "x").await.unwrap();
+
+    let gear: i64 = sqlx::query_scalar(
+        "INSERT INTO equipment (user_id, name, type) VALUES (?, 'Stylus', 'cartridge') RETURNING id",
+    )
+    .bind(me)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let chain = |components: String| {
+        let db = &db;
+        async move {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO signal_chains (user_id, name, components, created_at)
+                 VALUES (?, ?, ?, 0) RETURNING id",
+            )
+            .bind(me)
+            .bind(format!("chain-{}", components.len()))
+            .bind(components)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            id
+        }
+    };
+    let with_gear = chain(format!(
+        r#"[{{"type":"source","name":"Turntable","detail":null}},
+            {{"type":"transducer","name":"Stylus","detail":null,"equipment_id":{gear}}}]"#
+    ))
+    .await;
+    let without = chain(r#"[{"type":"dac","name":"E30","detail":null}]"#.to_string()).await;
+    // (title, chain): X twice without the gear, Y once with it, Z once,
+    // W twice on no chain at all.
+    for (i, (title, on)) in [
+        ("X", Some(without)),
+        ("X", Some(without)),
+        ("Y", Some(without)),
+        ("Y", Some(with_gear)),
+        ("Z", Some(without)),
+        ("W", None),
+        ("W", None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let p = crate::models::Play::new(
+            title.into(),
+            "Artist".into(),
+            1_700_000_000 + i as u64 * 600,
+            format!("gear-{i}"),
+            "test".into(),
+        );
+        db.save_scrobble(me, &p, None, None, None, None, None, None, None, Default::default())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE scrobbles SET chain_id = ? WHERE source_id = ?")
+            .bind(on)
+            .bind(format!("gear-{i}"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let names = |rows: Vec<crate::db::RediscoveryRow>| {
+        let mut n: Vec<String> = rows.into_iter().map(|r| r.name).collect();
+        n.sort();
+        n
+    };
+    let got = names(db.never_on_gear(me, gear, 50).await.unwrap());
+    assert_eq!(got, ["W", "X"], "Y was heard on the gear once; Z only once at all");
+    // Gear on no chain: every track heard more than once.
+    let nowhere = names(db.never_on_gear(me, gear + 1_000, 50).await.unwrap());
+    assert_eq!(nowhere, ["W", "X", "Y"]);
+
+    // The query this replaced, verbatim (SQLite's `json_each` +
+    // `json_extract`): the new code must answer exactly as it did.
+    let old: Vec<(String,)> = sqlx::query_as(
+        "SELECT title AS name FROM scrobbles s
+          WHERE s.user_id = ? AND s.skipped = FALSE
+            AND NOT EXISTS (
+                  SELECT 1 FROM scrobbles s2
+                    JOIN signal_chains c ON c.id = s2.chain_id
+                   WHERE s2.user_id = s.user_id AND s2.skipped = FALSE
+                     AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
+                     AND LOWER(TRIM(s2.artist)) = LOWER(TRIM(s.artist))
+                     AND EXISTS (
+                           SELECT 1 FROM json_each(c.components) j
+                            WHERE json_extract(j.value, '$.equipment_id') = ?
+                         )
+                )
+          GROUP BY LOWER(TRIM(s.title)), LOWER(TRIM(s.artist))
+         HAVING COUNT(*) > 1",
+    )
+    .bind(me)
+    .bind(gear)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let mut old: Vec<String> = old.into_iter().map(|r| r.0).collect();
+    old.sort();
+    assert_eq!(old, got, "the replaced json_each query answered differently");
+}
+
 /// A grouped row's cover has to come from **one listen**.
 ///
 /// Reported 2026-08-21: a Cœur de pirate record wore a 5-CD compilation's

@@ -73,8 +73,9 @@
 //!   comparison (v0.132.1).
 //! * **`json_each`** (13) → `jsonb_array_elements`. Over a column holding a
 //!   JSON array (`scrobbles.genres`) [`to_postgres`] now writes
-//!   `json_array_elements_text(CAST(col AS JSON))`; an object column such as
-//!   `signal_chains.components` still needs its own rewrite.
+//!   `json_array_elements_text(CAST(col AS JSON))`. The one walk over objects
+//!   (`never_on_gear` over `signal_chains.components`) now reads the chains in
+//!   Rust, as `equipment_seconds` does; no SQL in the tree walks objects.
 //! * **`last_insert_rowid()`** (17) → `RETURNING`.
 //! * **`INSERT OR IGNORE` / `OR REPLACE`** (16) → `ON CONFLICT`.
 //! * **`GROUP_CONCAT`** (2) → `string_agg`, **`strftime`** (6), **`datetime(`** (6).
@@ -549,8 +550,8 @@ fn nocase_rewrite(out: &mut String) -> bool {
 /// its column `value` too, so `g.value` reads the same on both. Only a plain
 /// column argument — anything else is left for Postgres to refuse. SQLite's
 /// `json_each` also walks objects and has `key`/`type` columns; this
-/// translation does neither, and an object column (`signal_chains.components`)
-/// needs a rewrite of its own.
+/// translation does neither — read an object column in Rust instead, as
+/// `never_on_gear` and `equipment_seconds` do.
 fn json_array_at(sql: &str, i: usize) -> Option<(usize, &str)> {
     let open = call_at(sql, i, "json_each")?;
     let args = &sql[open + 1..];

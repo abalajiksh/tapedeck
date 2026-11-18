@@ -741,6 +741,92 @@ mod tests {
         );
     }
 
+    /// "Never on this gear" on Postgres, which has no `json_each` over a
+    /// chain's components: the same case and answers as
+    /// `db::tests::never_on_gear_reads_the_chains_components`.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn never_on_gear_answers_as_sqlite_does() {
+        let url = fresh("never_on_gear").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new"));
+        let me = db.setup_admin("tester", None, "x").await.unwrap_or_else(die("setup_admin"));
+
+        let gear: i64 = sqlx::query_scalar(
+            "INSERT INTO equipment (user_id, name, type) VALUES ($1, 'Stylus', 'cartridge') RETURNING id",
+        )
+        .bind(me)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap_or_else(die("equipment"));
+        let chain = |components: String| {
+            let db = &db;
+            async move {
+                let id: i64 = sqlx::query_scalar(
+                    "INSERT INTO signal_chains (user_id, name, components, created_at)
+                     VALUES ($1, $2, $3, 0) RETURNING id",
+                )
+                .bind(me)
+                .bind(format!("chain-{}", components.len()))
+                .bind(components)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap_or_else(die("chain"));
+                id
+            }
+        };
+        let with_gear = chain(format!(
+            r#"[{{"type":"source","name":"Turntable","detail":null}},
+                {{"type":"transducer","name":"Stylus","detail":null,"equipment_id":{gear}}}]"#
+        ))
+        .await;
+        let without = chain(r#"[{"type":"dac","name":"E30","detail":null}]"#.to_string()).await;
+        // (title, chain): X twice without the gear, Y once with it, Z once,
+        // W twice on no chain at all.
+        for (i, (title, on)) in [
+            ("X", Some(without)),
+            ("X", Some(without)),
+            ("Y", Some(without)),
+            ("Y", Some(with_gear)),
+            ("Z", Some(without)),
+            ("W", None),
+            ("W", None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let p = crate::models::Play::new(
+                title.into(),
+                "Artist".into(),
+                1_700_000_000 + i as u64 * 600,
+                format!("gear-{i}"),
+                "test".into(),
+            );
+            db.save_scrobble(me, &p, None, None, None, None, None, None, None, Default::default())
+                .await
+                .unwrap_or_else(die("save_scrobble"));
+            sqlx::query("UPDATE scrobbles SET chain_id = $1 WHERE source_id = $2")
+                .bind(on)
+                .bind(format!("gear-{i}"))
+                .execute(&db.pool)
+                .await
+                .unwrap_or_else(die("chain_id"));
+        }
+        let names = |rows: Vec<crate::db::RediscoveryRow>| {
+            let mut n: Vec<String> = rows.into_iter().map(|r| r.name).collect();
+            n.sort();
+            n
+        };
+        let got = names(db.never_on_gear(me, gear, 50).await.unwrap_or_else(die("never_on_gear")));
+        assert_eq!(got, ["W", "X"], "Y was heard on the gear once; Z only once at all");
+        // Gear on no chain: every track heard more than once.
+        let nowhere = names(
+            db.never_on_gear(me, gear + 1_000, 50).await.unwrap_or_else(die("never_on_gear")),
+        );
+        assert_eq!(nowhere, ["W", "X", "Y"]);
+    }
+
     /// `chain_bindings`' columns (name, type, nullability) and foreign keys
     /// (name, definition), both sorted — column order differs after an
     /// `ADD COLUMN` and means nothing.
