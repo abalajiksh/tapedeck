@@ -13591,3 +13591,23 @@ async fn loved_but_unplayed_lists_a_loved_track_with_its_cover() {
     assert_eq!(rows[0].album.as_deref(), Some("Drukqs"));
     assert_eq!(rows[0].artwork_url.as_deref(), Some("https://covers.test/drukqs.jpg"));
 }
+
+/// Tied chart rows rank by their key, so a rank does not depend on the
+/// `LIMIT` — the API's fourth row and the page's fourth row are one artist.
+/// `pg_live::chart_ties_rank_the_same_at_any_limit` holds Postgres to it.
+#[tokio::test]
+async fn chart_ties_rank_by_key_at_any_limit() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    for (i, artist) in ["Hh", "Bb", "Gg", "Aa", "Ff", "Cc", "Ee", "Dd"].iter().enumerate() {
+        let p = play("One", artist, 1_700_000_000 + i as u64 * 60);
+        db.save_scrobble(uid, &p, None, None, None, None, None, None, None, Default::default())
+            .await
+            .unwrap();
+    }
+    let names = |rows: Vec<ChartRow>| -> Vec<String> { rows.into_iter().map(|r| r.name).collect() };
+    let short = names(db.top_chart(uid, "artists", None, 4, false, 0).await.unwrap());
+    let long = names(db.top_chart(uid, "artists", None, 50, false, 0).await.unwrap());
+    assert_eq!(short, long[..4]);
+    assert_eq!(long, ["Aa", "Bb", "Cc", "Dd", "Ee", "Ff", "Gg", "Hh"]);
+}

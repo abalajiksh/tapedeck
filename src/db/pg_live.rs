@@ -1849,4 +1849,68 @@ mod tests {
         }
         drop(db);
     }
+
+    /// A chart ranks tied rows the same whatever its `LIMIT`. Postgres hands
+    /// ties back in whatever order its sort left them, which differed between
+    /// the API's `LIMIT 4` and the page's longer list (tapedeck-pr build 28).
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn chart_ties_rank_the_same_at_any_limit() {
+        let url = fresh("chart_ties").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new"));
+        let uid = db
+            .setup_admin("tester", None, "not-a-real-hash")
+            .await
+            .unwrap_or_else(die("setup_admin"));
+        let now = chrono::Utc::now().timestamp();
+        for (i, artist) in ["Hh", "Bb", "Gg", "Aa", "Ff", "Cc", "Ee", "Dd"].iter().enumerate() {
+            let play = crate::models::Play::new(
+                "One".into(),
+                artist.to_string(),
+                (now - 3_600 + i as i64 * 60) as u64,
+                format!("pg-tie-{i}"),
+                "test".into(),
+            );
+            db.save_scrobble(
+                uid,
+                &play,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap_or_else(die("save_scrobble"));
+        }
+        for kind in ["artists", "tracks"] {
+            let names = |rows: Vec<crate::db::ChartRow>| -> Vec<String> {
+                rows.into_iter().map(|r| r.sub.unwrap_or(r.name)).collect()
+            };
+            let short = names(
+                db.top_chart(uid, kind, None, 4, false, 0).await.unwrap_or_else(die("top_chart 4")),
+            );
+            let long = names(
+                db.top_chart(uid, kind, None, 50, false, 0)
+                    .await
+                    .unwrap_or_else(die("top_chart 50")),
+            );
+            assert_eq!(
+                short,
+                long[..4],
+                "{kind}: the first four differ between LIMIT 4 and LIMIT 50"
+            );
+            assert_eq!(
+                long,
+                ["Aa", "Bb", "Cc", "Dd", "Ee", "Ff", "Gg", "Hh"],
+                "{kind}: ties break on the key"
+            );
+        }
+        drop(db);
+    }
 }

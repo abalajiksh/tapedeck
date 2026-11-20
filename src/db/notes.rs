@@ -1325,6 +1325,10 @@ impl Database {
         // carrying its metric, and landing on a differently-ranked list would
         // be the exact inconsistency that handoff exists to remove.
         let order = if by_hours { "seconds DESC, plays DESC" } else { "plays DESC" };
+        // Each branch then breaks ties on its group key. Without it Postgres
+        // returned tied rows in a different order for `LIMIT 4` than for the
+        // page's limit, so the API's fourth artist sat on the page's podium
+        // (e2e on Postgres, tapedeck-pr build 28).
         // Every branch selects the same shape so the caller doesn't care which
         // ran. `sub` is the secondary line (an album's artist), null for artists.
         // `seconds` is cast because Postgres widens `SUM(bigint)` to NUMERIC,
@@ -1342,7 +1346,7 @@ impl Database {
                    AND (facets & ?) = 0 AND (? = 0 OR (facets & ?) != 0)
                    AND album IS NOT NULL AND TRIM(album) != ''
                  GROUP BY LOWER(TRIM(album)), LOWER(TRIM(COALESCE(album_filed_under, artist)))
-                 ORDER BY {order} LIMIT ?"
+                 ORDER BY {order}, LOWER(TRIM(album)), LOWER(TRIM(COALESCE(album_filed_under, artist))) LIMIT ?"
                 )
             }
             "tracks" => {
@@ -1357,7 +1361,7 @@ impl Database {
                    AND (? IS NULL OR timestamp < ?)
                    AND (facets & ?) = 0 AND (? = 0 OR (facets & ?) != 0)
                  GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
-                 ORDER BY {order} LIMIT ?"
+                 ORDER BY {order}, LOWER(TRIM(title)), LOWER(TRIM(artist)) LIMIT ?"
                 )
             }
             _ => {
@@ -1378,7 +1382,7 @@ impl Database {
                    AND (? IS NULL OR s.timestamp < ?)
                    AND (s.facets & ?) = 0 AND (? = 0 OR (s.facets & ?) != 0)
                  GROUP BY sa.artist_key
-                 ORDER BY {order} LIMIT ?"
+                 ORDER BY {order}, sa.artist_key LIMIT ?"
                 )
             }
         };
