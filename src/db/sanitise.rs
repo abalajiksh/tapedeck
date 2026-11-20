@@ -137,7 +137,7 @@ impl Database {
         user_id: i64,
     ) -> Result<Vec<FeaturedArtist>, sqlx::Error> {
         let rows: Vec<(String, i64)> = sqlx::query_as(&crate::sql!(
-            "SELECT artist, COUNT(*) AS plays FROM scrobbles
+            "SELECT MAX(artist), COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
              GROUP BY LOWER(TRIM(artist)) ORDER BY plays DESC"
         ))

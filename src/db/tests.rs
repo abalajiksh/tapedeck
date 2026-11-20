@@ -13561,3 +13561,33 @@ async fn kinds_of_listen_leave_top_charts_and_fill_their_own_tabs() {
     // A member's overrides go with them.
     db.delete_user(uid).await.unwrap();
 }
+
+/// "Loved, but hardly ever played" lists a loved track with its plays and
+/// the cover its listens carried.
+///
+/// The query read `artwork_url`, `caa_id` and `caa_release_mbid` from a CTE
+/// that only holds the packed `cover_pick`, so it failed on every call, and
+/// the Rediscovery handler's `unwrap_or_default()` turned that into an empty
+/// card. Found while porting the grouped queries to Postgres (v0.132.3).
+#[tokio::test]
+async fn loved_but_unplayed_lists_a_loved_track_with_its_cover() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let mut p = play("Avril 14th", "Aphex Twin", 1_700_000_000);
+    p.album = Some("Drukqs".into());
+    db.save_scrobble(uid, &p, None, None, None, None, None, None, None, Default::default())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE scrobbles SET artwork_url = 'https://covers.test/drukqs.jpg'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let e = db.upsert_entity("recording", "Avril 14th", "Aphex Twin", None).await.unwrap();
+    db.set_love(uid, e, true).await.unwrap();
+
+    let rows = db.loved_but_unplayed(uid, 10).await.expect("the query runs");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].plays, 1);
+    assert_eq!(rows[0].album.as_deref(), Some("Drukqs"));
+    assert_eq!(rows[0].artwork_url.as_deref(), Some("https://covers.test/drukqs.jpg"));
+}

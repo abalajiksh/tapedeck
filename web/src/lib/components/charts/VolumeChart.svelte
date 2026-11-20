@@ -89,7 +89,7 @@
 				{#if hover !== null}
 					<line x1={xScale(hover + 0.5)} x2={xScale(hover + 0.5)} y1="0" y2={h} class="cross" />
 				{/if}
-				<rect x="0" y="0" {width} height={h} fill="transparent" role="presentation"
+				<rect x="0" y="0" width={Math.max(width, 0)} height={h} fill="transparent" role="presentation"
 					on:pointermove={(e) => move(e, xScale.invert)}
 					on:pointerleave={() => (hover = null)} />
 			</Svg>

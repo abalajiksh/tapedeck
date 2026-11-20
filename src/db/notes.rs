@@ -438,7 +438,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
-            "SELECT title, artist, COUNT(*) AS n FROM scrobbles
+            "SELECT MAX(title) AS title, MAX(artist) AS artist, COUNT(*) AS n FROM scrobbles
               WHERE user_id = ? AND skipped = TRUE
               GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))
               ORDER BY n DESC, title ASC
@@ -535,16 +535,17 @@ impl Database {
         // saying `is_lossless: false` about a FLAC knows something the codec
         // does not, and this pass must not overrule it any more than ingest
         // does.
+        use super::dialect::Int32;
         type Row = (
             i64,
             String,
-            Option<i32>,
-            Option<i32>,
-            Option<i16>,
+            Int32,
+            Int32,
+            Int32,
             Option<bool>,
             Option<bool>,
             Option<String>,
-            Option<i16>,
+            Int32,
             Option<i64>,
         );
         let rows: Vec<Row> = sqlx::query_as(&crate::sql!(
@@ -581,13 +582,13 @@ impl Database {
         {
             let mut q = AudioQuality {
                 codec: Some(codec),
-                sample_rate,
-                bitrate,
-                bit_depth,
+                sample_rate: sample_rate.0,
+                bitrate: bitrate.0,
+                bit_depth: bit_depth.0.and_then(|b| i16::try_from(b).ok()),
                 is_lossless,
                 is_transcoded,
                 delivery_codec,
-                dsd_multiplier,
+                dsd_multiplier: dsd_multiplier.0.and_then(|m| i16::try_from(m).ok()),
                 dsd_rate,
                 ..Default::default()
             };
@@ -622,12 +623,12 @@ impl Database {
         let rows: Vec<(
             i64,
             String,
-            Option<i32>,
-            Option<i32>,
-            Option<i16>,
+            super::dialect::Int32,
+            super::dialect::Int32,
+            super::dialect::Int32,
             Option<bool>,
             Option<String>,
-            Option<i32>,
+            super::dialect::Int32,
         )> = sqlx::query_as(&crate::sql!(
             "SELECT id, codec, sample_rate, bitrate, bit_depth, is_transcoded,
                         delivery_codec, delivery_bitrate
@@ -658,12 +659,12 @@ impl Database {
         {
             let mut q = AudioQuality {
                 codec: Some(codec),
-                sample_rate,
-                bitrate,
-                bit_depth,
+                sample_rate: sample_rate.0,
+                bitrate: bitrate.0,
+                bit_depth: bit_depth.0.and_then(|b| i16::try_from(b).ok()),
                 is_transcoded,
                 delivery_codec,
-                delivery_bitrate,
+                delivery_bitrate: delivery_bitrate.0,
                 ..Default::default()
             };
             q.classify_codec();
@@ -1054,7 +1055,9 @@ impl Database {
                     SELECT MIN(chain_variant_id) AS chain_variant_id
                       FROM scrobbles
                      WHERE session_id = ?2 AND chain_variant_id IS NOT NULL
-               ) sv
+               -- `ON TRUE`: SQLite takes a join with no condition, Postgres
+               -- does not.
+               ) sv ON TRUE
                LEFT JOIN chain_variants v ON v.id = sv.chain_variant_id
               WHERE s.user_id = ?1 AND s.id = ?2",
         ))
@@ -1894,7 +1897,8 @@ impl Database {
         Ok(keys)
     }
     pub async fn is_loved(&self, user_id: i64, entity_id: i64) -> Result<bool, sqlx::Error> {
-        let row: Option<(i64,)> =
+        // `i32`: a bare `1` is INT4 on Postgres, and sqlx will not widen it.
+        let row: Option<(i32,)> =
             sqlx::query_as(&crate::sql!("SELECT 1 FROM loves WHERE user_id = ? AND entity_id = ?"))
                 .bind(user_id)
                 .bind(entity_id)
@@ -1931,17 +1935,16 @@ impl Database {
     /// themselves are keyed by — see `Database::entity_key`, and keep the two in
     /// step or hearts and rows stop matching with nothing to show for it.
     ///
-    /// The bare `artwork_url` / `caa_id` columns beside `MAX(timestamp)` are
-    /// deliberate: SQLite guarantees those come from the row that produced the
-    /// max, so a row's cover is the one its *most recent* listen carried. That
-    /// is a documented min/max special case, not an accident of grouping.
+    /// A row's cover is [`COVER_PICK`]'s — the newest listen that carried one,
+    /// all three columns from that one listen, as on the charts and the album
+    /// page — and its album is the newest listen's that named one.
     pub async fn loves_detailed(&self, user_id: i64) -> Result<Vec<LovedEntity>, sqlx::Error> {
         let loves = self.list_loves(user_id).await?;
         if loves.is_empty() {
             return Ok(Vec::new());
         }
 
-        type Agg = (String, i64, i64, Option<String>, Option<i64>, Option<String>, Option<String>);
+        type Agg = (String, i64, i64, Option<String>, Option<String>);
 
         // Recordings and releases differ only in which column names the thing.
         let mut by_key: HashMap<
@@ -1952,7 +1955,8 @@ impl Database {
             let rows: Vec<Agg> = sqlx::query_as(&crate::sql!(&format!(
                 "SELECT LOWER(TRIM(artist)) || '|' || LOWER(TRIM({name_col})) AS k,
                         COUNT(*) AS plays, MAX(timestamp) AS last_played,
-                        artwork_url, caa_id, caa_release_mbid, album
+                        {COVER_PICK} AS cover_pick,
+                        MAX(printf('%012d', timestamp) || CHAR(31) || album) AS album_pick
                    FROM scrobbles
                   WHERE user_id = ? AND skipped = FALSE
                     AND {name_col} IS NOT NULL AND TRIM({name_col}) != ''
@@ -1961,19 +1965,35 @@ impl Database {
             .bind(user_id)
             .fetch_all(&self.pool)
             .await?;
-            for (k, plays, last, art, caa, caa_mbid, album) in rows {
-                by_key.insert(format!("{kind}|{k}"), (plays, last, art, caa, caa_mbid, album));
+            // Bare columns beside `MAX(timestamp)` used to carry these, which
+            // SQLite answers from the max row and Postgres refuses outright
+            // (found by the e2e suite on Postgres, v0.132.2).
+            for (k, plays, last, cover_pick, album_pick) in rows {
+                let c = Cover::parse(cover_pick.as_deref());
+                let album = album_pick
+                    .as_deref()
+                    .and_then(|p| p.split_once('\u{1f}'))
+                    .map(|(_, a)| a.to_string());
+                by_key.insert(
+                    format!("{kind}|{k}"),
+                    (plays, last, c.artwork_url, c.caa_id, c.caa_release_mbid, album),
+                );
             }
         }
         let artist_rows: Vec<(String, i64, i64, Option<String>)> = sqlx::query_as(&crate::sql!(
-            "SELECT LOWER(TRIM(s.artist)) AS k, COUNT(*) AS plays, MAX(s.timestamp) AS last_played,
+            // Grouped first, so the picture's subquery reads the grouped key:
+            // Postgres refuses `LOWER(TRIM(s.artist))` there as an ungrouped
+            // outer column (e2e on Postgres, v0.132.2).
+            "SELECT g.k, g.plays, g.last_played,
                     (SELECT COALESCE(p.url, a.image_url) FROM artists a
                        LEFT JOIN artist_pictures p
                          ON p.artist_id = a.id AND p.user_id = ? AND p.kind = 'portrait'
-                      WHERE a.name_key = LOWER(TRIM(s.artist)))
-               FROM scrobbles s
-              WHERE s.user_id = ? AND s.skipped = FALSE AND TRIM(s.artist) != ''
-              GROUP BY k",
+                      WHERE a.name_key = g.k)
+               FROM (SELECT LOWER(TRIM(s.artist)) AS k, COUNT(*) AS plays,
+                            MAX(s.timestamp) AS last_played
+                       FROM scrobbles s
+                      WHERE s.user_id = ? AND s.skipped = FALSE AND TRIM(s.artist) != ''
+                      GROUP BY LOWER(TRIM(s.artist))) g",
         ))
         // The viewer's own pick first — the subquery's `?` comes before the
         // `WHERE`'s, so the same id is bound twice in that order.

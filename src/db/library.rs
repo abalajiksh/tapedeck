@@ -51,13 +51,16 @@ impl Database {
         album: &str,
     ) -> Result<Vec<(String, i64, Option<i64>, Option<i64>)>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(
-            "SELECT title, COUNT(*) AS plays, MAX(duration) AS duration,
+            // Aggregates throughout, not bare `title` / `track_number`: Postgres
+            // refuses an ungrouped column (and an output alias inside an ORDER
+            // BY expression) where SQLite picks a row.
+            "SELECT MAX(title) AS title, COUNT(*) AS plays, MAX(duration) AS duration,
                     MIN(track_number) AS track_number
                FROM scrobbles
               WHERE user_id = ? AND skipped = FALSE
                 AND LOWER(TRIM(COALESCE(album_filed_under, artist))) = ? AND LOWER(TRIM(COALESCE(album, ''))) = ?
               GROUP BY LOWER(TRIM(title))
-              ORDER BY track_number IS NULL, track_number ASC, LOWER(TRIM(title)) ASC"
+              ORDER BY MIN(track_number) IS NULL, MIN(track_number) ASC, LOWER(TRIM(title)) ASC"
         ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
@@ -95,46 +98,52 @@ impl Database {
         artist: &str,
         album: &str,
     ) -> Result<Vec<TrackAggregate>, sqlx::Error> {
+        // Grouped in a derived table, and the per-track subqueries compare
+        // with its grouped key and with the binds. SQLite let them reach the
+        // outer row's ungrouped `title`, `user_id` and album artist; Postgres
+        // refuses an ungrouped outer column, and does not count
+        // `LOWER(TRIM(s.title))` as grouped inside a subquery (e2e on
+        // Postgres, v0.132.2). The `WHERE` pins the user and album artist to
+        // the binds already, so the rows are the same.
         sqlx::query_as(&crate::sql!(
-            "SELECT title,
-                    COUNT(*) AS plays,
-                    MAX(duration) AS duration,
-                    MIN(track_number) AS track_number,
-                    NULL AS album,
-                    MAX(artist_credit) AS artist_credit,
-                    (SELECT s2.format_type FROM scrobbles s2 WHERE s2.user_id = s.user_id
-                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
-                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = LOWER(TRIM(COALESCE(s.album_filed_under, s.artist)))
+            "SELECT t.title, t.plays, t.duration, t.track_number, NULL AS album, t.artist_credit,
+                    (SELECT s2.format_type FROM scrobbles s2 WHERE s2.user_id = ?1
+                       AND LOWER(TRIM(s2.title)) = t.title_key
+                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = ?2
                        AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS format_type,
-                    (SELECT s2.codec FROM scrobbles s2 WHERE s2.user_id = s.user_id
-                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
-                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = LOWER(TRIM(COALESCE(s.album_filed_under, s.artist)))
+                    (SELECT s2.codec FROM scrobbles s2 WHERE s2.user_id = ?1
+                       AND LOWER(TRIM(s2.title)) = t.title_key
+                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = ?2
                        AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS codec,
-                    (SELECT s2.bit_depth FROM scrobbles s2 WHERE s2.user_id = s.user_id
-                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
-                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = LOWER(TRIM(COALESCE(s.album_filed_under, s.artist)))
+                    (SELECT s2.bit_depth FROM scrobbles s2 WHERE s2.user_id = ?1
+                       AND LOWER(TRIM(s2.title)) = t.title_key
+                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = ?2
                        AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS bit_depth,
-                    (SELECT s2.sample_rate FROM scrobbles s2 WHERE s2.user_id = s.user_id
-                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
-                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = LOWER(TRIM(COALESCE(s.album_filed_under, s.artist)))
+                    (SELECT s2.sample_rate FROM scrobbles s2 WHERE s2.user_id = ?1
+                       AND LOWER(TRIM(s2.title)) = t.title_key
+                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = ?2
                        AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS sample_rate,
-                    (SELECT s2.dsd_multiplier FROM scrobbles s2 WHERE s2.user_id = s.user_id
-                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
-                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = LOWER(TRIM(COALESCE(s.album_filed_under, s.artist)))
+                    (SELECT s2.dsd_multiplier FROM scrobbles s2 WHERE s2.user_id = ?1
+                       AND LOWER(TRIM(s2.title)) = t.title_key
+                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = ?2
                        AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS dsd_multiplier,
-                    (SELECT s2.delivery_codec FROM scrobbles s2 WHERE s2.user_id = s.user_id
-                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
-                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = LOWER(TRIM(COALESCE(s.album_filed_under, s.artist)))
+                    (SELECT s2.delivery_codec FROM scrobbles s2 WHERE s2.user_id = ?1
+                       AND LOWER(TRIM(s2.title)) = t.title_key
+                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = ?2
                        AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS delivery_codec,
-                    (SELECT s2.is_lossless FROM scrobbles s2 WHERE s2.user_id = s.user_id
-                       AND LOWER(TRIM(s2.title)) = LOWER(TRIM(s.title))
-                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = LOWER(TRIM(COALESCE(s.album_filed_under, s.artist)))
+                    (SELECT s2.is_lossless FROM scrobbles s2 WHERE s2.user_id = ?1
+                       AND LOWER(TRIM(s2.title)) = t.title_key
+                       AND LOWER(TRIM(COALESCE(s2.album_filed_under, s2.artist))) = ?2
                        AND s2.skipped = FALSE ORDER BY s2.timestamp DESC LIMIT 1) AS is_lossless
-             FROM scrobbles s
-             WHERE user_id = ? AND skipped = FALSE
-               AND LOWER(TRIM(COALESCE(album_filed_under, artist))) = ? AND LOWER(TRIM(album)) = ?
-             GROUP BY LOWER(TRIM(title))
-             ORDER BY plays DESC, track_number ASC"
+             FROM (SELECT LOWER(TRIM(title)) AS title_key, MAX(title) AS title,
+                          COUNT(*) AS plays, MAX(duration) AS duration,
+                          MIN(track_number) AS track_number, MAX(artist_credit) AS artist_credit
+                     FROM scrobbles
+                    WHERE user_id = ?1 AND skipped = FALSE
+                      AND LOWER(TRIM(COALESCE(album_filed_under, artist))) = ?2
+                      AND LOWER(TRIM(album)) = ?3
+                    GROUP BY LOWER(TRIM(title))) t
+             ORDER BY t.plays DESC, t.track_number ASC"
         ))
         .bind(user_id)
         .bind(artist.trim().to_lowercase())
@@ -217,7 +226,7 @@ impl Database {
         cap: i64,
     ) -> Result<(Vec<crate::dossier::Listen>, Vec<crate::dossier::Credit>, bool), sqlx::Error> {
         let key = artist.trim().to_lowercase();
-        let mut rows: Vec<(i64, i32, Option<String>, Option<i32>)> =
+        let mut rows: Vec<(i64, i32, Option<String>, super::dialect::Int32)> =
             sqlx::query_as(&crate::sql!(&format!(
                 "SELECT s.timestamp, CASE WHEN {CREDITS_ARTIST} THEN 1 ELSE 0 END,
                         s.album, s.track_number
@@ -251,7 +260,7 @@ impl Database {
                     ts,
                     mine: mine != 0,
                     album,
-                    track_number,
+                    track_number: track_number.0,
                 })
                 .collect(),
             credits
@@ -318,7 +327,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<TrackAggregate>, sqlx::Error> {
         sqlx::query_as(&crate::sql!(&format!(
-            "SELECT title,
+            "SELECT MAX(title) AS title,
                     COUNT(*) AS plays,
                     MAX(duration) AS duration,
                     MIN(track_number) AS track_number,
@@ -331,7 +340,7 @@ impl Database {
                     MAX(sample_rate) AS sample_rate,
                     MAX(dsd_multiplier) AS dsd_multiplier,
                     MAX(delivery_codec) AS delivery_codec,
-                    MAX(is_lossless) AS is_lossless
+                    {LOSSLESS_ANY} AS is_lossless
              FROM scrobbles s
              WHERE user_id = ? AND skipped = FALSE AND {CREDITS_ARTIST}
              GROUP BY LOWER(TRIM(title))

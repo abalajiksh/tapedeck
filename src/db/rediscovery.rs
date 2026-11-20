@@ -252,9 +252,10 @@ impl Database {
                     p.album AS album,
                     COALESCE(p.plays, 0) AS plays,
                     p.last_played AS last_played,
-                    p.artwork_url AS artwork_url,
-                    p.caa_id AS caa_id,
-                    p.caa_release_mbid AS caa_release_mbid
+                    -- The pick, which `resolve_cover` unpacks. This read three
+                    -- columns `played` does not have, so the query failed on
+                    -- both backends and the card was always empty.
+                    p.cover_pick AS cover_pick
                FROM loves l
                JOIN entities e ON e.id = l.entity_id
                -- LEFT, because a love whose track is not in the history at all

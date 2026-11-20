@@ -512,11 +512,13 @@ impl Database {
         .execute(&self.pool)
         .await?;
         // `last_insert_rowid` is meaningless after an upsert that updated, so
-        // the id is read back by the key that decided it.
+        // the id is read back by the key that decided it. `=` and the NULL
+        // arm, not SQLite's null-safe `IS ?`: Postgres takes only NULL, TRUE
+        // or FALSE after `IS` and refused the statement (e2e on Postgres).
         let row: (i64,) = sqlx::query_as(&crate::sql!(
             "SELECT id FROM physical_images
               WHERE release_id = ? AND provider = ?
-                AND (remote_id IS ? OR (remote_id IS NULL AND ? IS NULL))
+                AND (remote_id = ? OR (remote_id IS NULL AND ? IS NULL))
               ORDER BY id DESC LIMIT 1"
         ))
         .bind(release_id)
@@ -971,7 +973,7 @@ impl Database {
         user_id: i64,
     ) -> Result<Vec<SplitAttribution>, sqlx::Error> {
         let rows: Vec<(String, String, String, i64)> = sqlx::query_as(&crate::sql!(
-            "SELECT title, album, artist, COUNT(*) AS plays FROM scrobbles
+            "SELECT MAX(title), MAX(album), MAX(artist), COUNT(*) AS plays FROM scrobbles
              WHERE user_id = ? AND skipped = FALSE
                AND album IS NOT NULL AND TRIM(album) != ''
              GROUP BY LOWER(TRIM(title)), LOWER(TRIM(album)), LOWER(TRIM(artist))"
@@ -1297,17 +1299,22 @@ impl Database {
         after: Option<i64>,
         limit: i64,
     ) -> Result<Vec<(i64, String, String, Option<String>, Option<i32>)>, sqlx::Error> {
-        sqlx::query_as(&crate::sql!(
-            "SELECT timestamp, artist, title, album, track_number FROM scrobbles
-             WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
-             ORDER BY timestamp DESC LIMIT ?"
-        ))
-        .bind(user_id)
-        .bind(after)
-        .bind(after)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
+        let rows: Vec<(i64, String, String, Option<String>, super::dialect::Int32)> =
+            sqlx::query_as(&crate::sql!(
+                "SELECT timestamp, artist, title, album, track_number FROM scrobbles
+                 WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
+                 ORDER BY timestamp DESC LIMIT ?"
+            ))
+            .bind(user_id)
+            .bind(after)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(ts, artist, title, album, n)| (ts, artist, title, album, n.0))
+            .collect())
     }
     /// Listens still needing a language, newest first. (id, title, album, mbid_recording)
     pub async fn scrobbles_needing_language(
@@ -1360,7 +1367,7 @@ impl Database {
         let (n,): (i64,) = sqlx::query_as(&crate::sql!(&format!(
             "SELECT COUNT(*) FROM (
                SELECT 1 FROM scrobbles WHERE {}
-                GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)))",
+                GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist))) wanting",
             Self::language_queue_predicate()
         )))
         .fetch_one(&self.pool)

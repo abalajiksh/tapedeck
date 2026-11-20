@@ -100,24 +100,32 @@ pub struct ScrobbleRecord {
     pub format_type: Option<String>,
     pub codec: Option<String>,
     /// kbps.
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub bitrate: Option<i32>,
     /// Hz.
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub sample_rate: Option<i32>,
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub bit_depth: Option<i32>,
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub channels: Option<i32>,
     pub container: Option<String>,
     pub source_quality: Option<String>,
     pub is_lossless: Option<bool>,
     /// Hz.
     pub dsd_rate: Option<i64>,
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub dsd_multiplier: Option<i32>,
     pub dsd_to_pcm_converted: Option<bool>,
     /// Set only on a genuine transcode.
     pub delivery_codec: Option<String>,
     /// kbps.
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub delivery_bitrate: Option<i32>,
     /// Hz.
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub delivery_sample_rate: Option<i32>,
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub delivery_bit_depth: Option<i32>,
     pub is_transcoded: Option<bool>,
     pub transcode_reason: Option<String>,
@@ -137,6 +145,7 @@ pub struct ScrobbleRecord {
     /// From the resolved chain.
     pub listening_context: Option<String>,
     pub submission_client: Option<String>,
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub track_number: Option<i32>,
     /// Empty string is a tombstone, same idea as `caa_id: -1`.
     pub artwork_url: Option<String>,
@@ -381,6 +390,7 @@ pub struct AlbumSummary {
     pub track_count: i64,
     pub first_heard: Option<i64>,
     pub last_heard: Option<i64>,
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub year: Option<i32>,
 }
 
@@ -402,6 +412,7 @@ pub struct TrackAggregate {
     pub title: String,
     pub plays: i64,
     pub duration: Option<i64>,
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub track_number: Option<i32>,
     /// Set on artist top-tracks (where the album varies), null on an album page.
     pub album: Option<String>,
@@ -416,8 +427,11 @@ pub struct TrackAggregate {
     pub artist: Option<String>,
     pub format_type: Option<String>,
     pub codec: Option<String>,
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub bit_depth: Option<i32>,
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub sample_rate: Option<i32>,
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub dsd_multiplier: Option<i32>,
     pub delivery_codec: Option<String>,
     pub is_lossless: Option<bool>,
@@ -431,6 +445,7 @@ pub struct AlbumAggregate {
     #[sqlx(default)]
     pub artist: Option<String>,
     pub plays: i64,
+    #[sqlx(try_from = "crate::db::dialect::Int32")]
     pub year: Option<i32>,
     /// A cover, from one of the listens counted.
     // Filled from `cover_pick` after the query, never selected directly —
@@ -1655,6 +1670,14 @@ mod credit_tests {
 pub const FIDELITY_KNOWN: &str = "(COALESCE(format_type, '') = 'dsd' \
      OR is_lossless IS NOT NULL \
      OR COALESCE(codec, '') != '')";
+
+/// Whether any listen in a group was lossless — `MAX(is_lossless)` on SQLite,
+/// where a boolean is an integer. Postgres has no `max(boolean)`, so it is
+/// spelled with integers both backends share; NULL when no listen said, as
+/// `MAX` was, and the comparison hands back a boolean on Postgres and 0/1 on
+/// SQLite, both of which decode into `Option<bool>`.
+pub const LOSSLESS_ANY: &str = "(MAX(CASE WHEN is_lossless = TRUE THEN 1 \
+     WHEN is_lossless = FALSE THEN 0 END) = 1)";
 
 impl Database {
     pub async fn new(database_url: &str, secrets: Arc<SecretBox>) -> Result<Self, sqlx::Error> {

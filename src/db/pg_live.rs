@@ -341,10 +341,9 @@ mod tests {
         let chain = insert_chain(&db, me, "Desk").await;
         db.set_chain_shared(me, chain, true).await.unwrap_or_else(die("set_chain_shared"));
         db.live_visibility(me, Some(chain)).await.unwrap_or_else(die("live_visibility"));
-        // `instance_pulse` also counts `shared = TRUE`, but stops first on
-        // `GROUP_CONCAT`, another gap `dialect.rs` lists. Reported only.
-        let pulse = db.instance_pulse(0).await;
-        println!("instance_pulse: {:?}", pulse.map(|_| ()).map_err(|e| e.to_string()));
+        // `instance_pulse` also counts `shared = TRUE` (its `GROUP_CONCAT` is
+        // spelled per backend since v0.132.3).
+        db.instance_pulse(0).await.unwrap_or_else(die("instance_pulse"));
         db.request_patch(bob, me).await.unwrap_or_else(die("request_patch"));
         // A new account starts open (`create_user` writes 1), so close it
         // first to see both values come back.
@@ -1610,6 +1609,244 @@ mod tests {
             .unwrap_or_else(die("equipment_playback_hours"));
         assert_eq!(n, 1);
         assert!((hours - 1_200.0 / 3_600.0).abs() < 1e-9, "{hours}");
+        drop(db);
+    }
+
+    /// Every read the e2e suite found failing on Postgres at v0.132.2, called
+    /// through the function the handler calls, over listens that carry what
+    /// the failures needed: audio columns, a track number, a release year, a
+    /// skip, a love, a shared chain, a shelf scan.
+    ///
+    /// Four families, all silent on SQLite: an `INTEGER` column (`BIGINT` here)
+    /// read into an `i32`; a bare `1` (`INT4` here) read into an `i64`; a bare
+    /// column beside an aggregate, and `max(boolean)`, `GROUP_CONCAT` and
+    /// `IS ?`, which Postgres does not have.
+    #[tokio::test]
+    #[ignore = "needs TAPEDECK_TEST_POSTGRES_URL and a reachable server"]
+    async fn the_reads_the_e2e_suite_found_failing_answer_on_postgres() {
+        let url = fresh("e2e_reads").await;
+        let db = Database::new(&url, Arc::new(SecretBox::test_key()))
+            .await
+            .unwrap_or_else(die("Database::new"));
+        let uid = db
+            .setup_admin("tester", None, "not-a-real-hash")
+            .await
+            .unwrap_or_else(die("setup_admin"));
+        let other = insert_returning_id(
+            &db,
+            "INSERT INTO users (username, password_hash, role, created_at)
+             VALUES ('neighbour', 'x', 'user', 0) RETURNING id",
+        )
+        .await;
+        let now = chrono::Utc::now().timestamp();
+
+        let listens = [
+            (uid, "Xtal", 1, false),
+            (uid, "Tha", 2, false),
+            (uid, "Xtal", 1, false),
+            (uid, "Pulsewidth", 3, true),
+            (other, "Xtal", 1, false),
+        ];
+        for (i, (user, title, n, skipped)) in listens.iter().enumerate() {
+            let mut play = crate::models::Play::new(
+                title.to_string(),
+                "Aphex Twin".into(),
+                (now - 3_600 + i as i64 * 300) as u64,
+                format!("pg-e2e-{i}"),
+                "test".into(),
+            );
+            play.album = Some("Selected Ambient Works 85-92".into());
+            play.duration = Some(240);
+            play.track_number = Some(*n);
+            db.save_scrobble(
+                *user,
+                &play,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Default::default(),
+            )
+            .await
+            .unwrap_or_else(die("save_scrobble"));
+            if *skipped {
+                sqlx::query("UPDATE scrobbles SET skipped = TRUE WHERE source_id = $1")
+                    .bind(format!("pg-e2e-{i}"))
+                    .execute(&db.pool)
+                    .await
+                    .unwrap_or_else(die("skip"));
+            }
+        }
+        sqlx::query(
+            "UPDATE scrobbles SET codec = 'flac', bitrate = 1411, sample_rate = 44100,
+                    bit_depth = 16, channels = 2, is_lossless = TRUE, release_year = 1992,
+                    artwork_url = 'https://covers.test/saw.jpg'",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap_or_else(die("audio columns"));
+        // The neighbour's listens go through a shared chain, which is what
+        // Patch reads.
+        let shared = insert_chain(&db, other, "Lounge").await;
+        sqlx::query("UPDATE signal_chains SET shared = TRUE WHERE id = $1")
+            .bind(shared)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(die("share chain"));
+        sqlx::query("UPDATE scrobbles SET chain_id = $1 WHERE user_id = $2")
+            .bind(shared)
+            .bind(other)
+            .execute(&db.pool)
+            .await
+            .unwrap_or_else(die("chain the neighbour"));
+
+        // `INTEGER` → `BIGINT`, read into `i32`.
+        let history = db
+            .get_recent_scrobbles(uid, 50, 0, None, None, None, None, None, None)
+            .await
+            .unwrap_or_else(die("get_recent_scrobbles (History, export)"));
+        assert!(history.iter().any(|r| r.bitrate == Some(1411) && r.track_number == Some(1)));
+        let album = db
+            .album_summary(uid, "Aphex Twin", "Selected Ambient Works 85-92")
+            .await
+            .unwrap_or_else(die("album_summary"))
+            .expect("the album has plays");
+        assert_eq!(album.year, Some(1992));
+        let tracks = db
+            .album_tracks(uid, "Aphex Twin", "Selected Ambient Works 85-92")
+            .await
+            .unwrap_or_else(die("album_tracks"));
+        assert_eq!(tracks.first().map(|t| (t.title.as_str(), t.plays)), Some(("Xtal", 2)));
+        assert_eq!(tracks.first().and_then(|t| t.sample_rate), Some(44100));
+        let albums = db
+            .artist_albums(uid, "Aphex Twin", None, 10)
+            .await
+            .unwrap_or_else(die("artist_albums"));
+        assert_eq!(albums.first().and_then(|a| a.year), Some(1992));
+        let (rows, _, _) = db
+            .artist_dossier_rows(uid, "Aphex Twin", 100)
+            .await
+            .unwrap_or_else(die("artist_dossier_rows"));
+        assert!(rows.iter().any(|l| l.track_number == Some(2)));
+        let rows = db
+            .get_listen_rows(uid, None, 100)
+            .await
+            .unwrap_or_else(die("get_listen_rows (personality)"));
+        assert_eq!(rows.len(), 3, "skips are not listens");
+
+        // Bare columns beside aggregates, and `max(boolean)`.
+        db.tracks_with_split_attribution(uid)
+            .await
+            .unwrap_or_else(die("tracks_with_split_attribution (sanitiser)"));
+        db.loved_but_unplayed(uid, 10).await.unwrap_or_else(die("loved_but_unplayed"));
+        let top = db
+            .artist_top_tracks(uid, "Aphex Twin", 10)
+            .await
+            .unwrap_or_else(die("artist_top_tracks"));
+        assert_eq!(
+            top.first().map(|t| (t.title.as_str(), t.plays, t.is_lossless)),
+            Some(("Xtal", 2, Some(true)))
+        );
+        let list = db
+            .album_track_list(uid, "Aphex Twin", "Selected Ambient Works 85-92")
+            .await
+            .unwrap_or_else(die("album_track_list (lyric reader)"));
+        assert_eq!(list.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["Xtal", "Tha"]);
+        let skipped = db.most_skipped(uid, 10).await.unwrap_or_else(die("most_skipped"));
+        assert_eq!(skipped, [("Pulsewidth".to_string(), "Aphex Twin".to_string(), 1)]);
+        db.artists_with_featured_credits(uid)
+            .await
+            .unwrap_or_else(die("artists_with_featured_credits (sanitiser)"));
+        let (decks, _) = db
+            .patch_artist_context(uid, "Aphex Twin")
+            .await
+            .unwrap_or_else(die("patch_artist_context"));
+        assert_eq!(
+            decks.iter().map(|d| d.plays).collect::<Vec<_>>(),
+            [1],
+            "the neighbour's one shared play"
+        );
+
+        // `GROUP_CONCAT`, and `0 AS mine` read into an `i64`.
+        db.patch_artists(uid, 10, None).await.unwrap_or_else(die("patch_artists"));
+        db.count_tracks_wanting_language()
+            .await
+            .unwrap_or_else(die("count_tracks_wanting_language"));
+        // A session's own read: a subquery join with no `ON`.
+        db.rebuild_sessions(uid, 1800).await.unwrap_or_else(die("rebuild_sessions"));
+        let session: i64 =
+            sqlx::query_scalar("SELECT MAX(session_id) FROM scrobbles WHERE user_id = $1")
+                .bind(uid)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap_or_else(die("session id"));
+        assert!(db.get_session(uid, session).await.unwrap_or_else(die("get_session")).is_some());
+        db.instance_pulse(now - 86_400).await.unwrap_or_else(die("instance_pulse"));
+
+        // A bare `1` read into an `i64`.
+        let entity = db
+            .upsert_entity("release", "Selected Ambient Works 85-92", "Aphex Twin", None)
+            .await
+            .unwrap_or_else(die("upsert_entity"));
+        db.set_love(uid, entity, true).await.unwrap_or_else(die("set_love"));
+        assert!(db.is_loved(uid, entity).await.unwrap_or_else(die("is_loved")));
+        let loves = db.loves_detailed(uid).await.unwrap_or_else(die("loves_detailed (Loved page)"));
+        assert_eq!(
+            loves.first().map(|l| (l.plays, l.artwork_url.as_deref())),
+            Some((3, Some("https://covers.test/saw.jpg")))
+        );
+        assert_eq!(
+            db.credited_spelling(uid, "Aphex Twin").await.unwrap_or_else(die("credited_spelling")),
+            None
+        );
+        let heard = db
+            .artists_in_history(uid, &["Aphex Twin".into(), "Squarepusher".into()])
+            .await
+            .unwrap_or_else(die("artists_in_history"));
+        assert_eq!(heard, ["Aphex Twin"]);
+
+        // SQLite's null-safe `IS ?`.
+        let shelf = db
+            .create_physical(
+                uid,
+                "vinyl",
+                "Aphex Twin",
+                "Selected Ambient Works 85-92",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                "[]",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_or_else(die("create_physical"));
+        for position in 0..2 {
+            db.add_physical_image(
+                uid,
+                shelf,
+                "front",
+                "upload",
+                None,
+                None,
+                Some("shelf/x.png"),
+                Some("image/png"),
+                Some(1),
+                None,
+                position,
+                None,
+            )
+            .await
+            .unwrap_or_else(die("add_physical_image"));
+        }
         drop(db);
     }
 }

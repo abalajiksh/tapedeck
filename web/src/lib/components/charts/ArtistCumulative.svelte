@@ -85,7 +85,7 @@
 					<line x1={xScale(hover)} x2={xScale(hover)} y1="0" y2={h} class="cross" />
 					<circle cx={xScale(hover)} cy={yScale(at(hover))} r="4" fill="var(--td-accent)" stroke="var(--td-surface)" stroke-width="2" />
 				{/if}
-				<rect x="0" y="0" {width} height={h} fill="transparent" role="presentation"
+				<rect x="0" y="0" width={Math.max(width, 0)} height={h} fill="transparent" role="presentation"
 					on:pointermove={(e) => move(e, xScale.invert)} on:pointerleave={() => (hover = null)} />
 			</Svg>
 		</LayerCake>
