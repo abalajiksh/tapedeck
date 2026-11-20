@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.132.2
+  version: 0.132.3
 servers:
 - url: /
   description: The Tapedeck instance serving this document.

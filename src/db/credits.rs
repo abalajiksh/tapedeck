@@ -798,7 +798,8 @@ impl Database {
         name: &str,
     ) -> Result<Option<String>, sqlx::Error> {
         let name = name.trim();
-        let own: Option<(i64,)> = sqlx::query_as(&crate::sql!(
+        // `i32`: a bare `1` is INT4 on Postgres, and sqlx will not widen it.
+        let own: Option<(i32,)> = sqlx::query_as(&crate::sql!(
             "SELECT 1 FROM scrobble_artists sa JOIN scrobbles s ON s.id = sa.scrobble_id
               WHERE s.user_id = ? AND s.skipped = FALSE AND sa.artist_key = ? LIMIT 1"
         ))
@@ -869,7 +870,7 @@ impl Database {
     ) -> Result<Vec<String>, sqlx::Error> {
         let mut out = Vec::new();
         for name in names {
-            let hit: Option<(i64,)> = sqlx::query_as(&crate::sql!(&format!(
+            let hit: Option<(i32,)> = sqlx::query_as(&crate::sql!(&format!(
                 "SELECT 1 FROM scrobbles s WHERE s.user_id = ? AND s.skipped = FALSE AND {CREDITS_ARTIST} LIMIT 1"
             )))
             .bind(user_id)

@@ -63,7 +63,7 @@
 				{#each ticks as t}
 					<text x={xScale(t.i)} y={h + 16} text-anchor="middle" class="tick">{t.label}</text>
 				{/each}
-				<rect x="0" y="0" {width} height={h} fill="transparent" role="presentation"
+				<rect x="0" y="0" width={Math.max(width, 0)} height={h} fill="transparent" role="presentation"
 					on:pointermove={(e) => move(e, xScale.invert)} on:pointerleave={() => (hover = null)} />
 			</Svg>
 		</LayerCake>

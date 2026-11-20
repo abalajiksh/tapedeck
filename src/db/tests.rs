@@ -13561,3 +13561,53 @@ async fn kinds_of_listen_leave_top_charts_and_fill_their_own_tabs() {
     // A member's overrides go with them.
     db.delete_user(uid).await.unwrap();
 }
+
+/// "Loved, but hardly ever played" lists a loved track with its plays and
+/// the cover its listens carried.
+///
+/// The query read `artwork_url`, `caa_id` and `caa_release_mbid` from a CTE
+/// that only holds the packed `cover_pick`, so it failed on every call, and
+/// the Rediscovery handler's `unwrap_or_default()` turned that into an empty
+/// card. Found while porting the grouped queries to Postgres (v0.132.3).
+#[tokio::test]
+async fn loved_but_unplayed_lists_a_loved_track_with_its_cover() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    let mut p = play("Avril 14th", "Aphex Twin", 1_700_000_000);
+    p.album = Some("Drukqs".into());
+    db.save_scrobble(uid, &p, None, None, None, None, None, None, None, Default::default())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE scrobbles SET artwork_url = 'https://covers.test/drukqs.jpg'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let e = db.upsert_entity("recording", "Avril 14th", "Aphex Twin", None).await.unwrap();
+    db.set_love(uid, e, true).await.unwrap();
+
+    let rows = db.loved_but_unplayed(uid, 10).await.expect("the query runs");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].plays, 1);
+    assert_eq!(rows[0].album.as_deref(), Some("Drukqs"));
+    assert_eq!(rows[0].artwork_url.as_deref(), Some("https://covers.test/drukqs.jpg"));
+}
+
+/// Tied chart rows rank by their key, so a rank does not depend on the
+/// `LIMIT` — the API's fourth row and the page's fourth row are one artist.
+/// `pg_live::chart_ties_rank_the_same_at_any_limit` holds Postgres to it.
+#[tokio::test]
+async fn chart_ties_rank_by_key_at_any_limit() {
+    let db = testdb().await;
+    let uid = db.create_user("ash", None, "pw", "user").await.unwrap();
+    for (i, artist) in ["Hh", "Bb", "Gg", "Aa", "Ff", "Cc", "Ee", "Dd"].iter().enumerate() {
+        let p = play("One", artist, 1_700_000_000 + i as u64 * 60);
+        db.save_scrobble(uid, &p, None, None, None, None, None, None, None, Default::default())
+            .await
+            .unwrap();
+    }
+    let names = |rows: Vec<ChartRow>| -> Vec<String> { rows.into_iter().map(|r| r.name).collect() };
+    let short = names(db.top_chart(uid, "artists", None, 4, false, 0).await.unwrap());
+    let long = names(db.top_chart(uid, "artists", None, 50, false, 0).await.unwrap());
+    assert_eq!(short, long[..4]);
+    assert_eq!(long, ["Aa", "Bb", "Cc", "Dd", "Ee", "Ff", "Gg", "Hh"]);
+}

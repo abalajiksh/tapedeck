@@ -793,14 +793,15 @@ impl Database {
         let mut artists: Vec<PatchArtist> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT MAX(sa.name) AS name, COUNT(*) AS plays, \
                     COUNT(DISTINCT s.user_id) AS decks, \
-                    GROUP_CONCAT(DISTINCT u.username) AS who, \
+                    {} AS who, \
                     MAX(s.timestamp) AS last_played, \
-                    MIN(s.timestamp) AS first_played, 0 AS mine, \
+                    MIN(s.timestamp) AS first_played, CAST(0 AS BIGINT) AS mine, \
                     NULL AS genre \
                {} AND (?2 IS NULL OR s.timestamp >= ?2) \
                 AND sa.artist_key {NOT_VARIOUS} \
             GROUP BY sa.artist_key \
             ORDER BY plays DESC LIMIT ?3",
+            super::dialect::group_concat_distinct("u.username"),
             Self::PATCH_VISIBLE_CREDITS
         )))
         .bind(user_id)
@@ -1070,12 +1071,16 @@ impl Database {
         .fetch_one(&self.pool)
         .await?;
 
+        let who = super::dialect::group_concat_distinct(
+            "(SELECT username FROM users WHERE id = s.user_id)",
+        );
         let artists: Vec<PatchArtist> = sqlx::query_as(&crate::sql!(&format!(
             "SELECT MAX(sa.name) AS name, COUNT(*) AS plays, \
                     COUNT(DISTINCT s.user_id) AS decks, \
-                    GROUP_CONCAT(DISTINCT (SELECT username FROM users WHERE id = s.user_id)) AS who, \
+                    {who} AS who, \
                     MAX(s.timestamp) AS last_played, \
-                    MIN(s.timestamp) AS first_played, 0 AS mine, NULL AS genre \
+                    MIN(s.timestamp) AS first_played, CAST(0 AS BIGINT) AS mine, \
+                    NULL AS genre \
                {SHARED_CREDITS} AND s.timestamp >= ? \
                 AND sa.artist_key {NOT_VARIOUS} \
             GROUP BY sa.artist_key ORDER BY plays DESC LIMIT 8"
@@ -2752,7 +2757,7 @@ impl Database {
 
         let decks: Vec<ArtistDeck> = sqlx::query_as(&crate::sql!(
             "SELECT u.id AS user_id, u.username, u.display_name, u.avatar_url,
-                    a.uri AS actor_uri, COUNT(*) AS plays,
+                    MAX(a.uri) AS actor_uri, COUNT(*) AS plays,
                     EXISTS (SELECT 1 FROM patches p
                              WHERE p.state = 'accepted'
                                AND ((p.follower_user_id = ?1 AND p.target_user_id = u.id)
@@ -3394,18 +3399,26 @@ impl Database {
         struct HostAudio {
             format_type: Option<String>,
             codec: Option<String>,
+            #[sqlx(try_from = "crate::db::dialect::Int32")]
             bitrate: Option<i32>,
+            #[sqlx(try_from = "crate::db::dialect::Int32")]
             sample_rate: Option<i32>,
+            #[sqlx(try_from = "crate::db::dialect::Int32")]
             bit_depth: Option<i32>,
+            #[sqlx(try_from = "crate::db::dialect::Int32")]
             channels: Option<i32>,
             container: Option<String>,
             source_quality: Option<String>,
             is_lossless: Option<bool>,
             dsd_rate: Option<i64>,
+            #[sqlx(try_from = "crate::db::dialect::Int32")]
             dsd_multiplier: Option<i32>,
             delivery_codec: Option<String>,
+            #[sqlx(try_from = "crate::db::dialect::Int32")]
             delivery_bitrate: Option<i32>,
+            #[sqlx(try_from = "crate::db::dialect::Int32")]
             delivery_sample_rate: Option<i32>,
+            #[sqlx(try_from = "crate::db::dialect::Int32")]
             delivery_bit_depth: Option<i32>,
             is_transcoded: Option<bool>,
             transcode_reason: Option<String>,

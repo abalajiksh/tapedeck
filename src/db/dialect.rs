@@ -78,14 +78,28 @@
 //!   Rust, as `equipment_seconds` does; no SQL in the tree walks objects.
 //! * **`last_insert_rowid()`** (17) → `RETURNING`.
 //! * **`INSERT OR IGNORE` / `OR REPLACE`** (16) → `ON CONFLICT`.
-//! * **`GROUP_CONCAT`** (2) → `string_agg`, **`strftime`** (6), **`datetime(`** (6).
+//! * **`GROUP_CONCAT`** (2) → `string_agg`: both are Patch's, spelled per
+//!   backend by [`group_concat_distinct`] (v0.132.3). **`strftime`** (6),
+//!   **`datetime(`** (6).
 //!   `strftime` usually takes its format as a bind, so no textual rewrite can
 //!   translate it; the genre trajectory's two (`physical::period_of`) are
 //!   spelled once per backend instead, `to_char` on Postgres (v0.132.1).
-//! * **Bare columns beside an aggregate.** `loves_detailed` leans on SQLite's
-//!   rule that one `min`/`max` makes bare columns come from that row. Postgres
-//!   rejects it outright — loud, at least, but it is a rewrite rather than a
-//!   translation.
+//! * **Bare columns beside an aggregate.** SQLite answers a column that is
+//!   neither grouped nor aggregated from some row of the group (the max row,
+//!   beside one `min`/`max`); Postgres rejects the statement. Loud, at least,
+//!   but a rewrite rather than a translation: `MAX(col)` where any spelling
+//!   will do, [`super::COVER_PICK`]'s packed pick where columns must come from
+//!   one listen (`loves_detailed`, v0.132.3). An output alias inside an
+//!   `ORDER BY` *expression* (`ORDER BY n IS NULL`) is the same mistake —
+//!   Postgres reads it as the ungrouped input column.
+//! * **`x IS ?`**, SQLite's null-safe equality, is `IS NOT DISTINCT FROM` on
+//!   Postgres, which takes only NULL, TRUE or FALSE after `IS`. Write
+//!   `(x = ? OR (x IS NULL AND ? IS NULL))`, which both read the same.
+//! * **`max(boolean)`** does not exist on Postgres; [`super::LOSSLESS_ANY`].
+//! * **An `INTEGER` column read into an `i32`**: the column is `BIGINT` here,
+//!   and sqlx will not narrow it — decode through [`Int32`]. The reverse is a
+//!   bare literal (`SELECT 1`, `0 AS mine`), which is `INT4`: read it as an
+//!   `i32` or write `CAST(0 AS BIGINT)`.
 //! * **`VACUUM INTO`** (8) is the whole backup endpoint and has no Postgres
 //!   equivalent short of `pg_dump`.
 //! * **On/off flags stored as `INTEGER`** (`users.disabled`,
@@ -577,6 +591,82 @@ fn zero_pad_at(sql: &str, i: usize) -> Option<(usize, &str)> {
     }
     let start = sql.len() - args.len();
     Some((start + len + 1, &args[..len]))
+}
+
+/// `GROUP_CONCAT(DISTINCT expr)`, SQLite's comma-joined distinct values, in
+/// the active dialect: Postgres spells it `string_agg(DISTINCT expr, ',')`.
+/// `expr` must be text on Postgres, which `string_agg` requires and SQLite
+/// does not.
+///
+/// Spelled per backend rather than rewritten, like the trajectory's
+/// `strftime`: a textual rewrite would have to find the matching paren of an
+/// argument that can hold a subquery.
+pub fn group_concat_distinct(expr: &str) -> String {
+    match ACTIVE {
+        Dialect::Sqlite => format!("GROUP_CONCAT(DISTINCT {expr})"),
+        Dialect::Postgres => format!("string_agg(DISTINCT {expr}, ',')"),
+    }
+}
+
+/// An `INTEGER` column read into an `i32`, whatever width the backend stored
+/// it at.
+///
+/// The schema is translated mechanically, so every `INTEGER` is `BIGINT` on
+/// Postgres, and sqlx refuses to decode an INT8 into an `i32` (it checks the
+/// type before it looks at the value). The audio columns, `track_number` and
+/// `year` are `i32` in Rust and in the published API, and widening them would
+/// change the API's `int32` to `int64` for every generated client, so the
+/// decode is what bends. Under SQLite this is exactly `Option<i32>`'s decode,
+/// so the SQLite path keeps its behaviour.
+///
+/// On a `FromRow` field: `#[sqlx(try_from = "Int32")]` over an `Option<i32>`.
+/// In a tuple: name it as the element type and take `.0`.
+// Found by the e2e suite on Postgres (v0.132.2): History, the album page,
+// the artist dossier and export all failed with "Rust type Option<i32>
+// (INT4) is not compatible with SQL type INT8". `db::guards` now refuses an
+// `i32` field in a `FromRow` struct that does not carry this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Int32(pub Option<i32>);
+
+impl From<Int32> for Option<i32> {
+    fn from(v: Int32) -> Self {
+        v.0
+    }
+}
+
+impl sqlx::Type<sqlx::Sqlite> for Int32 {
+    fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
+        <i32 as sqlx::Type<sqlx::Sqlite>>::type_info()
+    }
+    fn compatible(ty: &sqlx::sqlite::SqliteTypeInfo) -> bool {
+        <i32 as sqlx::Type<sqlx::Sqlite>>::compatible(ty)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for Int32 {
+    fn decode(value: sqlx::sqlite::SqliteValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        <Option<i32> as sqlx::Decode<'r, sqlx::Sqlite>>::decode(value).map(Int32)
+    }
+}
+
+impl sqlx::Type<sqlx::Postgres> for Int32 {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        <i64 as sqlx::Type<sqlx::Postgres>>::type_info()
+    }
+    fn compatible(ty: &sqlx::postgres::PgTypeInfo) -> bool {
+        <i16 as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+            || <i32 as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+            || <i64 as sqlx::Type<sqlx::Postgres>>::compatible(ty)
+    }
+}
+
+impl<'r> sqlx::Decode<'r, sqlx::Postgres> for Int32 {
+    // sqlx's Postgres integer decode reads as many bytes as the value has, so
+    // `i32`'s own decode takes an INT2, INT4 or INT8 — and refuses one out of
+    // range rather than truncating it.
+    fn decode(value: sqlx::postgres::PgValueRef<'r>) -> Result<Self, sqlx::error::BoxDynError> {
+        <Option<i32> as sqlx::Decode<'r, sqlx::Postgres>>::decode(value).map(Int32)
+    }
 }
 
 #[cfg(test)]

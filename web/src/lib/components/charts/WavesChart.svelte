@@ -97,7 +97,7 @@
 							stroke="var(--td-surface)" stroke-width="2" />
 					{/each}
 				{/if}
-				<rect x="0" y="0" {width} height={h} fill="transparent" role="presentation"
+				<rect x="0" y="0" width={Math.max(width, 0)} height={h} fill="transparent" role="presentation"
 					on:pointermove={(e) => move(e, xScale.invert)} on:pointerleave={() => (hover = null)} />
 			</Svg>
 		</LayerCake>

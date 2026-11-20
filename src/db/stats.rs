@@ -157,6 +157,10 @@ impl Database {
         // name in ORDER BY only on its own, never inside an expression.
         // Unqualified `duration` is the listen's in all three queries
         // (`scrobble_artists` has none).
+        // Ties then break on the group key, so a rank does not depend on
+        // `LIMIT` or the plan: Postgres hands tied rows back in whatever order
+        // its sort left them, and Top Charts (the same ranking, cut shorter or
+        // longer) must agree with this list row for row.
         let order =
             if by_hours { "COALESCE(SUM(duration), 0) DESC, plays DESC" } else { "plays DESC" };
         let plays: (i64,) = sqlx::query_as(&crate::sql!("SELECT COUNT(*) FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)")).bind(user_id).bind(after).bind(after).fetch_one(&self.pool).await?;
@@ -260,7 +264,7 @@ impl Database {
              FROM scrobble_artists sa
              JOIN scrobbles s ON s.id = sa.scrobble_id
              WHERE s.user_id = ? AND s.skipped = FALSE AND (? IS NULL OR s.timestamp >= ?)
-             GROUP BY sa.artist_key ORDER BY {} LIMIT 50",
+             GROUP BY sa.artist_key ORDER BY {}, sa.artist_key LIMIT 50",
             order
         )))
         .bind(user_id)
@@ -290,7 +294,7 @@ impl Database {
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
                AND album IS NOT NULL AND album != ''
              GROUP BY LOWER(TRIM(album)), LOWER(TRIM(COALESCE(album_filed_under, artist)))
-             ORDER BY {} LIMIT 50",
+             ORDER BY {}, LOWER(TRIM(album)), LOWER(TRIM(COALESCE(album_filed_under, artist))) LIMIT 50",
                 order
             )))
             .bind(user_id)
@@ -325,7 +329,7 @@ impl Database {
                     MAX(COALESCE(album_filed_under, artist)) AS album_artist,
                     COUNT(*) as plays, CAST(SUM(duration) AS BIGINT) as secs
              FROM scrobbles WHERE user_id = ? AND skipped = FALSE AND (? IS NULL OR timestamp >= ?)
-             GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)) ORDER BY {} LIMIT 50",
+             GROUP BY LOWER(TRIM(title)), LOWER(TRIM(artist)) ORDER BY {}, LOWER(TRIM(title)), LOWER(TRIM(artist)) LIMIT 50",
             order
         ),))
         .bind(user_id)

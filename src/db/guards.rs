@@ -760,4 +760,69 @@ mod tests {
              removed from EXEMPT: {stale:?}"
         );
     }
+
+    /// Every `i32` field of a `FromRow` struct decodes through
+    /// [`crate::db::dialect::Int32`].
+    ///
+    /// Every `INTEGER` column is `BIGINT` on Postgres, and sqlx refuses an INT8
+    /// for an `i32` — so a plain `Option<i32>` field compiles, passes the whole
+    /// SQLite suite, and fails every read of its struct on Postgres. That broke
+    /// History, the album page and export at once (e2e on Postgres, v0.132.2).
+    /// A tuple decode has no attribute to check; name `Int32` there by hand.
+    #[test]
+    fn every_narrow_integer_a_row_decodes_tolerates_bigint() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).expect("read src/").flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        files.sort();
+
+        let (mut structs, mut bare) = (0usize, Vec::new());
+        for path in &files {
+            let src = std::fs::read_to_string(path).expect("read source");
+            let lines: Vec<&str> = src.lines().collect();
+            let mut i = 0;
+            while i < lines.len() {
+                let l = lines[i].trim_start();
+                if !(l.starts_with("#[derive(") && l.contains("FromRow")) {
+                    i += 1;
+                    continue;
+                }
+                // To the struct line, then field by field to its closing brace.
+                while i < lines.len() && !lines[i].contains("struct ") {
+                    i += 1;
+                }
+                structs += 1;
+                i += 1;
+                while i < lines.len() && lines[i].trim() != "}" {
+                    let field = lines[i].trim();
+                    let narrow = !field.starts_with("//")
+                        && (field.contains(": Option<i32>") || field.ends_with(": i32,"));
+                    if narrow && !lines[i - 1].contains("dialect::Int32") {
+                        bare.push(format!(
+                            "  {}:{}  {field}",
+                            path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(path).display(),
+                            i + 1
+                        ));
+                    }
+                    i += 1;
+                }
+            }
+        }
+        assert!(structs > 20, "only {structs} FromRow structs found — the scanner is broken");
+        assert!(
+            bare.is_empty(),
+            "these `i32` fields decode a column Postgres stores as BIGINT; put \
+             `#[sqlx(try_from = \"crate::db::dialect::Int32\")]` on the line above:\n{}",
+            bare.join("\n")
+        );
+    }
 }
