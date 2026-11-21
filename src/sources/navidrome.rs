@@ -255,6 +255,12 @@ fn navidrome_quality(
         return None;
     }
     q.classify_codec();
+    // A lossy file has no bit depth. Navidrome reports one for AAC all the
+    // same (16, the decoder's output: media lab, 2026-11-21), where Jellyfin,
+    // Emby and Plex send none, so it would read as a 16-bit AAC.
+    if q.is_lossless == Some(false) {
+        q.bit_depth = None;
+    }
     q.compute_score();
     Some(q)
 }
@@ -1224,6 +1230,7 @@ mod tests {
             navidrome_quality(Some("m4a"), Some("AAC"), Some(256), Some(44100), Some(16), Some(2))
                 .unwrap();
         assert_eq!((aac.codec.as_deref(), aac.is_lossless), (Some("aac"), Some(false)));
+        assert_eq!(aac.bit_depth, None, "Navidrome's 16 for an AAC is not a bit depth");
 
         let wav =
             navidrome_quality(Some("wav"), Some(""), Some(1411), Some(44100), Some(16), Some(2))
