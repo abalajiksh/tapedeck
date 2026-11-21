@@ -1857,5 +1857,7 @@ See LICENSE file for details.
   sonic analysis of your own library, the optional source of per-recording audio
   vectors
 - [Figtree](https://github.com/erikdkennedy/figtree) and
-  [Caprasimo](https://github.com/vv-monsalve/Caprasimo) — the typefaces, OFL 1.1
+  [Caprasimo](https://github.com/vv-monsalve/Caprasimo) — the typefaces, OFL 1.1,
+  bundled through [Fontsource](https://fontsource.org) and served by the instance
+  itself (never from Google Fonts); the licence ships at `/licenses/fonts.txt`
 - Built with Rust's async ecosystem (tokio, axum, sqlx, reqwest)
