@@ -718,7 +718,7 @@ impl ScrobbleEngine {
                 if !plays.is_empty() {
                     info!("📀 {} Navidrome listen(s) for user {}", plays.len(), user_id);
                 }
-                for mut play in plays {
+                for (mut play, quality) in plays {
                     let dupe = match already_banked(db, user_id, &play, false).await {
                         Ok(d) => d,
                         Err(e) => {
@@ -742,7 +742,7 @@ impl ScrobbleEngine {
                         .save_scrobble(
                             user_id,
                             &play,
-                            None,
+                            quality.as_ref(),
                             None,
                             None,
                             None,
@@ -1432,6 +1432,10 @@ impl ScrobbleEngine {
                     continue;
                 }
 
+                // Plex's own MusicBrainz match, off the user's server: before
+                // enrichment, so a release id it already knows is one lookup
+                // not made.
+                plex.musicbrainz_ids(&plex_track).await.apply(&mut play);
                 enrich_play(&mb_client, &mut play, plex_track.album.as_deref()).await;
 
                 let quality_ref = plex_track.audio_quality.as_ref();

@@ -115,6 +115,12 @@ pub struct PlexTrack {
     pub grandparent_rating_key: Option<String>,
     pub session_key: Option<String>,
     pub viewed_at: Option<u64>,
+    /// When a live play **started**, set as it is banked: the moment it counted
+    /// less how far into the track it was. A listen's timestamp is when the
+    /// play began (the API document, Last.fm and ListenBrainz all mean that),
+    /// and stamping the moment it crossed put every Plex listen half a track
+    /// late. History rows have `viewed_at` instead.
+    pub started_at: Option<u64>,
     /// Audio quality extracted from Plex Media/Stream metadata
     pub audio_quality: Option<AudioQuality>,
     /// Plex account name (from the session's `User` element). None for
@@ -202,6 +208,7 @@ impl PlexTrack {
             grandparent_rating_key: s.grandparent_rating_key,
             session_key: s.session_key,
             viewed_at: None,
+            started_at: None,
             audio_quality,
             plex_user: s.user.as_ref().and_then(|u| u.title.clone()),
             plex_account_id: None,
@@ -236,6 +243,7 @@ impl PlexTrack {
             grandparent_rating_key: h.grandparent_rating_key,
             session_key: None,
             viewed_at: h.viewed_at,
+            started_at: None,
             audio_quality: None,
             plex_user: None,
             plex_account_id: h.account_id,
@@ -305,7 +313,7 @@ impl PlexTrack {
 
     pub fn to_play(&self, source_id_suffix: &str) -> Play {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        let timestamp = self.viewed_at.unwrap_or(now);
+        let timestamp = self.viewed_at.or(self.started_at).unwrap_or(now);
         // A history row carries Plex's own play-event id, which is stable
         // across walks; a live row has only the caller's suffix.
         let source_id = match &self.history_key {
@@ -344,24 +352,41 @@ impl PlexTrack {
         // checked) and its artist credits disagree with themselves, sometimes
         // listing the director, sometimes the singers, sometimes both — with
         // duplicate recordings for each. Plex already knows, for free.
-        let performer = self.track_artist.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        //
+        // `originalTitle` is one string, and Plex joins a multi-valued artist
+        // tag with a **bare `;`** ("Ilse Varga;Tomas Brandt", media lab
+        // 2026-11-21). Kept whole, that string became one "artist" and the
+        // co-artists were lost, so it is cut on the separators ingest already
+        // honours (`db::split_credit`: `;`, " feat. ", " / " …, never `&` or
+        // `,`, which are inside real names).
+        let performers: Vec<String> = self
+            .track_artist
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(crate::db::split_credit)
+            .unwrap_or_default();
 
-        let (primary, artists) = match performer {
+        let (primary, artists) = match performers.first() {
             // A compilation has no artist of its own, so the performer is it.
             // Keeping the placeholder in the credit would only assert that the
             // record is a compilation, which the album already says.
-            Some(p) if crate::db::is_various_artists(&self.artist) => {
-                (p.to_string(), vec![p.to_string()])
+            Some(first) if crate::db::is_various_artists(&self.artist) => {
+                (first.clone(), performers.clone())
             }
             // The performers already name the record's artist — the common case
             // when a music director sings on their own soundtrack, which
             // Anirudh Ravichander, Ilaiyaraaja, Harris Jayaraj and A. R. Rahman
             // all do. The credit is then simply the fuller one, and listing
             // them separately would repeat a name.
-            Some(p) if credit_includes(p, &self.artist) => {
-                (self.artist.clone(), vec![p.to_string()])
+            Some(_) if performers.iter().any(|p| credit_includes(p, &self.artist)) => {
+                (self.artist.clone(), performers.clone())
             }
-            Some(p) => (self.artist.clone(), vec![self.artist.clone(), p.to_string()]),
+            Some(_) => {
+                let mut all = vec![self.artist.clone()];
+                all.extend(performers.iter().cloned());
+                (self.artist.clone(), all)
+            }
             None => (self.artist.clone(), vec![self.artist.clone()]),
         };
 
@@ -411,11 +436,56 @@ pub struct SessionsContainer {
     pub metadata: Vec<SessionMetadata>,
 }
 
+/// One of an item's `Guid` entries.
+#[derive(Debug, Deserialize, Clone)]
+pub struct PlexGuid {
+    pub id: String,
+}
+
+/// The MusicBrainz id among an item's GUIDs, if Plex has one.
+pub(crate) fn mbid_guid(guids: &[PlexGuid]) -> Option<String> {
+    guids
+        .iter()
+        .filter_map(|g| g.id.strip_prefix("mbid://"))
+        .map(str::trim)
+        .find(|id| id.len() == 36 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
+        .map(str::to_string)
+}
+
+/// What Plex's GUIDs say about a listen, from its track, album and artist.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PlexMusicBrainz {
+    pub release_track: Option<String>,
+    pub release: Option<String>,
+    pub album_artist: Option<String>,
+}
+
+impl PlexMusicBrainz {
+    /// Fill the blanks on a play; never overwrite an id something else gave.
+    pub fn apply(&self, play: &mut Play) {
+        if play.mbid_release_track.is_none() {
+            play.mbid_release_track = self.release_track.clone();
+        }
+        if play.mbid_release.is_none() {
+            play.mbid_release = self.release.clone();
+        }
+        if play.mbid_album_artist.is_none() {
+            play.mbid_album_artist = self.album_artist.clone().map(|id| vec![id]);
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionMetadata {
     #[serde(rename = "type")]
     pub media_type: Option<String>,
+    /// Outside ids Plex matched the item to. A file tagged with MusicBrainz
+    /// ids lists them as `mbid://<uuid>`: on a **track** that is the
+    /// *release-track* id, on an album the release, on an artist the artist
+    /// (Plex 1.43.5, media lab 2026-11-21). See [`PlexSource::musicbrainz_ids`].
+    #[serde(rename = "Guid", default)]
+    pub guids: Vec<PlexGuid>,
     pub title: Option<String>,
     pub parent_title: Option<String>,
     pub grandparent_title: Option<String>,
@@ -1915,7 +1985,10 @@ impl PlexSource {
             let seconds = view_offset / 1000;
             let length = (duration > 0).then_some(duration / 1000);
 
-            let ready = !state.scrobbled && threshold.reached(seconds, length);
+            // Not while paused: a playhead dragged past halfway on a paused
+            // player is not listening, and the Jellyfin/Emby tracker has always
+            // refused it (`SessionTracker::observe`). It counts once it plays.
+            let ready = !state.scrobbled && is_playing && threshold.reached(seconds, length);
             // Whether we've already banked the scrobble says nothing about
             // what's on the deck. Gating now-playing on `!scrobbled` meant a
             // track stopped being reported the moment it passed the halfway
@@ -1934,7 +2007,9 @@ impl PlexSource {
             // Claim this item so the history sync doesn't re-report the same
             // play under its album artist a minute later.
             self.recent_scrobbles.insert(rating_key.clone(), now);
-            result.ready_to_scrobble.push(track.clone());
+            let mut banked = track.clone();
+            banked.started_at = Some(now.saturating_sub(view_offset / 1000));
+            result.ready_to_scrobble.push(banked);
         }
         if needs_np {
             debug!("Track now playing: '{}' by '{}'", track.title, track.artist);
@@ -2028,6 +2103,39 @@ impl PlexSource {
     /// that is a property of a session that has already ended, so a
     /// history-derived listen keeps `is_transcoded` unset rather than claiming
     /// a direct play it cannot vouch for.
+    /// The MusicBrainz ids Plex holds for a track, its album and its artist.
+    ///
+    /// Plex lists them only on the library items (`/library/metadata/<key>`),
+    /// never in a session or a history row, so a listen asks for them once, as
+    /// it is banked — three requests to the user's own server, none to
+    /// MusicBrainz. The track's id is the **release track**, not the recording,
+    /// so it is stored as that; a wrong recording id is worse than none. A
+    /// failed request costs the id, never the listen.
+    pub async fn musicbrainz_ids(&self, track: &PlexTrack) -> PlexMusicBrainz {
+        let guids = |key: Option<&String>| {
+            let key = key.cloned();
+            async move {
+                let key = key?;
+                let resp = self
+                    .client
+                    .get(format!("{}/library/metadata/{}", self.url, key))
+                    .header("X-Plex-Token", &self.token)
+                    .header("Accept", "application/json")
+                    .send()
+                    .await
+                    .ok()
+                    .filter(|r| r.status().is_success())?;
+                let parsed = resp.json::<SessionsResponse>().await.ok()?;
+                mbid_guid(&parsed.media_container.metadata.first()?.guids)
+            }
+        };
+        PlexMusicBrainz {
+            release_track: guids(Some(&track.rating_key)).await,
+            release: guids(track.parent_rating_key.as_ref()).await,
+            album_artist: guids(track.grandparent_rating_key.as_ref()).await,
+        }
+    }
+
     pub async fn hydrate_from_library(&self, track: &mut PlexTrack) {
         let endpoint = format!("{}/library/metadata/{}", self.url, track.rating_key);
         let resp = match self
@@ -2485,6 +2593,7 @@ mod tests {
             grandparent_rating_key: None,
             session_key: Some("sk1".into()),
             viewed_at: None,
+            started_at: None,
             audio_quality: None,
             plex_user: None,
             plex_account_id: None,
@@ -2668,6 +2777,89 @@ mod tests {
     /// Plex keeps its own copy of the session state machine rather than using
     /// `SessionTracker`, so it needs its own copy of this rule — and its own
     /// test, because the two can drift without anything erroring.
+    /// The playhead dragged past halfway on a **paused** player is not a
+    /// listen; it counts once the player plays (media lab, 2026-11-21:
+    /// PLEX_PAUSED_COUNTS). The Jellyfin/Emby tracker has the same gate.
+    #[tokio::test]
+    async fn a_track_moved_past_halfway_while_paused_counts_only_once_it_plays() {
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into(), Egress::Open);
+        let mut r = SessionResult::default();
+        src.process_live_track(track(90_000), true, &mut r).await;
+        let mut r = SessionResult::default();
+        src.process_live_track(track(180_000), false, &mut r).await;
+        assert!(r.ready_to_scrobble.is_empty(), "paused at 60 %: not yet");
+        let mut r = SessionResult::default();
+        src.process_live_track(track(182_000), true, &mut r).await;
+        assert_eq!(r.ready_to_scrobble.len(), 1, "playing again: now it counts");
+    }
+
+    /// A live listen is stamped with when it **started**, not when it crossed.
+    #[tokio::test]
+    async fn a_live_listen_is_stamped_when_the_play_began() {
+        let mut src = PlexSource::new("http://localhost:32400".into(), "t".into(), Egress::Open);
+        let mut r = SessionResult::default();
+        src.process_live_track(track(160_000), true, &mut r).await;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let play = r.ready_to_scrobble[0].to_play("scrobble-1");
+        assert!((now - 162..=now - 159).contains(&play.timestamp), "{}", play.timestamp);
+    }
+
+    /// Plex joins a multi-valued artist tag with a bare `;`, and a credit can
+    /// carry "feat."; each name is its own artist, the record's artist first.
+    #[test]
+    fn a_joined_performer_credit_is_split_into_its_artists() {
+        let credit = |record: &str, performer: &str| {
+            let mut t = track(0);
+            t.artist = record.into();
+            t.track_artist = Some(performer.into());
+            let p = t.to_play("np");
+            (p.artist, p.artists.unwrap_or_default().join("; "))
+        };
+        let both = ("Ilse Varga".to_string(), "Ilse Varga; Tomas Brandt".to_string());
+        assert_eq!(credit("Ilse Varga", "Ilse Varga;Tomas Brandt"), both);
+        assert_eq!(credit("Ilse Varga", "Ilse Varga; Tomas Brandt"), both);
+        assert_eq!(credit("Ilse Varga", "Ilse Varga feat. Tomas Brandt"), both);
+        assert_eq!(
+            credit("Lab Orchestra", "Meera Iyer;Arjun Rao"),
+            ("Lab Orchestra".into(), "Lab Orchestra; Meera Iyer; Arjun Rao".into())
+        );
+        // An ampersand is inside a name, never a separator.
+        assert_eq!(
+            credit("Ilse Varga", "Moss & Fern"),
+            ("Ilse Varga".into(), "Ilse Varga; Moss & Fern".into())
+        );
+        // A compilation: the performers are the credit.
+        assert_eq!(
+            credit("Various Artists", "Meera Iyer;Arjun Rao"),
+            ("Meera Iyer".into(), "Meera Iyer; Arjun Rao".into())
+        );
+    }
+
+    /// `Guid` as Plex 1.43.5 lists it on a tagged track (media lab).
+    #[test]
+    fn plex_mbid_guids_are_read_and_only_fill_blanks() {
+        let meta: SessionMetadata = serde_json::from_str(
+            r#"{"type":"track","guid":"plex://track/5d07d262403c6402905cb2d3",
+                "Guid":[{"id":"mbid://0eb09320-6af5-39b9-86ef-a4a00572bc82"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(mbid_guid(&meta.guids).as_deref(), Some("0eb09320-6af5-39b9-86ef-a4a00572bc82"));
+        assert_eq!(mbid_guid(&[PlexGuid { id: "plex://track/x".into() }]), None);
+
+        let ids = PlexMusicBrainz {
+            release_track: Some("rt".into()),
+            release: Some("rel".into()),
+            album_artist: Some("aa".into()),
+        };
+        let mut play = track(0).to_play("np");
+        play.mbid_release = Some("from-the-source".into());
+        ids.apply(&mut play);
+        assert_eq!(play.mbid_release_track.as_deref(), Some("rt"));
+        assert_eq!(play.mbid_release.as_deref(), Some("from-the-source"), "never overwritten");
+        assert_eq!(play.mbid_album_artist, Some(vec!["aa".to_string()]));
+        assert_eq!(play.mbid_recording, None, "a release track is not a recording");
+    }
+
     #[tokio::test]
     async fn a_track_dropped_before_the_threshold_is_recorded_as_a_skip() {
         let mut src = PlexSource::new("http://localhost:32400".into(), "t".into(), Egress::Open);

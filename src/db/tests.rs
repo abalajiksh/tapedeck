@@ -2073,6 +2073,79 @@ async fn the_dsd_listens_stored_as_lossy_are_re_filed_once() {
     );
 }
 
+/// Jellyfin/Emby listens stored their stream's bitrate in bits per second
+/// until v0.133.0. The repair brings them to kbps, rescores a lossy one (its
+/// score was the top lossy tier for any bits-per-second figure), leaves a
+/// lossless score and other sources alone, and runs once.
+#[tokio::test]
+async fn mediabrowser_bitrates_in_bits_per_second_are_brought_to_kbps_once() {
+    let db = testdb().await;
+    for (title, source, n) in
+        [("Lossy", "emby", 1), ("Lossless", "jellyfin", 2), ("Plex", "Plex", 3), ("Dsd", "emby", 4)]
+    {
+        let mut p = play(title, "Artist", 1_700_000_000 + n * 1000);
+        p.source_name = source.into();
+        p.source_id = format!("{source}-{n}");
+        db.save_scrobble(1, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+            .await
+            .unwrap();
+    }
+    for (title, sql) in [
+        ("Lossy", "codec = 'mp3', format_type = 'pcm', is_lossless = 0, bitrate = 128000, quality_score = 60.0"),
+        ("Lossless", "codec = 'flac', format_type = 'pcm', is_lossless = 1, bitrate = 231743, quality_score = 80.0"),
+        ("Plex", "codec = 'flac', format_type = 'pcm', is_lossless = 1, bitrate = 232, quality_score = 80.0"),
+        // DSD1024 in kbps: big, and already right.
+        ("Dsd", "codec = 'dsd_lsbf_planar', format_type = 'dsd', is_lossless = 1, bitrate = 45158, quality_score = 98.0"),
+    ] {
+        sqlx::query(&format!("UPDATE scrobbles SET {sql} WHERE title = '{title}'"))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(db.rescale_mediabrowser_bitrates().await.unwrap(), 2);
+    let rows: Vec<(String, i64, f64)> =
+        sqlx::query_as("SELECT title, bitrate, quality_score FROM scrobbles ORDER BY title")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("Dsd".into(), 45158, 98.0),
+            ("Lossless".into(), 232, 80.0),
+            ("Lossy".into(), 128, 40.0),
+            ("Plex".into(), 232, 80.0),
+        ]
+    );
+    assert_eq!(db.rescale_mediabrowser_bitrates().await.unwrap(), 0, "a second run is a no-op");
+}
+
+/// The reader's library lookup finds only the asker's own listens. It used to
+/// match a title across everyone's, and Tapedeck then decrypted that listen's
+/// owner's credentials and asked their server on the asker's behalf (media lab,
+/// 2026-11-21: LYRICS_NOT_SCOPED).
+#[tokio::test]
+async fn the_library_lyrics_lookup_reads_only_the_askers_listens() {
+    let db = testdb().await;
+    let a = db.create_user("emby-member", None, "pw", "user").await.unwrap();
+    let b = db.create_user("plex-member", None, "pw", "user").await.unwrap();
+    let mut p = play("Hound Dog", "Elvis Presley", 1_700_000_000);
+    p.source_name = "emby".into();
+    p.source_id = "emby-289-Living-Room".into();
+    db.save_scrobble(a, &p, None, None, None, None, None, None, None, ListenDisposition::LIVE)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE scrobbles SET source_ref = 7").execute(&db.pool).await.unwrap();
+
+    let mine = db.library_ref_for_track(a, "hound dog", "ELVIS PRESLEY").await.unwrap();
+    assert_eq!(mine.map(|r| (r.user_id, r.source_ref)), Some((a, 7)));
+    assert!(
+        db.library_ref_for_track(b, "Hound Dog", "Elvis Presley").await.unwrap().is_none(),
+        "someone else's listen is never the asker's library"
+    );
+}
+
 /// A pairing code mints exactly one token and hands it over exactly once.
 /// Both halves matter: a second approval would give an attacker who watched
 /// someone type a code a token of their own, and a request row left holding

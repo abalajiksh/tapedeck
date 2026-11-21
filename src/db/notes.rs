@@ -616,6 +616,104 @@ impl Database {
         Ok(done)
     }
 
+    /// Bring the Jellyfin and Emby listens stored in **bits per second** down
+    /// to kbps, the unit every other source writes and the API document states.
+    ///
+    /// `MediaStream.BitRate` is bits per second, and the source passed it
+    /// through unconverted until v0.133.0, so a 16/44.1 FLAC read `231743`
+    /// where the same file off Plex reads `232` (media lab, 2026-11-21).
+    ///
+    /// The predicate is about the data rather than a marker, so a second run
+    /// selects nothing: no audio stream is 32,000 kbps or more save DSD, and
+    /// DSD in kbps stays under 50,000 (DSD1024 is 45,158) where DSD in bits per
+    /// second starts at 2,822,400. A lossy row is also rescored — its score was
+    /// taken from the bitrate tier, and a bits-per-second figure clears every
+    /// tier — which is the input-was-misparsed case `reclassify_dsd_listens`
+    /// argues, not a change of formula.
+    pub async fn rescale_mediabrowser_bitrates(&self) -> Result<u64, sqlx::Error> {
+        use super::dialect::Int32;
+        type Row = (
+            i64,
+            Int32,
+            Option<String>,
+            Option<bool>,
+            Int32,
+            Int32,
+            Int32,
+            Option<bool>,
+            Option<String>,
+            Option<f64>,
+        );
+        let rows: Vec<Row> = sqlx::query_as(&crate::sql!(
+            "SELECT id, bitrate, format_type, is_lossless, sample_rate, bit_depth,
+                    dsd_multiplier, is_transcoded, delivery_codec, quality_score
+               FROM scrobbles
+              WHERE LOWER(source_name) IN ('jellyfin', 'emby')
+                AND bitrate >= 32000
+                AND NOT (COALESCE(format_type, '') = 'dsd' AND bitrate < 50000)",
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        info!(
+            "⚙️ Migrating: {} Jellyfin/Emby listen(s) from bits per second to kbps...",
+            rows.len()
+        );
+
+        let mut tx = self.pool.begin().await?;
+        let mut done = 0u64;
+        for (
+            id,
+            bitrate,
+            format_type,
+            is_lossless,
+            sample_rate,
+            bit_depth,
+            dsd_multiplier,
+            is_transcoded,
+            delivery_codec,
+            score,
+        ) in rows
+        {
+            let Some(bps) = bitrate.0 else { continue };
+            let kbps = crate::sources::mediabrowser::bps_to_kbps(bps);
+            // Only a lossy PCM score reads the bitrate; leave every other one
+            // exactly as ingest wrote it.
+            let lossy = matches!(format_type.as_deref(), Some("pcm") | None)
+                && !is_lossless.unwrap_or(false);
+            let score = if lossy && score.is_some() {
+                let mut q = AudioQuality {
+                    bitrate: Some(kbps),
+                    format_type,
+                    is_lossless,
+                    sample_rate: sample_rate.0,
+                    bit_depth: bit_depth.0.and_then(|b| i16::try_from(b).ok()),
+                    dsd_multiplier: dsd_multiplier.0.and_then(|m| i16::try_from(m).ok()),
+                    is_transcoded,
+                    delivery_codec,
+                    ..Default::default()
+                };
+                q.compute_score();
+                q.quality_score
+            } else {
+                score
+            };
+            sqlx::query(&crate::sql!(
+                "UPDATE scrobbles SET bitrate = ?, quality_score = ? WHERE id = ?"
+            ))
+            .bind(kbps)
+            .bind(score)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            done += 1;
+        }
+        tx.commit().await?;
+        Ok(done)
+    }
+
     pub async fn reclassify_dsd_listens(&self) -> Result<u64, sqlx::Error> {
         // `codec LIKE 'dsd%'` is the cheap half of `codec_is_dsd`; `dst` is
         // named explicitly. The container is *not* consulted — a DSF holding

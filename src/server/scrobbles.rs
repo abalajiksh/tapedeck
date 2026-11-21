@@ -1943,7 +1943,7 @@ async fn lyric_document(
         lyrics.cached(artist, title).await,
         Some(crate::lyrics::Found::Lyrics { .. }) | Some(crate::lyrics::Found::Instrumental)
     ) {
-        crate::enrich::lyrics_from_library_now(&state.db, &lyrics, artist, title).await;
+        crate::enrich::lyrics_from_library_now(&state.db, &lyrics, user_id, artist, title).await;
     }
 
     let words = match lyrics.cached(artist, title).await {
@@ -2386,6 +2386,7 @@ async fn fetch_lyrics_now(
             crate::enrich::lyrics_now(
                 &state.db,
                 &lyrics,
+                user.user_id,
                 &body.artist,
                 &body.title,
                 body.album.as_deref(),

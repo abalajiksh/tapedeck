@@ -146,6 +146,12 @@ const EXEMPT: &[(&str, &str)] = &[
                                 play's, and the filter belongs on the readers",
     ),
     (
+        "rescale_mediabrowser_bitrates",
+        "repairs the unit of a stored column on every \
+                                Jellyfin/Emby row; a skip's bitrate is as much \
+                                a stored fact as a play's",
+    ),
+    (
         "reclassify_dsd_listens",
         "repairs format_type/quality_score on rows the \
                                 old classifier misparsed; leaving a skip wrong \

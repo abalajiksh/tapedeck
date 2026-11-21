@@ -67,6 +67,8 @@ pub(crate) fn remote_item_id(source_name: &str, source_id: &str) -> Option<Strin
         "navidrome" => ("navidrome-", false),
         "Plex" | "plex" => ("plex-", true),
         "jellyfin" | "Jellyfin" => ("jellyfin-", true),
+        // `emby-<itemId>-<device>`, numeric item ids: left, as Jellyfin.
+        "emby" | "Emby" => ("emby-", true),
         _ => return None,
     };
     let rest = source_id.strip_prefix(prefix)?;
@@ -132,6 +134,14 @@ async fn scrobble_art(
                 return not_found("Jellyfin API key is missing");
             };
             MediaBrowserSource::jellyfin(source.url.clone(), key, String::new(), egress)
+                .fetch_cover_art(&item_id)
+                .await
+        }
+        "emby" => {
+            let Some(key) = source.credential("api_key") else {
+                return not_found("Emby API key is missing");
+            };
+            MediaBrowserSource::emby(source.url.clone(), key, String::new(), egress)
                 .fetch_cover_art(&item_id)
                 .await
         }
@@ -978,6 +988,9 @@ mod tests {
     #[test]
     fn ignores_sources_with_no_library_behind_them() {
         // An ingested or imported listen has no media server to ask.
+        // Emby's item ids are numeric; the device after them has dashes.
+        assert_eq!(remote_item_id("emby", "emby-289-Living-Room-Mac").as_deref(), Some("289"));
+        assert_eq!(remote_item_id("emby", "emby-289-scrobble-1700000000").as_deref(), Some("289"));
         assert_eq!(remote_item_id("ingest:pano", "ingest-1-1700000000-Title"), None);
         assert_eq!(remote_item_id("rockbox", "rockbox-abc"), None);
         assert_eq!(remote_item_id("import", "import-x-1"), None);

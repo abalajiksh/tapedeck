@@ -82,7 +82,7 @@ info:
   license:
     name: AGPL-3.0-or-later
     identifier: AGPL-3.0-or-later
-  version: 0.132.4
+  version: 0.133.0
 servers:
 - url: /
   description: The Tapedeck instance serving this document.
@@ -30830,7 +30830,7 @@ components:
             The parts are sung syllables (Korean), so the reader marks the
             boundaries between them.
     Words:
-      oneOf:
+      anyOf:
       - type: object
         description: The words, as numbered lines.
         required:

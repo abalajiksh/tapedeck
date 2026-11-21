@@ -1475,6 +1475,11 @@ impl Database {
     /// **Both sides are folded by SQLite**, so no Rust `to_lowercase` gets to
     /// disagree with its ASCII-only `LOWER` on an accented title.
     ///
+    /// **Only the asker's own listens.** A person opening the reader is asking
+    /// *their* server, with *their* credentials: matching anyone's listen of
+    /// the title had Tapedeck decrypt another member's token and call their
+    /// server on this person's behalf (found by the media lab, 2026-11-21).
+    ///
     /// Deliberately no `ORDER BY`: it would force the whole scan, where
     /// `LIMIT 1` alone lets SQLite stop at the first match. Any listen of the
     /// track gives a usable item id, and if that one has since been removed
@@ -1482,18 +1487,21 @@ impl Database {
     /// answer as the track being untagged.
     pub async fn library_ref_for_track(
         &self,
+        user_id: i64,
         title: &str,
         artist: &str,
     ) -> Result<Option<LibraryRef>, sqlx::Error> {
         sqlx::query_as::<_, (i64, i64, String, String, i64)>(&crate::sql!(
             "SELECT user_id, source_ref, source_id, source_name, timestamp
                FROM scrobbles
-              WHERE source_ref IS NOT NULL
+              WHERE user_id = ?
+                AND source_ref IS NOT NULL
                 AND LOWER(source_name) IN ('plex', 'jellyfin', 'emby')
                 AND LOWER(TRIM(title)) = LOWER(TRIM(?))
                 AND LOWER(TRIM(artist)) = LOWER(TRIM(?))
               LIMIT 1",
         ))
+        .bind(user_id)
         .bind(title)
         .bind(artist)
         .fetch_optional(&self.pool)
