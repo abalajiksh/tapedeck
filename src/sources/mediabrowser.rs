@@ -1,8 +1,8 @@
 //! Jellyfin and Emby, which are one protocol with a prefix on it.
 //!
-//! Jellyfin is a 2018 fork of Emby 3.5.2. The session shape, the `X-Emby-Token`
-//! header (Jellyfin kept the name) and the .NET tick encoding are all
-//! inheritance rather than coincidence, so both servers are driven from one
+//! Jellyfin is a 2018 fork of Emby 3.5.2. The session shape, the API key header
+//! (until Jellyfin 12 dropped `X-Emby-Token`, see [`Flavour::auth_header`]) and
+//! the .NET tick encoding are all inheritance rather than coincidence, so both servers are driven from one
 //! client parameterised by [`Flavour`].
 //!
 //! **The closeness is the trap.** Emby has developed independently for seven
@@ -94,6 +94,40 @@ impl Flavour {
             Flavour::Jellyfin => "Jellyfin",
             Flavour::Emby => "Emby",
         }
+    }
+
+    /// The header an API key travels in.
+    ///
+    /// **Jellyfin 12 refuses `X-Emby-Token`** — and `X-MediaBrowser-Token` and
+    /// `?api_key=` with it: each answers 401 for a key that is valid (measured
+    /// against 12.4.0 in the media lab, 2026-11-20). It takes
+    /// `Authorization: MediaBrowser Token="…"`, which Jellyfin 10.x accepts as
+    /// well, so that is the one form sent to Jellyfin. Emby keeps
+    /// `X-Emby-Token`: it is what Emby documents, and Emby answers a bare
+    /// `Authorization: MediaBrowser …` playback report with 400.
+    pub fn auth_header(&self, api_key: &str) -> (&'static str, String) {
+        match self {
+            Flavour::Jellyfin => ("Authorization", format!("MediaBrowser Token=\"{api_key}\"")),
+            Flavour::Emby => ("X-Emby-Token", api_key.to_string()),
+        }
+    }
+}
+
+/// Attach an API key the way [`Flavour::auth_header`] says the server wants it.
+/// Bits per second to kbps, rounded — `231743` is `232`, as Plex reports the
+/// same file.
+pub(crate) fn bps_to_kbps(bps: i32) -> i32 {
+    (bps.saturating_add(500)) / 1000
+}
+
+pub(crate) trait MediaBrowserAuth {
+    fn mb_auth(self, flavour: Flavour, api_key: &str) -> Self;
+}
+
+impl MediaBrowserAuth for reqwest::RequestBuilder {
+    fn mb_auth(self, flavour: Flavour, api_key: &str) -> Self {
+        let (name, value) = flavour.auth_header(api_key);
+        self.header(name, value)
     }
 }
 
@@ -390,11 +424,16 @@ pub(crate) struct NowPlayingItem {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProviderIds {
-    /// Jellyfin's own tag for the MusicBrainz recording id. Emby writes
-    /// `MusicBrainzTrack` too, but this is unconfirmed against a live server —
-    /// see `emby.rs`.
+    /// **Not always the recording.** Emby 4.10 and Jellyfin 12 put the
+    /// *release-track* id here (checked against each file's tags in the media
+    /// lab, 2026-11-21); Jellyfin 12 sends the recording as
+    /// `MusicBrainzRecording` beside it. Jellyfin before 12 sent only this key,
+    /// holding the recording. [`MediaBrowserSource::musicbrainz_ids`] decides.
     #[serde(rename = "MusicBrainzTrack", default)]
     pub musicbrainz_track: Option<String>,
+    /// Jellyfin 12's recording id. Emby sends none.
+    #[serde(rename = "MusicBrainzRecording", default)]
+    pub musicbrainz_recording: Option<String>,
     #[serde(rename = "MusicBrainzAlbum", default)]
     pub musicbrainz_album: Option<String>,
     /// The performer. `MusicBrainzArtist` is the track artist and
@@ -540,7 +579,7 @@ impl MediaBrowserSource {
 
         let resp = client
             .get(format!("{base}/Users/Me"))
-            .header("X-Emby-Token", api_key)
+            .mb_auth(flavour, api_key)
             .header("Accept", "application/json")
             .send()
             .await?;
@@ -605,7 +644,7 @@ impl MediaBrowserSource {
 
         let resp = client
             .get(format!("{base}/Users"))
-            .header("X-Emby-Token", api_key)
+            .mb_auth(flavour, api_key)
             .header("Accept", "application/json")
             .send()
             .await?;
@@ -633,7 +672,7 @@ impl MediaBrowserSource {
         let resp = self
             .client
             .get(self.endpoint("/System/Info"))
-            .header("X-Emby-Token", &self.api_key)
+            .mb_auth(self.flavour, &self.api_key)
             .send()
             .await?;
         if resp.status() == StatusCode::UNAUTHORIZED {
@@ -653,7 +692,7 @@ impl MediaBrowserSource {
         let resp = self
             .client
             .get(self.endpoint("/Sessions"))
-            .header("X-Emby-Token", &self.api_key)
+            .mb_auth(self.flavour, &self.api_key)
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -753,6 +792,9 @@ impl MediaBrowserSource {
                 let mut banked = track.clone();
                 banked.play.source_id =
                     format!("{}-{}-scrobble-{}", self.flavour.source_name(), item.id, now_secs());
+                // When the play started, not when it counted: a listen's
+                // timestamp is its start, as the API document says.
+                banked.play.timestamp = now_secs().saturating_sub(position);
                 result.ready_to_scrobble.push(banked);
             }
             result.now_playing.push(track);
@@ -760,6 +802,31 @@ impl MediaBrowserSource {
 
         self.tracker.retain_live(&live_sessions);
         result
+    }
+
+    /// `(recording, release track)` out of `ProviderIds`.
+    ///
+    /// A release-track id stored as the recording is a wrong id, not a missing
+    /// one: MusicBrainz answers it with nothing, and every credit and genre
+    /// keyed on the recording goes with it.
+    ///
+    /// * `MusicBrainzRecording` present (Jellyfin 12): that is the recording,
+    ///   and `MusicBrainzTrack` the release track.
+    /// * Emby: `MusicBrainzTrack` is the release track; no recording is sent.
+    /// * Jellyfin without `MusicBrainzRecording` (before 12): `MusicBrainzTrack`
+    ///   is the recording, which is what Picard's `musicbrainz_trackid` holds.
+    pub(crate) fn musicbrainz_ids(
+        flavour: Flavour,
+        ids: Option<&ProviderIds>,
+    ) -> (Option<String>, Option<String>) {
+        let Some(p) = ids else { return (None, None) };
+        let nonblank = |v: &Option<String>| v.clone().filter(|s| !s.trim().is_empty());
+        let track = nonblank(&p.musicbrainz_track);
+        match (nonblank(&p.musicbrainz_recording), flavour) {
+            (Some(rec), _) => (Some(rec), track),
+            (None, Flavour::Emby) => (None, track),
+            (None, Flavour::Jellyfin) => (track, None),
+        }
     }
 
     pub(crate) fn to_play(
@@ -773,6 +840,7 @@ impl MediaBrowserSource {
             .and_then(|a| a.first().cloned())
             .or_else(|| item.album_artist.clone())
             .unwrap_or_else(|| "Unknown".to_string());
+        let (recording, release_track) = Self::musicbrainz_ids(flavour, item.provider_ids.as_ref());
 
         Play {
             // The item id alone would collide across repeat plays, so the
@@ -793,7 +861,7 @@ impl MediaBrowserSource {
             track_number: item.index_number.filter(|n| *n > 0),
             // Carries MusicBrainz ids when the library was tagged — another
             // listen that never needs a MusicBrainz lookup.
-            mbid_recording: item.provider_ids.as_ref().and_then(|p| p.musicbrainz_track.clone()),
+            mbid_recording: recording.clone(),
             mbid_release: item.provider_ids.as_ref().and_then(|p| p.musicbrainz_album.clone()),
             mbid_artist: item
                 .provider_ids
@@ -807,9 +875,8 @@ impl MediaBrowserSource {
                 .provider_ids
                 .as_ref()
                 .and_then(|p| p.musicbrainz_release_group.clone()),
-            // No release-track or work id in `ProviderIds` — Jellyfin does not
-            // surface either, so these stay unset rather than guessed at.
-            mbid_release_track: None,
+            // No work id in `ProviderIds` — neither server surfaces one.
+            mbid_release_track: release_track,
             mbid_work: None,
             // Also recorded now, rather than only as a fallback for the
             // performer above: the record's credit and the track's are
@@ -886,7 +953,8 @@ impl MediaBrowserSource {
 
         let mut q = AudioQuality {
             codec: audio.codec.clone(),
-            bitrate: audio.bit_rate,
+            // `BitRate` is bits per second; a listen's bitrate is kbps.
+            bitrate: audio.bit_rate.map(bps_to_kbps),
             sample_rate: audio.sample_rate,
             bit_depth: audio.bit_depth.map(|b| b as i16),
             channels: audio.channels.map(|c| c as i16),
@@ -942,7 +1010,7 @@ impl MediaBrowserSource {
             .client
             .get(self.endpoint("/Artists"))
             .query(&[("searchTerm", name), ("limit", "10")])
-            .header("X-Emby-Token", &self.api_key)
+            .mb_auth(self.flavour, &self.api_key)
             .header("Accept", "application/json")
             .send()
             .await?;
@@ -1048,7 +1116,7 @@ impl MediaBrowserSource {
                 ("limit", "20"),
                 ("fields", "Artists"),
             ])
-            .header("X-Emby-Token", &self.api_key)
+            .mb_auth(self.flavour, &self.api_key)
             .header("Accept", "application/json")
             .send()
             .await?;
@@ -1167,7 +1235,7 @@ impl MediaBrowserSource {
                     ("startIndex", &start.to_string()),
                     ("limit", &RATING_PAGE_SIZE.to_string()),
                 ])
-                .header("X-Emby-Token", &self.api_key)
+                .mb_auth(self.flavour, &self.api_key)
                 .header("Accept", "application/json")
                 .send()
                 .await?;
@@ -1216,12 +1284,18 @@ impl MediaBrowserSource {
                     name,
                     album: if kind == "recording" { it.album } else { None },
                     // Free, and every one is a MusicBrainz lookup not made.
-                    mbid: it
-                        .provider_ids
-                        .get("MusicBrainzTrack")
-                        .or_else(|| it.provider_ids.get("MusicBrainzAlbum"))
-                        .or_else(|| it.provider_ids.get("MusicBrainzArtist"))
-                        .cloned(),
+                    // Each kind's own id: a track's `MusicBrainzTrack` is the
+                    // release track on Emby and Jellyfin 12, never a recording
+                    // (see `musicbrainz_ids`).
+                    mbid: match kind {
+                        "release" => it.provider_ids.get("MusicBrainzAlbum").cloned(),
+                        "artist" => it.provider_ids.get("MusicBrainzArtist").cloned(),
+                        _ => it.provider_ids.get("MusicBrainzRecording").cloned().or_else(|| {
+                            (self.flavour == Flavour::Jellyfin)
+                                .then(|| it.provider_ids.get("MusicBrainzTrack").cloned())
+                                .flatten()
+                        }),
+                    },
                     rating: rating.map(|v| {
                         crate::ratings::Rating::new(v, crate::ratings::SourceScale::MEDIABROWSER)
                     }),
@@ -1281,7 +1355,7 @@ impl MediaBrowserSource {
         let req = self
             .client
             .post(self.endpoint("/Playlists"))
-            .header("X-Emby-Token", &self.api_key)
+            .mb_auth(self.flavour, &self.api_key)
             .header("Accept", "application/json");
 
         let req = match self.flavour {
@@ -1322,7 +1396,7 @@ impl MediaBrowserSource {
         let resp = self
             .client
             .get(self.endpoint(&format!("/Items/{item_id}/Images/Primary")))
-            .header("X-Emby-Token", &self.api_key)
+            .mb_auth(self.flavour, &self.api_key)
             .query(&[("maxWidth", "500")])
             .send()
             .await?;
@@ -1368,7 +1442,7 @@ impl MediaBrowserSource {
             .client
             .get(self.endpoint("/Artists"))
             .query(&[("searchTerm", name), ("limit", "10")])
-            .header("X-Emby-Token", &self.api_key)
+            .mb_auth(self.flavour, &self.api_key)
             .header("Accept", "application/json")
             .send()
             .await?;
@@ -1408,7 +1482,7 @@ impl MediaBrowserSource {
         let resp = self
             .client
             .get(self.endpoint(&format!("/Items/{item_id}/Images")))
-            .header("X-Emby-Token", &self.api_key)
+            .mb_auth(self.flavour, &self.api_key)
             .header("Accept", "application/json")
             .send()
             .await?;
@@ -1427,7 +1501,7 @@ impl MediaBrowserSource {
             .client
             .get(self.endpoint(&format!("/Items/{item_id}/RemoteImages")))
             .query(&[("type", kind), ("limit", "24")])
-            .header("X-Emby-Token", &self.api_key)
+            .mb_auth(self.flavour, &self.api_key)
             .header("Accept", "application/json")
             .send()
             .await;
@@ -1458,7 +1532,7 @@ impl MediaBrowserSource {
         let resp = self
             .client
             .get(self.endpoint(&format!("/Items/{item}/Images/{kind}/{index}")))
-            .header("X-Emby-Token", &self.api_key)
+            .mb_auth(self.flavour, &self.api_key)
             .query(&[("maxWidth", max.to_string())])
             .send()
             .await?;
@@ -1501,10 +1575,13 @@ impl MediaBrowserSource {
         item_id: &str,
     ) -> Result<Option<(Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>>
     {
+        if self.flavour == Flavour::Emby {
+            return self.fetch_emby_lyrics(item_id).await;
+        }
         let resp = self
             .client
             .get(self.endpoint(&format!("/Audio/{item_id}/Lyrics")))
-            .header("X-Emby-Token", &self.api_key)
+            .mb_auth(self.flavour, &self.api_key)
             .send()
             .await?;
 
@@ -1521,6 +1598,102 @@ impl MediaBrowserSource {
         let dto: LyricDto = resp.json().await?;
         Ok(lyric_dto_to_pair(&dto))
     }
+
+    /// Emby's lyrics, which are not where Jellyfin's are.
+    ///
+    /// Emby has no `/Audio/{id}/Lyrics` (it answers 500). It lists a lyric as a
+    /// **`Subtitle` stream** of the audio item — an `.lrc` beside the file as an
+    /// external stream with codec `lrc`, an embedded tag as codec `text` — and
+    /// serves one as JSON at `/Items/{id}/{source}/Subtitles/{index}/Stream.js`:
+    /// `TrackEvents` with `Text` and `StartPositionTicks`, ticks as everywhere
+    /// else on this server. Measured against Emby 4.10.2 in the media lab
+    /// (2026-11-21); asking for `Stream.lrc` there returns an empty body.
+    async fn fetch_emby_lyrics(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(Option<String>, Option<String>)>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Items {
+            #[serde(default)]
+            items: Vec<Item>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Item {
+            #[serde(default)]
+            media_sources: Vec<Source>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Source {
+            id: String,
+            #[serde(default)]
+            media_streams: Vec<Stream>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct Stream {
+            #[serde(rename = "Type", default)]
+            stream_type: Option<String>,
+            #[serde(default)]
+            codec: Option<String>,
+            index: i64,
+            #[serde(default)]
+            is_external: bool,
+        }
+
+        let resp = self
+            .client
+            .get(self.endpoint("/Items"))
+            .mb_auth(self.flavour, &self.api_key)
+            .query(&[("Ids", item_id), ("Fields", "MediaSources")])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(format!("Emby item returned {}", resp.status()).into());
+        }
+        let items: Items = resp.json().await?;
+        // The `.lrc` first: it is the file the user wrote, and it is timed.
+        let pick = items.items.iter().flat_map(|i| &i.media_sources).find_map(|src| {
+            let subs = src.media_streams.iter().filter(|s| {
+                s.stream_type.as_deref().is_some_and(|t| t.eq_ignore_ascii_case("Subtitle"))
+            });
+            let mut best: Option<&Stream> = None;
+            for s in subs {
+                let lrc = s.codec.as_deref().is_some_and(|c| c.eq_ignore_ascii_case("lrc"));
+                if lrc && s.is_external {
+                    best = Some(s);
+                    break;
+                }
+                best = best.or(Some(s));
+            }
+            best.map(|s| (src.id.clone(), s.index))
+        });
+        let Some((source_id, index)) = pick else {
+            return Ok(None);
+        };
+
+        let resp = self
+            .client
+            .get(
+                self.endpoint(&format!("/Items/{item_id}/{source_id}/Subtitles/{index}/Stream.js")),
+            )
+            .mb_auth(self.flavour, &self.api_key)
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(format!("Emby lyrics returned {}", resp.status()).into());
+        }
+        // Emby writes a byte-order mark ahead of the JSON.
+        let text = resp.text().await?;
+        let events: EmbySubtitleTrack = serde_json::from_str(text.trim_start_matches('\u{feff}'))?;
+        Ok(emby_track_to_pair(&events))
+    }
 }
 
 /// `LyricDto` — what `GET /Audio/{id}/Lyrics` returns.
@@ -1528,6 +1701,43 @@ impl MediaBrowserSource {
 /// PascalCase on the wire like every other Jellyfin/Emby response. Pinned to
 /// the 12.0.0 schema; the field that fails silently if it is wrong is `Start`,
 /// which is ticks.
+/// Emby's subtitle stream as JSON (`Stream.js`).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct EmbySubtitleTrack {
+    #[serde(default)]
+    pub track_events: Vec<EmbyTrackEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct EmbyTrackEvent {
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Ticks, as everywhere on this server.
+    #[serde(default)]
+    pub start_position_ticks: Option<i64>,
+}
+
+/// An Emby subtitle track as `(plain, synced)`, through the same conversion
+/// Jellyfin's lyrics take. A track whose every event starts at zero carries no
+/// cues — an unsynced lyric — and is plain only.
+pub fn emby_track_to_pair(track: &EmbySubtitleTrack) -> Option<(Option<String>, Option<String>)> {
+    let timed = track.track_events.iter().any(|e| e.start_position_ticks.unwrap_or(0) > 0);
+    let dto = LyricDto {
+        metadata: None,
+        lyrics: track
+            .track_events
+            .iter()
+            .map(|e| LyricLine {
+                text: e.text.clone(),
+                start: if timed { e.start_position_ticks } else { None },
+            })
+            .collect(),
+    };
+    lyric_dto_to_pair(&dto)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct LyricDto {
@@ -1971,6 +2181,7 @@ mod tests {
             container: Some("flac".into()),
             provider_ids: Some(ProviderIds {
                 musicbrainz_track: Some("mb-track".into()),
+                musicbrainz_recording: None,
                 musicbrainz_album: Some("mb-album".into()),
                 musicbrainz_artist: Some("mb-artist".into()),
                 musicbrainz_album_artist: Some("mb-album-artist".into()),

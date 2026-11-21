@@ -1418,7 +1418,7 @@ const CREDIT_SEPARATORS: [&str; 12] = [
 ];
 
 /// Cut `s` on [`CREDIT_SEPARATORS`]. One element means nothing was cut.
-fn split_credit(s: &str) -> Vec<String> {
+pub(crate) fn split_credit(s: &str) -> Vec<String> {
     let b = s.as_bytes();
     let (mut parts, mut start, mut i) = (Vec::new(), 0, 0);
     while i < b.len() {

@@ -157,6 +157,13 @@ impl Database {
             }
         }
 
+        // v0.133.0: Jellyfin/Emby bitrates from bits per second to kbps. A data
+        // repair rather than DDL, so a failure warns instead of stopping
+        // startup — the rows stay as every earlier release wrote them.
+        if let Err(e) = self.rescale_mediabrowser_bitrates().await {
+            warn!("Could not rescale Jellyfin/Emby bitrates: {}", e);
+        }
+
         Ok(())
     }
 
@@ -935,6 +942,12 @@ impl Database {
             // Not fatal: the rows stay as they were, which is exactly the state
             // every release before this one shipped.
             warn!("Could not re-file misclassified DSD listens: {}", e);
+        }
+
+        // Migration: Jellyfin/Emby bitrates from bits per second to kbps.
+        // Runs until nothing matches; see `rescale_mediabrowser_bitrates`.
+        if let Err(e) = self.rescale_mediabrowser_bitrates().await {
+            warn!("Could not rescale Jellyfin/Emby bitrates: {}", e);
         }
 
         // Migration: a note can hang off a report period.

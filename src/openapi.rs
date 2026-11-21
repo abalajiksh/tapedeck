@@ -425,7 +425,39 @@ fn build() -> (OpenApi, Vec<String>) {
         // nothing else can arrive here that the root has not already set.
         doc.merge(module);
     }
+    overlapping_unions(&mut doc);
     (doc, collisions)
+}
+
+/// Untagged enums whose branches a valid answer can match more than one of.
+///
+/// utoipa renders every `#[serde(untagged)]` enum as a `oneOf`, which means
+/// "exactly one branch". That is only true when the branches exclude each
+/// other. In `Words` they cannot: the no-words branch is `lines` alone, and
+/// every answer has `lines`, so an answer *with* words matched two branches and
+/// failed validation (media lab, 2026-11-21: LYRICS_ONEOF). Serde takes the
+/// first branch that fits, which is what `anyOf` says. Listed by name rather
+/// than applied to every union, because a `oneOf` that holds is a stronger
+/// promise worth keeping.
+const OVERLAPPING_UNIONS: &[&str] = &["Words"];
+
+fn overlapping_unions(doc: &mut OpenApi) {
+    use utoipa::openapi::schema::{AnyOfBuilder, Schema};
+    use utoipa::openapi::RefOr;
+    let Some(components) = doc.components.as_mut() else { return };
+    for name in OVERLAPPING_UNIONS {
+        let Some(RefOr::T(Schema::OneOf(one))) = components.schemas.get(*name) else {
+            continue;
+        };
+        let any = one
+            .items
+            .iter()
+            .cloned()
+            .fold(AnyOfBuilder::new(), |b, item| b.item(item))
+            .description(one.description.clone())
+            .build();
+        components.schemas.insert((*name).to_string(), RefOr::T(Schema::AnyOf(any)));
+    }
 }
 
 /// This instance's API description.
@@ -1133,6 +1165,19 @@ mod tests {
     /// A generated document cannot be mis-indented, but the check is cheap, it
     /// reads with a second, independent parser, and it is what stands between
     /// a truncated or hand-edited snapshot and the website.
+    /// Every name in `OVERLAPPING_UNIONS` is still a schema, and rendered as an
+    /// `anyOf` — a rename would otherwise leave the `oneOf` back in silently.
+    #[test]
+    fn overlapping_unions_are_any_of() {
+        let doc = serde_json::to_value(super::document()).unwrap();
+        for name in super::OVERLAPPING_UNIONS {
+            let schema = &doc["components"]["schemas"][*name];
+            assert!(schema.is_object(), "{name} is no longer a schema");
+            assert!(schema.get("oneOf").is_none(), "{name} is a oneOf again");
+            assert!(schema["anyOf"].as_array().is_some_and(|a| a.len() > 1), "{name}: {schema}");
+        }
+    }
+
     #[test]
     fn the_spec_is_a_document_a_client_can_actually_load() {
         let text = committed();

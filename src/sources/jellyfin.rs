@@ -7,9 +7,10 @@
 //!
 //! Two structural facts about this source, both still true:
 //!
-//! * **Auth is an API key**, sent as `X-Emby-Token` — Jellyfin kept the header
-//!   name from Emby. Jellyfin lets a user mint one per client, so it is
-//!   per-user in the same way a Plex token is.
+//! * **Auth is an API key**, sent as `Authorization: MediaBrowser Token="…"`.
+//!   Jellyfin kept Emby's `X-Emby-Token` until 12, which refuses it. Jellyfin
+//!   lets a user mint one per client, so it is per-user in the same way a Plex
+//!   token is.
 //! * **There is no play history to backfill.** Jellyfin doesn't record listens
 //!   natively — that needs the Playback Reporting plugin, which not everyone
 //!   installs. So this source only ever sees what's playing now, unlike
@@ -148,6 +149,9 @@ mod tests {
         assert_eq!(q.container.as_deref(), Some("flac"));
         assert_eq!(q.is_lossless, Some(true));
         assert_eq!(q.sample_rate, Some(44100));
+        // `BitRate` is bits per second (media lab, 2026-11-21: Emby sent
+        // 231743 for a 16/44.1 FLAC Plex reports as 232); a listen's is kbps.
+        assert_eq!(q.bitrate, Some(900), "bits per second → kbps");
 
         // The delivery half.
         assert_eq!(q.is_transcoded, Some(true));
@@ -371,5 +375,25 @@ mod tests {
         let dto: crate::sources::mediabrowser::LyricDto =
             serde_json::from_str(r#"{"Lyrics": []}"#).unwrap();
         assert!(crate::sources::mediabrowser::lyric_dto_to_pair(&dto).is_none());
+    }
+
+    /// Jellyfin 12 sends the recording as `MusicBrainzRecording` and the release
+    /// track as `MusicBrainzTrack` (lab, 12.4.0); before
+    /// 12, `MusicBrainzTrack` alone held the recording.
+    #[test]
+    fn jellyfin_12_recording_and_release_track_are_kept_apart() {
+        let ids: ProviderIds = serde_json::from_str(
+            r#"{"MusicBrainzRecording":"rec","MusicBrainzTrack":"rt","MusicBrainzAlbum":"rel"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            MediaBrowserSource::musicbrainz_ids(Flavour::Jellyfin, Some(&ids)),
+            (Some("rec".into()), Some("rt".into()))
+        );
+        let old: ProviderIds = serde_json::from_str(r#"{"MusicBrainzTrack":"rec"}"#).unwrap();
+        assert_eq!(
+            MediaBrowserSource::musicbrainz_ids(Flavour::Jellyfin, Some(&old)),
+            (Some("rec".into()), None)
+        );
     }
 }

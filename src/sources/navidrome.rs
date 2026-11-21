@@ -110,6 +110,9 @@ pub struct NavidromeSong {
     pub mbid_album_artist: Option<Vec<String>>,
     /// The record's artist by name, which on a compilation is not `artist`.
     pub album_artist: Option<String>,
+    /// The file's format, rate and depth as Navidrome read them — see
+    /// [`navidrome_quality`].
+    pub quality: Option<crate::models::AudioQuality>,
 }
 
 // ── Native API wire types ──
@@ -182,6 +185,78 @@ struct NativeSong {
     mbz_album_artist_id: Option<String>,
     #[serde(default)]
     album_artist: Option<String>,
+    /// The file's audio, as Navidrome's scanner read it. `bitRate` is
+    /// already kbps; `codec` is filled for some formats only (`AAC`, `MP3`)
+    /// and blank for the rest, which `suffix` then names.
+    #[serde(default)]
+    suffix: Option<String>,
+    #[serde(default)]
+    codec: Option<String>,
+    #[serde(default)]
+    bit_rate: Option<i32>,
+    #[serde(default)]
+    sample_rate: Option<i32>,
+    #[serde(default)]
+    bit_depth: Option<i32>,
+    #[serde(default)]
+    channels: Option<i32>,
+}
+
+/// A song's format, rate and depth, from Navidrome's own read of the file.
+///
+/// **This source recorded none of it until v0.133.0** (media lab, 2026-11-21:
+/// a 16/44.1 FLAC through Navidrome had no codec, rate or depth, where the same
+/// play through Jellyfin, Emby or Plex had all three), so every Navidrome
+/// listen sat outside the fidelity cards and scored nothing.
+///
+/// The codec is Navidrome's when it names one, else the file's suffix in the
+/// spellings the other sources use: `ogg` is Vorbis, `wv` WavPack, WAV and
+/// AIFF are PCM, DSF and DFF are DSD. An `m4a` with no codec is left without
+/// one, because it holds either AAC or ALAC and nothing here says which. A
+/// file is played as it is (Navidrome's scrobble history records no
+/// transcode), so `is_transcoded` stays unknown rather than claimed.
+fn navidrome_quality(
+    suffix: Option<&str>,
+    codec: Option<&str>,
+    bitrate: Option<i32>,
+    sample_rate: Option<i32>,
+    bit_depth: Option<i32>,
+    channels: Option<i32>,
+) -> Option<crate::models::AudioQuality> {
+    let suffix = suffix.map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty());
+    let codec = codec.map(|c| c.trim().to_lowercase()).filter(|c| !c.is_empty()).or_else(|| {
+        Some(
+            match suffix.as_deref()? {
+                "flac" => "flac",
+                "mp3" => "mp3",
+                "opus" => "opus",
+                "ogg" | "oga" => "vorbis",
+                "wv" => "wavpack",
+                "ape" => "ape",
+                "wav" | "aif" | "aiff" | "aifc" => "pcm",
+                "dsf" | "dff" => "dsd",
+                "aac" => "aac",
+                _ => return None,
+            }
+            .to_string(),
+        )
+    });
+    let positive = |v: Option<i32>| v.filter(|n| *n > 0);
+    let mut q = crate::models::AudioQuality {
+        codec,
+        bitrate: positive(bitrate),
+        sample_rate: positive(sample_rate),
+        bit_depth: positive(bit_depth).and_then(|b| i16::try_from(b).ok()),
+        channels: positive(channels).and_then(|c| i16::try_from(c).ok()),
+        container: suffix,
+        ..Default::default()
+    };
+    if !q.has_data() {
+        return None;
+    }
+    q.classify_codec();
+    q.compute_score();
+    Some(q)
 }
 
 #[derive(Deserialize, Default)]
@@ -423,10 +498,11 @@ impl NavidromeSource {
 
     /// Scrobbles submitted after `from`. This is the backfill: Navidrome keeps
     /// its own play history, so a new Tapedeck install can pull years of it.
+    /// Each new listen with the file's quality, when Navidrome read one.
     pub async fn fetch_scrobbles(
         &mut self,
         from: u64,
-    ) -> Result<Vec<Play>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<(Play, Option<crate::models::AudioQuality>)>, Box<dyn std::error::Error>> {
         // Paged, because a single `_end=10000` is only safe under an ordering
         // Navidrome does not promise. If its history comes back **newest
         // first**, one capped request advances `last_submission` to the very
@@ -494,7 +570,10 @@ impl NavidromeSource {
                 );
                 continue;
             };
-            plays.push(song.to_play(row.submission_time, &row.media_file_id));
+            plays.push((
+                song.to_play(row.submission_time, &row.media_file_id),
+                song.quality.clone(),
+            ));
         }
         self.last_submission = newest;
         Ok(plays)
@@ -575,6 +654,14 @@ impl NavidromeSource {
                         mbid_release: id_one(s.mbz_album_id),
                         mbid_release_group: id_one(s.mbz_release_group_id),
                         mbid_release_track: id_one(s.mbz_release_track_id),
+                        quality: navidrome_quality(
+                            s.suffix.as_deref(),
+                            s.codec.as_deref(),
+                            s.bit_rate,
+                            s.sample_rate,
+                            s.bit_depth,
+                            s.channels,
+                        ),
                     },
                 )
             })
@@ -1032,7 +1119,7 @@ impl MusicSource for NavidromeSource {
         // the same reason: prefer a few redundant rows to a silent hole.
         let from = resume_point(self.last_submission, last_checked);
         match self.fetch_scrobbles(from).await {
-            Ok(plays) => Ok(plays),
+            Ok(plays) => Ok(plays.into_iter().map(|(p, _)| p).collect()),
             Err(e) => {
                 warn!("Navidrome scrobble fetch failed: {}", e);
                 Err(e)
@@ -1113,7 +1200,66 @@ mod tests {
             mbid_artist: None,
             mbid_album_artist: None,
             album_artist: None,
+            quality: None,
         }
+    }
+
+    /// What Navidrome 0.64.2's `/api/song` sent for the lab's Codec Matrix
+    /// (2026-11-21): `codec` only for some formats, `suffix` always, `bitRate`
+    /// already in kbps.
+    #[test]
+    fn a_navidrome_song_carries_its_format_rate_and_depth() {
+        let flac =
+            navidrome_quality(Some("flac"), Some(""), Some(231), Some(44100), Some(16), Some(2))
+                .expect("quality");
+        assert_eq!(flac.codec.as_deref(), Some("flac"));
+        assert_eq!(flac.container.as_deref(), Some("flac"));
+        assert_eq!(
+            (flac.sample_rate, flac.bit_depth, flac.bitrate),
+            (Some(44100), Some(16), Some(231))
+        );
+        assert_eq!(flac.is_lossless, Some(true));
+
+        let aac =
+            navidrome_quality(Some("m4a"), Some("AAC"), Some(256), Some(44100), Some(16), Some(2))
+                .unwrap();
+        assert_eq!((aac.codec.as_deref(), aac.is_lossless), (Some("aac"), Some(false)));
+
+        let wav =
+            navidrome_quality(Some("wav"), Some(""), Some(1411), Some(44100), Some(16), Some(2))
+                .unwrap();
+        assert_eq!((wav.codec.as_deref(), wav.is_lossless), (Some("pcm"), Some(true)));
+
+        let dsf =
+            navidrome_quality(Some("dsf"), Some(""), Some(5645), Some(2822400), Some(1), Some(2))
+                .unwrap();
+        assert_eq!(dsf.format_type.as_deref(), Some("dsd"));
+
+        let ogg =
+            navidrome_quality(Some("ogg"), None, Some(36), Some(44100), None, Some(2)).unwrap();
+        assert_eq!((ogg.codec.as_deref(), ogg.bit_depth), (Some("vorbis"), None));
+
+        // An m4a without a codec is AAC or ALAC: no codec claimed, the rest kept.
+        let m4a =
+            navidrome_quality(Some("m4a"), Some(""), Some(900), Some(44100), Some(16), Some(2))
+                .unwrap();
+        assert_eq!((m4a.codec, m4a.is_lossless), (None, None));
+        assert_eq!(navidrome_quality(None, None, None, None, None, None).map(|_| ()), None);
+    }
+
+    /// The wire names, against the captured shape.
+    #[test]
+    fn the_native_song_reads_navidromes_audio_fields() {
+        let s: NativeSong = serde_json::from_str(
+            r#"{"id":"x","title":"T","artist":"A","duration":10.5,"suffix":"flac",
+                "bitRate":231,"sampleRate":44100,"bitDepth":16,"channels":2,"codec":""}"#,
+        )
+        .unwrap();
+        assert_eq!(s.suffix.as_deref(), Some("flac"));
+        assert_eq!(
+            (s.bit_rate, s.sample_rate, s.bit_depth, s.channels),
+            (Some(231), Some(44100), Some(16), Some(2))
+        );
     }
 
     /// The cursor rewinds, and never underflows past the epoch.

@@ -176,6 +176,7 @@ mod tests {
         assert_eq!(q.delivery_bitrate, Some(192), "bits per second → kbps");
         // The source half is still the file on disk.
         assert_eq!(q.codec.as_deref(), Some("flac"));
+        assert_eq!(q.bitrate, Some(900), "the stream's bits per second → kbps");
         assert_eq!(q.is_lossless, Some(true));
     }
 
@@ -240,10 +241,72 @@ mod tests {
         assert_eq!(play.title, "Archangel");
         assert_eq!(play.duration, Some(240));
         assert_eq!(play.track_number, Some(3));
-        assert_eq!(play.mbid_recording.as_deref(), Some("mb-archangel"));
+        // Emby's `MusicBrainzTrack` is the release track (media lab), and it
+        // sends no recording: none is better than a wrong one.
+        assert_eq!(play.mbid_recording, None);
+        assert_eq!(play.mbid_release_track.as_deref(), Some("mb-archangel"));
+        // Stamped when the play started — 123 s before it counted — not when
+        // it crossed the threshold.
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert!((now - 125..=now - 122).contains(&play.timestamp), "{}", play.timestamp);
 
         // And the deck's copy keeps the stable id.
         assert_eq!(out.now_playing.len(), 1);
         assert!(!out.now_playing[0].play.source_id.contains("scrobble"));
+    }
+
+    /// Emby's `Stream.js` for an `.lrc`, shape captured from Emby 4.10.2 in the
+    /// media lab (2026-11-21) — words replaced, ticks kept. A byte-order mark
+    /// leads the body; `fetch_emby_lyrics` strips it before parsing.
+    #[test]
+    fn an_emby_subtitle_track_becomes_a_timed_lyric() {
+        let body = r#"{"TrackEvents":[
+            {"Text":"First line","StartPositionTicks":403500000,"EndPositionTicks":457500000},
+            {"Text":"Second line","StartPositionTicks":615000000,"EndPositionTicks":621600000}
+        ]}"#;
+        let t: EmbySubtitleTrack = serde_json::from_str(body).unwrap();
+        let (plain, synced) = emby_track_to_pair(&t).expect("words");
+        assert_eq!(plain.as_deref(), Some("First line\nSecond line"));
+        // Ticks, not milliseconds: 40.35 s, and 61.5 s rolls over a minute.
+        assert_eq!(synced.as_deref(), Some("[00:40.35] First line\n[01:01.50] Second line"));
+    }
+
+    /// Every event at zero is an unsynced lyric: plain words, no cues.
+    #[test]
+    fn an_emby_track_with_no_times_is_plain() {
+        let body = r#"{"TrackEvents":[
+            {"Text":"One","StartPositionTicks":0},{"Text":"Two","StartPositionTicks":0}
+        ]}"#;
+        let t: EmbySubtitleTrack = serde_json::from_str(body).unwrap();
+        assert_eq!(emby_track_to_pair(&t), Some((Some("One\nTwo".into()), None)));
+        let empty: EmbySubtitleTrack = serde_json::from_str(r#"{"TrackEvents":[]}"#).unwrap();
+        assert_eq!(emby_track_to_pair(&empty), None);
+    }
+
+    /// Emby's `MusicBrainzTrack` is the release-track id (media lab: it
+    /// differs from the recording in the file's tags), and Emby sends no
+    /// recording. Storing it as the recording was a wrong id, not a missing one.
+    #[test]
+    fn emby_music_brainz_track_is_the_release_track() {
+        let ids: ProviderIds = serde_json::from_str(
+            r#"{"MusicBrainzTrack":"rt","MusicBrainzAlbum":"rel","MusicBrainzArtist":"art"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            MediaBrowserSource::musicbrainz_ids(Flavour::Emby, Some(&ids)),
+            (None, Some("rt".into()))
+        );
+    }
+
+    /// Emby keeps `X-Emby-Token`; Jellyfin 12 refuses it (401) and takes the
+    /// `Authorization` form, measured against 12.4.0 in the media lab.
+    #[test]
+    fn each_server_gets_its_key_in_the_header_it_accepts() {
+        assert_eq!(Flavour::Emby.auth_header("k"), ("X-Emby-Token", "k".to_string()));
+        assert_eq!(
+            Flavour::Jellyfin.auth_header("k"),
+            ("Authorization", "MediaBrowser Token=\"k\"".to_string())
+        );
     }
 }

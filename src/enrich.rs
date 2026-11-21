@@ -341,10 +341,11 @@ pub async fn resolve_lyrics(
 pub async fn lyrics_from_library_now(
     db: &Database,
     lyrics: &crate::lyrics::LyricsClient,
+    user_id: i64,
     artist: &str,
     title: &str,
 ) -> bool {
-    let Ok(Some(r)) = db.library_ref_for_track(title, artist).await else {
+    let Ok(Some(r)) = db.library_ref_for_track(user_id, title, artist).await else {
         return false;
     };
     let mut servers = LibraryClients::default();
@@ -376,13 +377,14 @@ pub async fn lyrics_from_library_now(
 pub async fn lyrics_now(
     db: &Database,
     lyrics: &crate::lyrics::LyricsClient,
+    user_id: i64,
     artist: &str,
     title: &str,
     album: Option<&str>,
     duration: Option<i64>,
 ) -> LyricOutcome {
     let lib = db
-        .library_ref_for_track(title, artist)
+        .library_ref_for_track(user_id, title, artist)
         .await
         .or_warn("lyrics_now: library_ref_for_track")
         .flatten();
