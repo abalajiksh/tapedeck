@@ -1,0 +1,16 @@
+# An allow-list. A checkout's root holds live databases and the secret key
+# (tapedeck.key, scrobbles.db, tapedeck.db, everynoise.db), logs, temp/ and a
+# multi-gigabyte target/ — none of which may reach a build context.
+*
+
+!Cargo.toml
+!Cargo.lock
+!build.rs
+!src/
+!assets/
+!web/
+
+# Built or installed inside the image.
+web/node_modules/
+web/.svelte-kit/
+web/build/

@@ -1,0 +1,43 @@
+# Tapedeck with Docker Compose.
+#
+#   docker compose up -d        then open http://<host>:8080
+#
+# Until the first admin account exists, the setup page answers anyone who can
+# reach the port, so create it straight away — or bind to 127.0.0.1 until you
+# have (see `ports`).
+#
+# Everything Tapedeck writes — the databases, uploaded scans and the
+# credential key (tapedeck.key) — lives in the `tapedeck-data` volume. Back up
+# the whole volume, and treat the backup as sensitive: the key in it decrypts
+# the stored service credentials.
+
+services:
+  tapedeck:
+    image: ghcr.io/abalajiksh/tapedeck:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+      # - "127.0.0.1:8080:8080"   # until the admin account exists, or behind a proxy
+    volumes:
+      - tapedeck-data:/data
+    environment:
+      # MusicBrainz asks every client for a real way to reach its operator — an
+      # email address or a URL of yours. Until it is set, MusicBrainz and Cover
+      # Art Archive lookups stay off (MetaBrainz blocks clients that do not
+      # identify themselves), and the log says so at startup.
+      MUSICBRAINZ_CONTACT: ""
+
+      # Behind a reverse proxy that terminates HTTPS, set both. PUBLIC_URL is
+      # the address people type; without it the OAuth issuer published for MCP
+      # clients says http:// and conformant clients refuse it during discovery.
+      # PUBLIC_URL: "https://tapedeck.example.com"
+      # TRUST_PROXY: "true"
+
+      # Private networks a member's media-server source may point at (admins'
+      # sources may point anywhere). Your LAN, if Plex/Jellyfin/Navidrome is on it.
+      # TAPEDECK_SOURCE_NETWORKS: "192.168.1.0/24"
+
+      # RUST_LOG: "info"
+
+volumes:
+  tapedeck-data:

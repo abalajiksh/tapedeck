@@ -1,6 +1,6 @@
 [package]
 name = "tapedeck"
-version = "0.133.1"
+version = "0.134.0"
 edition = "2021"
 # Builds the SvelteKit UI into static/ before rustc runs, so `cargo build` is
 # the whole build and a fresh clone compiles. See build.rs.
@@ -107,6 +107,13 @@ skrifa = "0.44"
 # by module, in the order `build_app` merges the routers. `yaml` renders
 # /api/openapi.yaml.
 utoipa = { version = "5.5", features = ["yaml", "preserve_order", "preserve_path_order"] }
+
+# The container image is a static musl build (Dockerfile), and musl's own
+# allocator is slow under the allocation-heavy work here — whole-history reads,
+# report rendering. mimalloc is the global allocator on musl only (main.rs), so
+# every glibc build — the hosts, OBS — keeps exactly the allocator it had.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false }
 
 [dev-dependencies]
 yaml-rust2 = "0.13.0"
