@@ -9,6 +9,11 @@
 #   docker build -t tapedeck .
 #   docker run -p 8080:8080 -v tapedeck-data:/data tapedeck
 #
+# The Postgres build is the same file with one argument (compose.postgres.yaml
+# runs it beside a database):
+#
+#   docker build --build-arg CARGO_FEATURES=postgres -t tapedeck:postgres .
+#
 # Published to ghcr.io/abalajiksh/tapedeck by .github/workflows/docker.yml
 # when a v* tag reaches the GitHub mirror. The hosts and the OBS packages are
 # built elsewhere (glibc, Jenkins) and are not affected by anything here.
@@ -56,11 +61,18 @@ COPY . .
 # The cache mounts only help a local rebuild: every release changes the source,
 # so in CI this step always runs in full. target/ is a cache mount and vanishes
 # with the step, hence the copy out inside the same RUN.
+#
+# CARGO_FEATURES picks the backend: empty is SQLite, `postgres` is Postgres. The
+# feature switches one type alias and nothing downstream (design note 0005), so
+# both builds share one target cache and the second costs one crate. They also
+# share target/release/tapedeck, which is why that mount is locked: two builds
+# at once would otherwise copy out whichever binary finished last.
 ARG TARGETARCH
+ARG CARGO_FEATURES=
 RUN --mount=type=cache,id=tapedeck-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=tapedeck-target-${TARGETARCH},target=/src/target \
+    --mount=type=cache,id=tapedeck-target-${TARGETARCH},target=/src/target,sharing=locked \
     --mount=type=cache,id=tapedeck-node-modules-${TARGETARCH},target=/src/web/node_modules \
-    cargo build --release --locked \
+    cargo build --release --locked ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
  && cp target/release/tapedeck /tapedeck \
  && strip /tapedeck
 
@@ -90,6 +102,12 @@ COPY --from=build /tapedeck /usr/local/bin/tapedeck
 # and every stored credential (Plex tokens, Navidrome passwords, Last.fm
 # sessions) would become undecryptable. The working directory is /data too, so
 # anything relative — a .env, tapedeck.toml — is read from the volume.
+#
+# The Postgres build keeps these defaults and needs DATABASE_URL set to a
+# postgres:// URL; handed the SQLite one below it refuses to start and says
+# which schemes it takes. It ignores SQLITE_DB_PATH and EVERYNOISE_DB_PATH
+# (those stores move into the one database), but the key, uploads and logs
+# still land on /data, so it needs the volume all the same.
 ENV HOST=0.0.0.0 \
     PORT=8080 \
     DATABASE_URL="sqlite:/data/scrobbles.db?mode=rwc" \
