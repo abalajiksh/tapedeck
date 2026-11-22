@@ -30,8 +30,8 @@ The rest explains each part, and why it works the way it does.
 - **For anything bigger than a fix, open an issue first** and say what you have in
   mind. Tapedeck has opinions (see [Code conventions](#code-conventions)), and it is
   cheaper to agree on a shape before the code exists.
-- `README.md` is the feature tour and the architecture overview. Read its
-  *Architecture* and *Project Structure* sections before a large change.
+- Read [Architecture](#architecture) below before a large change. The feature
+  tour is on [tapedeck.cc](https://tapedeck.cc/features/); `README.md` is kept short.
 
 ## Setting up
 
@@ -319,6 +319,144 @@ it. Read the top of `migrate.rs` before you add one.
 - **Test the upgrade path, not just a fresh database.** A test that builds the old table
   shape by hand, opens it through `Database::new`, and asserts the old data survived is
   the kind that would have caught past crash loops. `src/db/tests.rs` has examples.
+
+## Architecture
+
+### How it fits together
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                       Tapedeck Binary                          │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌───────────────────────┐   ┌──────────────────┐   ┌────────┐ │
+│  │ Poll Sources          │   │  Ingest API      │   │ Import │ │
+│  │ (Plex/Navidrome/      │   │  (LB-compatible) │   │ (LB/fm/│ │
+│  │  Jellyfin/Emby/Roon,  │   │                  │   │ files) │ │
+│  │  per user)            │   │                  │   │        │ │
+│  └───────────┬───────────┘   └────────┬─────────┘   └───┬────┘ │
+│              └────────────────────────┼─────────────────┘      │
+│                                       ▼                        │
+│                          ┌─────────────────────┐               │
+│                          │  Scrobble Engine    │               │
+│                          │  - Dedup            │               │
+│                          │  - MB enrich        │               │
+│                          │  - Artwork chain    │               │
+│                          │  - Quality score    │               │
+│                          │  - Session group    │               │
+│                          └──────────┬──────────┘               │
+│                                     │                          │
+│              ┌──────────────────────┼──────────────────┐       │
+│              ▼                      ▼                  ▼       │
+│     ┌──────────────────┐   ┌────────────────┐  ┌────────────┐ │
+│     │  SQLite          │   │  Sinks         │  │  REST API  │ │
+│     │  (listens,       │   │  (per user:    │  │  + embedded│ │
+│     │   entities/notes,│   │   Last.fm,     │  │    SPA     │ │
+│     │   chains, gear,  │   │   Libre.fm,    │  │            │ │
+│     │   sessions)      │   │   ListenBrainz)│  │            │ │
+│     └──────────────────┘   └────────────────┘  └────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Where things live
+
+```
+src/
+├── main.rs                  Init, wire everything, run
+├── config.rs                Infrastructure config (env > .env > tapedeck.toml)
+├── models.rs                Play, AudioQuality, SignalChain, Device, Session
+├── db/                      Storage: schema, migrations, every query
+│   ├── schema.rs            Every CREATE TABLE / INDEX — the current shape
+│   ├── migrate.rs           Walks an existing SQLite database up to it
+│   ├── dialect.rs           SQLite ⇄ Postgres translation, and what it will not do
+│   ├── guards.rs            Source scanners: the skip filter, index drift, dialect
+│   └── …                    listens, library, physical, notes, patch, users, …
+├── crypto.rs                XChaCha20-Poly1305 credential encryption at rest
+├── musicbrainz.rs           3-tier metadata client
+├── enrich.rs                Background backfills (MBIDs, ISRC, language, art)
+├── analytics.rs             Listening personality + per-artist loyalty
+├── language.rs              Script/language classification
+├── lyrics.rs                LRCLIB client + lyrics cache (language by script)
+├── notes.rs                 Liner-note shortcodes + Markdown rendering
+├── openapi.rs               Builds and serves the generated spec, plus its guards
+├── rockbox.rs               .scrobbler.log parsing (Audioscrobbler Log 1.1)
+├── spotify.rs               Spotify extended streaming history (pure, tested)
+├── tidal.rs                 TIDAL as a playlist target (PKCE + the write half)
+├── amai.rs                  AudioMuse-AI client (per-recording audio vectors)
+├── playlist_lab.rs          The ten-axis space a playlist is generated in
+├── playlists.rs             Track matching + the push-to-server target trait
+├── logging.rs               tracing + file output + live log level
+├── web_assets.rs            serves the embedded SvelteKit SPA
+├── engine/
+│   ├── pipeline.rs          ScrobbleEngine (poll → enrich → store → dispatch)
+│   └── enrichment.rs        MusicBrainz enrichment helper
+├── metadata/
+│   ├── mod.rs               ArtworkProvider trait + the ordered chain
+│   ├── deezer.rs            Deezer artwork provider
+│   ├── bio.rs               BioProvider chain (Last.fm → TheAudioDB → …)
+│   └── release_lookup.rs    Pressing lookup for the shelf (MusicBrainz, Discogs)
+├── dvinyl/                  Reading a DVinyl collection export (fixtures: a real 3.2.1 one)
+├── patch/                   Actor documents, keypairs, HTTP signatures
+├── mcp/                     Model Context Protocol: dispatch, tools, prompts
+├── report_image/            A report chapter drawn as a PNG (fonts, SVG, layout)
+├── server/
+│   ├── mod.rs               AppState, build_app()
+│   ├── admin.rs             Health + log level endpoints
+│   ├── auth.rs              Session/token auth extractors (read / write / MCP)
+│   ├── ingest.rs            /1/submit-listens, /1/validate-token
+│   ├── lb_api.rs            The read side of the ListenBrainz Core API
+│   ├── models.rs            Request/response types + Tapedeck extensions
+│   ├── users.rs             Auth, user + token management, your own account
+│   ├── scrobbles.rs         Listen list/edit/delete, stats, skips
+│   ├── notes.rs             Liner notes, loves, entities
+│   ├── sources.rs           Per-user media sources (CRUD + test)
+│   ├── artwork.rs           Cover-art proxy for library-sourced listens
+│   ├── connections.rs       Last.fm / Libre.fm / ListenBrainz connect flows
+│   ├── now_playing.rs       In-memory now-playing registry
+│   ├── public_np.rs         The one unauthenticated read: /public/np/:user
+│   ├── preferences.rs       Per-user settings (theme, timezone, threshold, …)
+│   ├── export.rs            JSON/CSV export + full DB backup
+│   ├── import.rs            ListenBrainz/Last.fm/file import + jobs
+│   ├── ratelimit.rs         Login throttle
+│   ├── chains.rs            Signal chain, variant, device, equipment endpoints
+│   ├── library.rs           Album/artist pages, charts, entity resolve
+│   ├── sessions.rs          Listening sessions: list, merge, split, rebuild
+│   ├── physical.rs          The shelf — records, tapes and discs — and playing one
+│   ├── rediscovery.rs       Smart collections over your own history
+│   ├── crate_shelf.rs       The Crate: records somebody else suggested
+│   ├── patch.rs             Patch, the Reel, Dubs, Shared Spools, actor endpoints
+│   ├── playlist_lab.rs      Serves the playlist space for the browser to work in
+│   ├── playlists.rs         Push a generated list to Plex / Jellyfin / Subsonic
+│   ├── tidal.rs             TIDAL app registration + per-user OAuth connect
+│   ├── reports.rs           Week/month/year chapters, one pass over the history
+│   ├── report_image.rs      GET /api/v1/reports/image
+│   ├── everynoise.rs        The Every Noise genre map and the genre-map views
+│   ├── pairing.rs           Device-code pairing for browserless clients
+│   ├── oauth.rs             OAuth 2.1 + PKCE for hosted MCP clients
+│   ├── mcp.rs               The /mcp endpoint and its connection management
+│   ├── loves_pull.rs        Pull loves back from Last.fm / ListenBrainz
+│   ├── ops.rs               Operations: engine, sources, forwarding, the log
+│   └── metrics.rs           Prometheus exposition (admin only)
+├── sinks/
+│   ├── mod.rs               sinks_for_user() — the only place sinks are built
+│   ├── health.rs            Per-service circuit breaker
+│   ├── lastfm.rs            Last.fm sink (also drives Libre.fm)
+│   └── listenbrainz.rs      ListenBrainz scrobble + now-playing sink
+└── sources/
+    ├── plex.rs              Plex sessions + history walk
+    ├── navidrome.rs         Navidrome (native history + Subsonic)
+    ├── mediabrowser.rs      The shared Jellyfin/Emby client + session tracker
+    ├── jellyfin.rs          Jellyfin's own tests
+    ├── emby.rs              Emby's own tests
+    └── roon.rs              Roon Core (zone subscription + poll)
+
+src/everynoise/              Every Noise map: parse, store, scrape
+assets/fonts/                Figtree + Caprasimo, embedded for report images
+openapi.yaml                 The whole API, generated; served at /api/openapi.yaml
+integrations/hugo/           Now-playing shortcode for a static site
+web/                         SvelteKit SPA (built into static/, embedded)
+deploy/                      Sample hardened systemd unit
+```
 
 ## Code conventions
 

@@ -12,6 +12,8 @@
 #   tag v0.134.0       →  :0.134.0  :0.134  :latest
 #   tag v0.135.0-rc1   →  :0.135.0-rc1        (latest does not move)
 #   run by hand        →  :test               (a trial; nothing else moves)
+#   run by hand on a tag →  as the tag push    (no :test — the way to publish a
+#                                              tag that arrived without a run)
 #
 # Actions are pinned to commit SHAs, since this workflow holds packages: write.
 
@@ -149,7 +151,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
-            type=raw,value=test,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=test,enable=${{ github.event_name == 'workflow_dispatch' && github.ref_type != 'tag' }}
 
       - name: Join the two digests under the tags
         working-directory: ${{ runner.temp }}/digests
