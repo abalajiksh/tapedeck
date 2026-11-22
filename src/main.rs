@@ -37,6 +37,12 @@ mod spotify;
 mod tidal;
 mod web_assets;
 
+// musl only: the container image's static build. See the comment on the
+// dependency in Cargo.toml; glibc builds keep the system allocator.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::sync::Arc;
 
 use tracing::{error, info, warn};

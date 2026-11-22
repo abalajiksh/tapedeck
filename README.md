@@ -992,6 +992,64 @@ tag is published by Jenkins; to produce the upload set yourself:
 `scripts/make_obs_source.sh OUTDIR [REF]`, and to check a tarball builds and
 boots offline on a Linux host: `scripts/obs_smoke_build.sh TARBALL`.
 
+### Docker
+
+A multi-arch image (`linux/amd64`, `linux/arm64`) is published for every
+release at `ghcr.io/abalajiksh/tapedeck`:
+
+| Tag | Moves to |
+|-----|----------|
+| `latest` | the newest release (never a prerelease) |
+| `0.134` | the newest patch of that minor version |
+| `0.134.0` | exactly that release |
+
+[`compose.yaml`](compose.yaml) is a starting point:
+
+```bash
+curl -fsSLO https://codeberg.org/abksh/tapedeck/raw/branch/main/compose.yaml
+$EDITOR compose.yaml          # MUSICBRAINZ_CONTACT at least
+docker compose up -d          # then open http://<host>:8080
+```
+
+Or in one line:
+
+```bash
+docker run -d --name tapedeck -p 8080:8080 -v tapedeck-data:/data \
+  -e MUSICBRAINZ_CONTACT=you@your.domain ghcr.io/abalajiksh/tapedeck
+```
+
+As with the package, **create the admin account straight away**: until it
+exists, the setup page answers anyone who can reach the port.
+
+Everything Tapedeck writes goes to `/data` — the databases, uploaded scans and
+the credential key `tapedeck.key` — so mount a volume there and nothing is lost
+with the container. The in-app backup is the database alone; a copy of the
+volume holds the key as well, so keep such a copy as private as the key
+itself, or pass the key in as `TAPEDECK_SECRET_KEY` and keep it out of the
+volume. The container runs as uid 10001; a bind mount instead of a named volume
+must be writable by it (`chown 10001:10001 <dir>`).
+
+Behind a reverse proxy that terminates HTTPS, set `PUBLIC_URL` and
+`TRUST_PROXY=true` (see [Configuration](#configuration)). The image's own
+settings are environment variables, which take precedence over
+`tapedeck.toml`; a `tapedeck.toml` or `.env` placed in the volume is read for
+everything else.
+
+The image is a static musl build on Alpine, with the certificate roots and time
+zones compiled in. It leaves out `ffmpeg`, so a report mixdown plays in the
+browser but offers no video export; to have it, build on top of the image:
+
+```dockerfile
+FROM ghcr.io/abalajiksh/tapedeck
+USER root
+RUN apk add --no-cache ffmpeg
+USER tapedeck
+```
+
+To build the image yourself: `docker build -t tapedeck .` from a checkout. It
+is SQLite only; a Postgres build is a different binary (see
+[Two backends](#two-backends-one-source-tree)) and is not published as an image.
+
 ### Prerequisites
 
 To build:
@@ -1727,7 +1785,8 @@ deploy/                      Sample hardened systemd unit
       optionally scrobble what the phone is playing. `AudioDeviceInfo` is the one
       thing only Android can contribute: USB DAC vs Bluetooth vs speaker, straight
       onto the chain ladder's device rung
-- [ ] Docker container
+- [x] **Docker container** — multi-arch, on GHCR, published from every
+      release tag (see [Docker](#docker))
 - [ ] Notes: **tags**. Full-text search and Markdown export for Obsidian/Logseq
       already shipped
 - [ ] **Why Plex loses tracks on a playlist push** — the push now reports the
