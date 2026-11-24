@@ -44,7 +44,8 @@ The service is installed but not enabled; set `MUSICBRAINZ_CONTACT` in
 `/etc/tapedeck/tapedeck.env`, then run `sudo systemctl enable --now tapedeck`.
 
 **Docker** images are multi-arch (amd64, arm64) and published for every
-release. Tags: `latest`, `0.134`, `0.134.0`.
+release, for SQLite (`latest`, `0.135`, `0.135.0`) and for Postgres
+(`postgres`, `0.135-postgres`, `0.135.0-postgres`).
 
 ```bash
 docker run -d --name tapedeck -p 8080:8080 -v tapedeck-data:/data \
@@ -52,8 +53,11 @@ docker run -d --name tapedeck -p 8080:8080 -v tapedeck-data:/data \
 ```
 
 Everything is written to `/data`, including the credential key, so keep that
-volume. [`compose.yaml`](compose.yaml) is a starting point. The image has no
-ffmpeg, so a report Mixdown plays in the browser but can't be exported as video.
+volume. [`compose.yaml`](compose.yaml) is a starting point, and
+[`compose.postgres.yaml`](compose.postgres.yaml) runs the Postgres image beside
+a database. Pick the backend at install time: nothing moves a SQLite history
+into Postgres yet. The images have no ffmpeg, so a report Mixdown plays in the
+browser but can't be exported as video.
 
 **From source** you need Rust 1.88+ and [Bun](https://bun.sh); `build.rs`
 builds the web UI into the binary.

@@ -5,13 +5,19 @@
 # own and starts this; nothing waits on the result. The Jenkins pipelines —
 # tests, staging, the demo, OBS — are untouched by it and know nothing of it.
 #
-# Each architecture builds natively, in parallel (no QEMU: an emulated release
-# build of this tree takes hours), and pushes by digest. The last job joins the
-# two digests into one multi-arch image and names it.
+# Two images per release, one per backend: SQLite (the default) and Postgres.
+# The backend is fixed when the binary is compiled (`--features postgres`), so
+# they are two builds of the same Dockerfile, told apart by a tag suffix.
 #
-#   tag v0.134.0       →  :0.134.0  :0.134  :latest
-#   tag v0.135.0-rc1   →  :0.135.0-rc1        (latest does not move)
-#   run by hand        →  :test               (a trial; nothing else moves)
+# Each architecture builds natively, in parallel (no QEMU: an emulated release
+# build of this tree takes hours), and pushes by digest. The last job, once per
+# backend, joins its two digests into one multi-arch image and names it.
+#
+#   tag v0.135.0       →  :0.135.0  :0.135  :latest
+#                         :0.135.0-postgres  :0.135-postgres  :postgres
+#   tag v0.136.0-rc1   →  :0.136.0-rc1  :0.136.0-rc1-postgres
+#                                             (latest and postgres do not move)
+#   run by hand        →  :test  :test-postgres   (a trial; nothing else moves)
 #   run by hand on a tag →  as the tag push    (no :test — the way to publish a
 #                                              tag that arrived without a run)
 #
@@ -57,11 +63,13 @@ jobs:
           fi
 
   build:
-    name: Build ${{ matrix.arch }}
+    name: Build ${{ matrix.backend }} ${{ matrix.arch }}
     needs: guard
     strategy:
       fail-fast: true
       matrix:
+        backend: [sqlite, postgres]
+        arch: [amd64, arm64]
         include:
           - arch: amd64
             platform: linux/amd64
@@ -69,6 +77,10 @@ jobs:
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
+          - backend: sqlite
+            features: ''
+          - backend: postgres
+            features: postgres
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -100,6 +112,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             TAPEDECK_UI_VERSION_NAME=${{ github.sha }}
+            CARGO_FEATURES=${{ matrix.features }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
       - name: Keep the digest for the merge job
@@ -111,23 +124,36 @@ jobs:
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: digest-${{ matrix.arch }}
+          name: digest-${{ matrix.backend }}-${{ matrix.arch }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    name: Publish the multi-arch image
+    name: Publish the ${{ matrix.backend }} image
     needs: build
     runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
+    # One image per backend. `suffix` lands on every tag but the moving one,
+    # which is named outright: :latest for SQLite, :postgres for Postgres
+    # (not :latest-postgres).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: sqlite
+            suffix: ''
+            moving: latest
+          - backend: postgres
+            suffix: -postgres
+            moving: postgres
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: ${{ runner.temp }}/digests
-          pattern: digest-*
+          pattern: digest-${{ matrix.backend }}-*
           merge-multiple: true
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -138,19 +164,21 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # latest=false in the flavor, and `latest` given by hand, so that only a
-      # real release moves it: never a prerelease, never a trial run.
+      # latest=false in the flavor, and the moving tag given by hand, so that
+      # only a real release moves it: never a prerelease, never a trial run.
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         env:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: index
         with:
           images: ${{ env.IMAGE }}
-          flavor: latest=false
+          flavor: |
+            latest=false
+            suffix=${{ matrix.suffix }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
+            type=raw,value=${{ matrix.moving }},suffix=,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
             type=raw,value=test,enable=${{ github.event_name == 'workflow_dispatch' && github.ref_type != 'tag' }}
 
       - name: Join the two digests under the tags
@@ -168,7 +196,9 @@ jobs:
           [ ${#digests[@]} -eq 2 ] || { echo "::error::expected 2 digests, got ${#digests[@]}"; exit 1; }
           docker buildx imagetools create "${args[@]}" "${digests[@]}"
 
+      # The first tag rather than the `version` output, which is not obliged to
+      # carry the flavor's suffix.
       - name: Show what was published
         env:
-          VERSION: ${{ steps.meta.outputs.version }}
-        run: docker buildx imagetools inspect "$IMAGE:$VERSION"
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: docker buildx imagetools inspect "$(head -n1 <<< "$TAGS")"

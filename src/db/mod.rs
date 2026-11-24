@@ -1679,24 +1679,34 @@ pub const FIDELITY_KNOWN: &str = "(COALESCE(format_type, '') = 'dsd' \
 pub const LOSSLESS_ANY: &str = "(MAX(CASE WHEN is_lossless = TRUE THEN 1 \
      WHEN is_lossless = FALSE THEN 0 END) = 1)";
 
+/// Refuse a `DATABASE_URL` this build cannot serve, in words rather than as a
+/// driver error twenty frames down.
+pub fn check_database_url(database_url: &str) -> Result<(), sqlx::Error> {
+    // Getting handed "unsupported URL scheme" when the real answer is "you want
+    // the other build" is the kind of message that costs an evening. `main`
+    // calls this before anything connects: on a Postgres build the auxiliary
+    // pool (`open_aux_pool`) opens DATABASE_URL first, and handed the SQLite
+    // default the container image ships, the driver read the file path as a
+    // database name ("database \"data/scrobbles.db\" does not exist").
+    if dialect::ACTIVE.accepts(database_url) {
+        return Ok(());
+    }
+    Err(sqlx::Error::Configuration(
+        format!(
+            "this build serves {}, but DATABASE_URL names something else. \
+             Accepted schemes: {}. The two backends are separate builds of the \
+             same binary: `cargo build --features postgres` is the Postgres \
+             one, and so are the container image tags ending in `postgres`.",
+            dialect::ACTIVE.name(),
+            dialect::ACTIVE.schemes().join(", "),
+        )
+        .into(),
+    ))
+}
+
 impl Database {
     pub async fn new(database_url: &str, secrets: Arc<SecretBox>) -> Result<Self, sqlx::Error> {
-        // Refuse a URL this build cannot serve, in words rather than as a
-        // driver error twenty frames down. Getting handed
-        // "unsupported URL scheme" when the real answer is "you want the other
-        // build" is the kind of message that costs an evening.
-        if !dialect::ACTIVE.accepts(database_url) {
-            return Err(sqlx::Error::Configuration(
-                format!(
-                    "this build serves {}, but DATABASE_URL names something else. \
-                     Accepted schemes: {}. The other backend is a separate build \
-                     of the same binary — see `cargo build --features postgres`.",
-                    dialect::ACTIVE.name(),
-                    dialect::ACTIVE.schemes().join(", "),
-                )
-                .into(),
-            ));
-        }
+        check_database_url(database_url)?;
         let pool = Self::connect(database_url).await?;
         let db = Self { pool, secrets };
         // The current shape, then walking an existing database up to it, then

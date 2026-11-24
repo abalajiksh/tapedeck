@@ -88,6 +88,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("🔒 Members' sources may also reach {}", config.source_networks.join(", "));
     }
 
+    // Before anything connects: the auxiliary pool below opens DATABASE_URL
+    // first on a Postgres build, and a URL for the other backend must be
+    // refused by name, not by whatever the driver makes of it.
+    crate::db::check_database_url(&config.database.scrobble_db_url).inspect_err(|e| {
+        error!("❌ {e}");
+    })?;
+
     // ── MusicBrainz client ──
     let sqlite_path = config.database.sqlite_path.clone();
     info!("📦 Initializing SQLite database at {}", sqlite_path);

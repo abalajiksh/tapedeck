@@ -1,0 +1,81 @@
+# Tapedeck on Postgres, with Docker Compose.
+#
+#   echo "TAPEDECK_PG_PASSWORD=$(openssl rand -hex 24)" > .env
+#   docker compose -f compose.postgres.yaml up -d     then open http://<host>:8080
+#
+# The same app as compose.yaml, built for Postgres (the :postgres image) and
+# run beside a Postgres 16 container. The backend is fixed when the binary is
+# compiled, so this image will not open a SQLite database and the other one
+# will not open Postgres.
+#
+# This is for a new install. There is no tool yet that moves an existing
+# SQLite history into Postgres: pointed at an empty database, Tapedeck starts
+# empty.
+#
+# Until the first admin account exists, the setup page answers anyone who can
+# reach the port, so create it straight away — or bind to 127.0.0.1 until you
+# have (see `ports`).
+#
+# Two volumes to back up:
+#   * `tapedeck-pg`   — the listening history. Back it up with pg_dump, not by
+#     copying the volume; the in-app backup (a SQLite `VACUUM INTO`) is not
+#     available on Postgres.
+#   * `tapedeck-data` — the credential key (tapedeck.key), uploaded scans and
+#     logs. Keep it: without the key, the stored service credentials (Plex,
+#     Navidrome, Last.fm) cannot be decrypted. Treat backups of it as sensitive.
+
+services:
+  tapedeck:
+    image: ghcr.io/abalajiksh/tapedeck:postgres
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+      # - "127.0.0.1:8080:8080"   # until the admin account exists, or behind a proxy
+    volumes:
+      - tapedeck-data:/data
+    environment:
+      # The one database URL. The MusicBrainz cache, the lyrics cache and the
+      # genre map live in the same database, so SQLITE_DB_PATH and
+      # EVERYNOISE_DB_PATH do nothing here.
+      DATABASE_URL: "postgres://tapedeck:${TAPEDECK_PG_PASSWORD:?set TAPEDECK_PG_PASSWORD in .env}@db:5432/tapedeck"
+
+      # MusicBrainz asks every client for a real way to reach its operator — an
+      # email address or a URL of yours. Until it is set, MusicBrainz and Cover
+      # Art Archive lookups stay off (MetaBrainz blocks clients that do not
+      # identify themselves), and the log says so at startup.
+      MUSICBRAINZ_CONTACT: ""
+
+      # Behind a reverse proxy that terminates HTTPS, set both. PUBLIC_URL is
+      # the address people type; without it the OAuth issuer published for MCP
+      # clients says http:// and conformant clients refuse it during discovery.
+      # PUBLIC_URL: "https://tapedeck.example.com"
+      # TRUST_PROXY: "true"
+
+      # Private networks a member's media-server source may point at (admins'
+      # sources may point anywhere). Your LAN, if Plex/Jellyfin/Navidrome is on it.
+      # TAPEDECK_SOURCE_NETWORKS: "192.168.1.0/24"
+
+      # RUST_LOG: "info"
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    # No `ports`: only Tapedeck, on the compose network, needs to reach it.
+    volumes:
+      - tapedeck-pg:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: tapedeck
+      POSTGRES_DB: tapedeck
+      POSTGRES_PASSWORD: "${TAPEDECK_PG_PASSWORD:?set TAPEDECK_PG_PASSWORD in .env}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tapedeck -d tapedeck"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  tapedeck-data:
+  tapedeck-pg:
