@@ -1694,9 +1694,9 @@ pub fn check_database_url(database_url: &str) -> Result<(), sqlx::Error> {
     Err(sqlx::Error::Configuration(
         format!(
             "this build serves {}, but DATABASE_URL names something else. \
-             Accepted schemes: {}. The other backend is a separate build of the \
-             same binary (cargo's `postgres` feature; for containers, the \
-             image tags ending in `postgres`).",
+             Accepted schemes: {}. The two backends are separate builds of the \
+             same binary: `cargo build --features postgres` is the Postgres \
+             one, and so are the container image tags ending in `postgres`.",
             dialect::ACTIVE.name(),
             dialect::ACTIVE.schemes().join(", "),
         )
